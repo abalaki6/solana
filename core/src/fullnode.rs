@@ -3,11 +3,13 @@
 use crate::bank_forks::BankForks;
 use crate::blocktree::Blocktree;
 use crate::blocktree_processor::{self, BankForksInfo};
-use crate::cluster_info::{ClusterInfo, Node, NodeInfo};
+use crate::cluster_info::{ClusterInfo, Node};
+use crate::contact_info::ContactInfo;
 use crate::entry::create_ticks;
 use crate::entry::next_entry_mut;
 use crate::entry::Entry;
 use crate::gossip_service::GossipService;
+use crate::leader_schedule_utils;
 use crate::poh_recorder::PohRecorder;
 use crate::poh_service::{PohService, PohServiceConfig};
 use crate::rpc::JsonRpcConfig;
@@ -30,11 +32,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread::sleep;
-use std::thread::JoinHandle;
-use std::thread::{spawn, Result};
-use std::time::Duration;
+use std::thread::Result;
 
+#[derive(Clone)]
 pub struct FullnodeConfig {
     pub sigverify_disabled: bool,
     pub voting_disabled: bool,
@@ -67,7 +67,6 @@ pub struct Fullnode {
     exit: Arc<AtomicBool>,
     rpc_service: Option<JsonRpcService>,
     rpc_pubsub_service: Option<PubSubService>,
-    rpc_working_bank_handle: JoinHandle<()>,
     gossip_service: GossipService,
     poh_recorder: Arc<Mutex<PohRecorder>>,
     poh_service: PohService,
@@ -80,8 +79,9 @@ impl Fullnode {
         mut node: Node,
         keypair: &Arc<Keypair>,
         ledger_path: &str,
+        vote_account: &Pubkey,
         voting_keypair: T,
-        entrypoint_info_option: Option<&NodeInfo>,
+        entrypoint_info_option: Option<&ContactInfo>,
         config: &FullnodeConfig,
     ) -> Self
     where
@@ -104,10 +104,23 @@ impl Fullnode {
             bank.tick_height(),
             bank.last_blockhash(),
         );
-        let (poh_recorder, entry_receiver) =
-            PohRecorder::new(bank.tick_height(), bank.last_blockhash());
+        let (poh_recorder, entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.slot(),
+            leader_schedule_utils::next_leader_slot(&id, bank.slot(), &bank),
+            bank.ticks_per_slot(),
+            &id,
+        );
         let poh_recorder = Arc::new(Mutex::new(poh_recorder));
         let poh_service = PohService::new(poh_recorder.clone(), &config.tick_config, &exit);
+        poh_recorder.lock().unwrap().clear_bank_signal =
+            blocktree.new_blobs_signals.first().cloned();
+        assert_eq!(
+            blocktree.new_blobs_signals.len(),
+            1,
+            "New blob signal for the TVU should be the same as the clear bank signal."
+        );
 
         info!("node info: {:?}", node.info);
         info!("node entrypoint_info: {:?}", entrypoint_info_option);
@@ -120,7 +133,7 @@ impl Fullnode {
         let bank_forks = Arc::new(RwLock::new(bank_forks));
 
         node.info.wallclock = timestamp();
-        let cluster_info = Arc::new(RwLock::new(ClusterInfo::new_with_keypair(
+        let cluster_info = Arc::new(RwLock::new(ClusterInfo::new(
             node.info.clone(),
             keypair.clone(),
         )));
@@ -132,6 +145,7 @@ impl Fullnode {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), node.info.rpc.port()),
             storage_state.clone(),
             config.rpc_config.clone(),
+            bank_forks.clone(),
             &exit,
         );
 
@@ -155,11 +169,12 @@ impl Fullnode {
 
         // Insert the entrypoint info, should only be None if this node
         // is the bootstrap leader
+
         if let Some(entrypoint_info) = entrypoint_info_option {
             cluster_info
                 .write()
                 .unwrap()
-                .insert_info(entrypoint_info.clone());
+                .set_entrypoint(entrypoint_info.clone());
         }
 
         let sockets = Sockets {
@@ -181,7 +196,7 @@ impl Fullnode {
                 .collect(),
         };
 
-        let voting_keypair_option = if config.voting_disabled {
+        let voting_keypair = if config.voting_disabled {
             None
         } else {
             Some(Arc::new(voting_keypair))
@@ -189,7 +204,8 @@ impl Fullnode {
 
         // Setup channel for rotation indications
         let tvu = Tvu::new(
-            voting_keypair_option,
+            vote_account,
+            voting_keypair,
             &bank_forks,
             &bank_forks_info,
             &cluster_info,
@@ -204,29 +220,17 @@ impl Fullnode {
             &exit,
         );
         let tpu = Tpu::new(
-            id,
+            &id,
             &cluster_info,
             &poh_recorder,
             entry_receiver,
             node.sockets.tpu,
+            node.sockets.tpu_via_blobs,
             node.sockets.broadcast,
             config.sigverify_disabled,
             &blocktree,
             &exit,
         );
-        let exit_ = exit.clone();
-        let bank_forks_ = bank_forks.clone();
-        let rpc_service_rp = rpc_service.request_processor.clone();
-        let rpc_working_bank_handle = spawn(move || loop {
-            if exit_.load(Ordering::Relaxed) {
-                break;
-            }
-            let bank = bank_forks_.read().unwrap().working_bank();
-            trace!("rpc working bank {} {}", bank.slot(), bank.last_blockhash());
-            rpc_service_rp.write().unwrap().set_bank(&bank);
-            let timer = Duration::from_millis(100);
-            sleep(timer);
-        });
 
         inc_new_counter_info!("fullnode-new", 1);
         Self {
@@ -234,7 +238,6 @@ impl Fullnode {
             gossip_service,
             rpc_service: Some(rpc_service),
             rpc_pubsub_service: Some(rpc_pubsub_service),
-            rpc_working_bank_handle,
             tpu,
             tvu,
             exit,
@@ -246,15 +249,6 @@ impl Fullnode {
     // Used for notifying many nodes in parallel to exit
     pub fn exit(&self) {
         self.exit.store(true, Ordering::Relaxed);
-
-        // Need to force the poh_recorder to drop the WorkingBank,
-        // which contains the channel to BroadcastStage. This should be
-        // sufficient as long as no other rotations are happening that
-        // can cause the Tpu to restart a BankingStage and reset a
-        // WorkingBank in poh_recorder. It follows no other rotations can be
-        // in motion because exit()/close() are only called by the run() loop
-        // which is the sole initiator of rotations.
-        self.poh_recorder.lock().unwrap().clear_bank();
     }
 
     pub fn close(self) -> Result<()> {
@@ -270,9 +264,8 @@ pub fn new_banks_from_blocktree(
     let genesis_block =
         GenesisBlock::load(blocktree_path).expect("Expected to successfully open genesis block");
 
-    let (blocktree, ledger_signal_receiver) =
-        Blocktree::open_with_config_signal(blocktree_path, genesis_block.ticks_per_slot)
-            .expect("Expected to successfully open database ledger");
+    let (blocktree, ledger_signal_receiver) = Blocktree::open_with_signal(blocktree_path)
+        .expect("Expected to successfully open database ledger");
 
     let (bank_forks, bank_forks_info) =
         blocktree_processor::process_blocktree(&genesis_block, &blocktree, account_paths)
@@ -299,7 +292,6 @@ impl Service for Fullnode {
             rpc_pubsub_service.join()?;
         }
 
-        self.rpc_working_bank_handle.join()?;
         self.gossip_service.join()?;
         self.tpu.join()?;
         self.tvu.join()?;
@@ -321,7 +313,7 @@ pub fn make_active_set_entries(
     // 1) Assume the active_keypair node has no lamports staked
     let transfer_tx = SystemTransaction::new_account(
         &lamport_source,
-        active_keypair.pubkey(),
+        &active_keypair.pubkey(),
         stake,
         *blockhash,
         0,
@@ -335,7 +327,7 @@ pub fn make_active_set_entries(
 
     let new_vote_account_tx = VoteTransaction::new_account(
         active_keypair,
-        vote_account_id,
+        &vote_account_id,
         *blockhash,
         stake.saturating_sub(2),
         1,
@@ -343,7 +335,13 @@ pub fn make_active_set_entries(
     let new_vote_account_entry = next_entry_mut(&mut last_entry_hash, 1, vec![new_vote_account_tx]);
 
     // 3) Create vote entry
-    let vote_tx = VoteTransaction::new_vote(&voting_keypair, slot_to_vote_on, *blockhash, 0);
+    let vote_tx = VoteTransaction::new_vote(
+        &voting_keypair.pubkey(),
+        &voting_keypair,
+        slot_to_vote_on,
+        *blockhash,
+        0,
+    );
     let vote_entry = next_entry_mut(&mut last_entry_hash, 1, vec![vote_tx]);
 
     // 4) Create `num_ending_ticks` empty ticks
@@ -352,6 +350,36 @@ pub fn make_active_set_entries(
     entries.extend(empty_ticks);
 
     (entries, voting_keypair)
+}
+
+pub fn new_fullnode_for_tests() -> (Fullnode, ContactInfo, Keypair, String) {
+    use crate::blocktree::create_new_tmp_ledger;
+    use crate::cluster_info::Node;
+
+    let node_keypair = Arc::new(Keypair::new());
+    let node = Node::new_localhost_with_pubkey(&node_keypair.pubkey());
+    let contact_info = node.info.clone();
+
+    let (mut genesis_block, mint_keypair) =
+        GenesisBlock::new_with_leader(10_000, &contact_info.id, 42);
+    genesis_block
+        .native_programs
+        .push(("solana_budget_program".to_string(), solana_budget_api::id()));
+
+    let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
+
+    let voting_keypair = Keypair::new();
+    let node = Fullnode::new(
+        node,
+        &node_keypair,
+        &ledger_path,
+        &voting_keypair.pubkey(),
+        voting_keypair,
+        None,
+        &FullnodeConfig::default(),
+    );
+
+    (node, contact_info, mint_keypair, ledger_path)
 }
 
 #[cfg(test)]
@@ -363,19 +391,21 @@ mod tests {
     #[test]
     fn validator_exit() {
         let leader_keypair = Keypair::new();
-        let leader_node = Node::new_localhost_with_pubkey(leader_keypair.pubkey());
+        let leader_node = Node::new_localhost_with_pubkey(&leader_keypair.pubkey());
 
         let validator_keypair = Keypair::new();
-        let validator_node = Node::new_localhost_with_pubkey(validator_keypair.pubkey());
+        let validator_node = Node::new_localhost_with_pubkey(&validator_keypair.pubkey());
         let (genesis_block, _mint_keypair) =
-            GenesisBlock::new_with_leader(10_000, leader_keypair.pubkey(), 1000);
+            GenesisBlock::new_with_leader(10_000, &leader_keypair.pubkey(), 1000);
         let (validator_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
 
+        let voting_keypair = Keypair::new();
         let validator = Fullnode::new(
             validator_node,
             &Arc::new(validator_keypair),
             &validator_ledger_path,
-            Keypair::new(),
+            &voting_keypair.pubkey(),
+            voting_keypair,
             Some(&leader_node.info),
             &FullnodeConfig::default(),
         );
@@ -386,22 +416,24 @@ mod tests {
     #[test]
     fn validator_parallel_exit() {
         let leader_keypair = Keypair::new();
-        let leader_node = Node::new_localhost_with_pubkey(leader_keypair.pubkey());
+        let leader_node = Node::new_localhost_with_pubkey(&leader_keypair.pubkey());
 
         let mut ledger_paths = vec![];
         let validators: Vec<Fullnode> = (0..2)
             .map(|_| {
                 let validator_keypair = Keypair::new();
-                let validator_node = Node::new_localhost_with_pubkey(validator_keypair.pubkey());
+                let validator_node = Node::new_localhost_with_pubkey(&validator_keypair.pubkey());
                 let (genesis_block, _mint_keypair) =
-                    GenesisBlock::new_with_leader(10_000, leader_keypair.pubkey(), 1000);
+                    GenesisBlock::new_with_leader(10_000, &leader_keypair.pubkey(), 1000);
                 let (validator_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
                 ledger_paths.push(validator_ledger_path.clone());
+                let voting_keypair = Keypair::new();
                 Fullnode::new(
                     validator_node,
                     &Arc::new(validator_keypair),
                     &validator_ledger_path,
-                    Keypair::new(),
+                    &voting_keypair.pubkey(),
+                    voting_keypair,
                     Some(&leader_node.info),
                     &FullnodeConfig::default(),
                 )

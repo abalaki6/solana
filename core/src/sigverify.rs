@@ -337,10 +337,11 @@ mod tests {
     use bincode::{deserialize, serialize};
     use solana_budget_api;
     use solana_sdk::hash::Hash;
+    use solana_sdk::instruction::CompiledInstruction;
     use solana_sdk::signature::{Keypair, KeypairUtil};
     use solana_sdk::system_instruction::SystemInstruction;
     use solana_sdk::system_program;
-    use solana_sdk::transaction::{Instruction, Transaction};
+    use solana_sdk::transaction::Transaction;
 
     const SIG_OFFSET: usize = std::mem::size_of::<u64>() + 1;
 
@@ -395,10 +396,10 @@ mod tests {
     }
 
     #[test]
-    fn test_system_transaction_userdata_layout() {
+    fn test_system_transaction_data_layout() {
         use crate::packet::PACKET_DATA_SIZE;
         let mut tx0 = test_tx();
-        tx0.instructions[0].userdata = vec![1, 2, 3];
+        tx0.instructions[0].data = vec![1, 2, 3];
         let message0a = tx0.message();
         let tx_bytes = serialize(&tx0).unwrap();
         assert!(tx_bytes.len() < PACKET_DATA_SIZE);
@@ -408,9 +409,9 @@ mod tests {
         );
         let tx1 = deserialize(&tx_bytes).unwrap();
         assert_eq!(tx0, tx1);
-        assert_eq!(tx1.instructions[0].userdata, vec![1, 2, 3]);
+        assert_eq!(tx1.instructions[0].data, vec![1, 2, 3]);
 
-        tx0.instructions[0].userdata = vec![1, 2, 4];
+        tx0.instructions[0].data = vec![1, 2, 4];
         let message0b = tx0.message();
         assert_ne!(message0a, message0b);
     }
@@ -497,17 +498,15 @@ mod tests {
         let fee = 2;
         let blockhash = Hash::default();
 
-        let keys = vec![keypair0.pubkey(), keypair1.pubkey()];
-
         let system_instruction = SystemInstruction::Move { lamports };
 
         let program_ids = vec![system_program::id(), solana_budget_api::id()];
 
-        let instructions = vec![Instruction::new(0, &system_instruction, vec![0, 1])];
+        let instructions = vec![CompiledInstruction::new(0, &system_instruction, vec![0, 1])];
 
-        let tx = Transaction::new_with_instructions(
+        let tx = Transaction::new_with_compiled_instructions(
             &keypairs,
-            &keys,
+            &[],
             blockhash,
             fee,
             program_ids,

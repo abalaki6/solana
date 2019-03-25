@@ -498,13 +498,19 @@ fn categorize_blob(
 
 #[cfg(test)]
 pub mod test {
+    #[derive(Default, Clone)]
+    pub struct WindowSlot {
+        pub data: Option<SharedBlob>,
+        pub coding: Option<SharedBlob>,
+        pub leader_unknown: bool,
+    }
+
     use super::*;
     use crate::blocktree::get_tmp_ledger_path;
     use crate::blocktree::Blocktree;
     use crate::entry::{make_tiny_test_entries, EntrySlice};
 
     use crate::packet::{index_blobs, SharedBlob, BLOB_DATA_SIZE, BLOB_SIZE};
-    use crate::window::WindowSlot;
     use rand::{thread_rng, Rng};
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::{Keypair, KeypairUtil};
@@ -890,7 +896,7 @@ pub mod test {
         }
 
         // Make some dummy slots
-        index_blobs(&blobs, &Keypair::new().pubkey(), &mut (offset as u64), slot);
+        index_blobs(&blobs, &Keypair::new().pubkey(), offset as u64, slot, 0);
 
         for b in blobs {
             let idx = b.read().unwrap().index() as usize % WINDOW_SIZE;
@@ -901,9 +907,9 @@ pub mod test {
     }
 
     fn generate_test_blobs(offset: usize, num_blobs: usize) -> Vec<SharedBlob> {
-        let blobs = make_tiny_test_entries(num_blobs).to_shared_blobs();
+        let blobs = make_tiny_test_entries(num_blobs).to_single_entry_shared_blobs();
 
-        index_blobs(&blobs, &Keypair::new().pubkey(), &mut (offset as u64), 0);
+        index_blobs(&blobs, &Keypair::new().pubkey(), offset as u64, 0, 0);
         blobs
     }
 

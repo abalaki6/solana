@@ -104,13 +104,21 @@ mod tests {
     use solana_runtime::bank::Bank;
     use solana_sdk::genesis_block::GenesisBlock;
     use solana_sdk::hash::hash;
+    use solana_sdk::pubkey::Pubkey;
 
     #[test]
     fn test_poh_service() {
         let (genesis_block, _mint_keypair) = GenesisBlock::new(2);
         let bank = Arc::new(Bank::new(&genesis_block));
         let prev_hash = bank.last_blockhash();
-        let (poh_recorder, entry_receiver) = PohRecorder::new(bank.tick_height(), prev_hash);
+        let (poh_recorder, entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            prev_hash,
+            bank.slot(),
+            Some(4),
+            bank.ticks_per_slot(),
+            &Pubkey::default(),
+        );
         let poh_recorder = Arc::new(Mutex::new(poh_recorder));
         let exit = Arc::new(AtomicBool::new(false));
         let working_bank = WorkingBank {
@@ -130,7 +138,11 @@ mod tests {
                         // send some data
                         let h1 = hash(b"hello world!");
                         let tx = test_tx();
-                        poh_recorder.lock().unwrap().record(h1, vec![tx]).unwrap();
+                        poh_recorder
+                            .lock()
+                            .unwrap()
+                            .record(bank.slot(), h1, vec![tx])
+                            .unwrap();
 
                         if exit.load(Ordering::Relaxed) {
                             break Ok(());

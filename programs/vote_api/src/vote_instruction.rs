@@ -1,7 +1,9 @@
 use crate::id;
+use crate::vote_state::VoteState;
 use serde_derive::{Deserialize, Serialize};
+use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::transaction_builder::BuilderInstruction;
+use solana_sdk::system_instruction::SystemInstruction;
 
 #[derive(Serialize, Default, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct Vote {
@@ -23,6 +25,8 @@ pub enum VoteInstruction {
     InitializeAccount,
     /// `Delegate` or `Assign` a vote account to a particular node
     DelegateStake(Pubkey),
+    /// Authorize a voter to send signed votes.
+    AuthorizeVoter(Pubkey),
     Vote(Vote),
     /// Clear the credits in the vote account
     /// * Transaction::keys[0] - the "vote account"
@@ -30,24 +34,39 @@ pub enum VoteInstruction {
 }
 
 impl VoteInstruction {
-    pub fn new_clear_credits(vote_id: Pubkey) -> BuilderInstruction {
-        BuilderInstruction::new(id(), &VoteInstruction::ClearCredits, vec![(vote_id, true)])
+    pub fn new_account(from_id: &Pubkey, staker_id: &Pubkey, lamports: u64) -> Vec<Instruction> {
+        let space = VoteState::max_size() as u64;
+        let create_ix =
+            SystemInstruction::new_program_account(&from_id, staker_id, lamports, space, &id());
+        let init_ix = VoteInstruction::new_initialize_account(staker_id);
+        vec![create_ix, init_ix]
     }
-    pub fn new_delegate_stake(vote_id: Pubkey, delegate_id: Pubkey) -> BuilderInstruction {
-        BuilderInstruction::new(
+    pub fn new_clear_credits(vote_id: &Pubkey) -> Instruction {
+        let account_metas = vec![AccountMeta::new(*vote_id, true)];
+        Instruction::new(id(), &VoteInstruction::ClearCredits, account_metas)
+    }
+    pub fn new_delegate_stake(vote_id: &Pubkey, delegate_id: &Pubkey) -> Instruction {
+        let account_metas = vec![AccountMeta::new(*vote_id, true)];
+        Instruction::new(
             id(),
-            &VoteInstruction::DelegateStake(delegate_id),
-            vec![(vote_id, true)],
+            &VoteInstruction::DelegateStake(*delegate_id),
+            account_metas,
         )
     }
-    pub fn new_initialize_account(vote_id: Pubkey) -> BuilderInstruction {
-        BuilderInstruction::new(
+    pub fn new_authorize_voter(vote_id: &Pubkey, authorized_voter_id: &Pubkey) -> Instruction {
+        let account_metas = vec![AccountMeta::new(*vote_id, true)];
+        Instruction::new(
             id(),
-            &VoteInstruction::InitializeAccount,
-            vec![(vote_id, false)],
+            &VoteInstruction::AuthorizeVoter(*authorized_voter_id),
+            account_metas,
         )
     }
-    pub fn new_vote(vote_id: Pubkey, vote: Vote) -> BuilderInstruction {
-        BuilderInstruction::new(id(), &VoteInstruction::Vote(vote), vec![(vote_id, true)])
+    pub fn new_initialize_account(vote_id: &Pubkey) -> Instruction {
+        let account_metas = vec![AccountMeta::new(*vote_id, false)];
+        Instruction::new(id(), &VoteInstruction::InitializeAccount, account_metas)
+    }
+    pub fn new_vote(vote_id: &Pubkey, vote: Vote) -> Instruction {
+        let account_metas = vec![AccountMeta::new(*vote_id, true)];
+        Instruction::new(id(), &VoteInstruction::Vote(vote), account_metas)
     }
 }

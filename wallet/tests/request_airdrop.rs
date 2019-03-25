@@ -1,5 +1,5 @@
-use solana::rpc_request::RpcClient;
-use solana::thin_client::new_fullnode;
+use solana::fullnode::new_fullnode_for_tests;
+use solana_client::rpc_client::RpcClient;
 use solana_drone::drone::run_local_drone;
 use solana_sdk::signature::KeypairUtil;
 use solana_wallet::wallet::{process_command, WalletCommand, WalletConfig};
@@ -8,7 +8,7 @@ use std::sync::mpsc::channel;
 
 #[test]
 fn test_wallet_request_airdrop() {
-    let (server, leader_data, alice, ledger_path) = new_fullnode();
+    let (server, leader_data, alice, ledger_path) = new_fullnode_for_tests();
     let (sender, receiver) = channel();
     run_local_drone(alice, sender);
     let drone_addr = receiver.recv().unwrap();
@@ -21,10 +21,10 @@ fn test_wallet_request_airdrop() {
     let sig_response = process_command(&bob_config);
     sig_response.unwrap();
 
-    let rpc_client = RpcClient::new_from_socket(leader_data.rpc);
+    let rpc_client = RpcClient::new_socket(leader_data.rpc);
 
     let balance = rpc_client
-        .retry_get_balance(1, bob_config.id.pubkey(), 1)
+        .retry_get_balance(&bob_config.id.pubkey(), 1)
         .unwrap()
         .unwrap();
     assert_eq!(balance, 50);

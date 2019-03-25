@@ -1,16 +1,13 @@
 mod bench;
 mod cli;
 
-use solana::client::mk_client;
-use solana::cluster_info::{ClusterInfo, NodeInfo};
-use solana::gossip_service::GossipService;
-
+use crate::bench::*;
+use solana::cluster_info::FULLNODE_PORT_RANGE;
 use solana::gen_keys::GenKeys;
-use solana::service::Service;
-use solana::thin_client::poll_gossip_for_leader;
+use solana::gossip_service::discover;
+use solana_client::thin_client::create_client;
 use solana_metrics;
 use solana_sdk::signature::{Keypair, KeypairUtil};
-
 use std::collections::VecDeque;
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
@@ -19,56 +16,6 @@ use std::thread::sleep;
 use std::thread::Builder;
 use std::time::Duration;
 use std::time::Instant;
-
-use crate::bench::*;
-
-/// Creates a cluster and waits for the network to converge, returning the peers, leader, and gossip service
-/// # Arguments
-/// `leader` - the input leader node
-/// `exit_signal` - atomic bool used to signal early exit to cluster
-/// `num_nodes` - the number of nodes
-/// # Panics
-/// Panics if the spy node `RwLock` somehow ends up unreadable
-fn converge(
-    leader: &NodeInfo,
-    exit_signal: &Arc<AtomicBool>,
-    num_nodes: usize,
-) -> (Vec<NodeInfo>, Option<NodeInfo>, GossipService) {
-    //lets spy on the network
-    let (node, gossip_socket) = ClusterInfo::spy_node();
-    println!("Spy node: {}", node.id);
-    let mut spy_cluster_info = ClusterInfo::new(node);
-    spy_cluster_info.insert_info(leader.clone());
-    spy_cluster_info.set_leader(leader.id);
-    let spy_ref = Arc::new(RwLock::new(spy_cluster_info));
-    let gossip_service = GossipService::new(&spy_ref, None, None, gossip_socket, &exit_signal);
-    let mut v: Vec<NodeInfo> = vec![];
-    // wait for the network to converge, 30 seconds should be plenty
-    for _ in 0..30 {
-        {
-            let spy_ref = spy_ref.read().unwrap();
-
-            println!("{}", spy_ref.node_info_trace());
-
-            if spy_ref.leader_data().is_some() {
-                v = spy_ref.rpc_peers();
-                if v.len() >= num_nodes {
-                    println!("CONVERGED!");
-                    break;
-                } else {
-                    println!(
-                        "{} node(s) discovered (looking for {} or more)",
-                        v.len(),
-                        num_nodes
-                    );
-                }
-            }
-        }
-        sleep(Duration::new(1, 0));
-    }
-    let leader = spy_ref.read().unwrap().leader_data().cloned();
-    (v, leader, gossip_service)
-}
 
 fn main() {
     solana_logger::setup();
@@ -92,47 +39,33 @@ fn main() {
         converge_only,
     } = cfg;
 
-    println!("Looking for leader at {:?}", network);
-    let leader = poll_gossip_for_leader(network, Some(30)).unwrap_or_else(|err| {
-        println!(
-            "Error: unable to find leader on network after 30 seconds: {:?}",
-            err
-        );
+    let nodes = discover(&network, num_nodes).unwrap_or_else(|err| {
+        eprintln!("Failed to discover {} nodes: {:?}", num_nodes, err);
         exit(1);
     });
-
-    let exit_signal = Arc::new(AtomicBool::new(false));
-    let (nodes, leader, gossip_service) = converge(&leader, &exit_signal, num_nodes);
-
     if nodes.len() < num_nodes {
-        println!(
+        eprintln!(
             "Error: Insufficient nodes discovered.  Expecting {} or more",
             num_nodes
         );
         exit(1);
     }
     if reject_extra_nodes && nodes.len() > num_nodes {
-        println!(
+        eprintln!(
             "Error: Extra nodes discovered.  Expecting exactly {}",
             num_nodes
         );
         exit(1);
     }
 
-    if leader.is_none() {
-        println!("no leader");
-        exit(1);
-    }
-
     if converge_only {
         return;
     }
+    let cluster_entrypoint = nodes[0].clone(); // Pick the first node, why not?
 
-    let leader = leader.unwrap();
-
-    println!("leader RPC is at {} {}", leader.rpc, leader.id);
-    let mut client = mk_client(&leader);
-    let mut barrier_client = mk_client(&leader);
+    let client = create_client(cluster_entrypoint.client_facing_addr(), FULLNODE_PORT_RANGE);
+    let mut barrier_client =
+        create_client(cluster_entrypoint.client_facing_addr(), FULLNODE_PORT_RANGE);
 
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&id.public_key_bytes()[..32]);
@@ -161,20 +94,22 @@ fn main() {
     if num_lamports_per_account > keypair0_balance {
         let extra = num_lamports_per_account - keypair0_balance;
         let total = extra * (gen_keypairs.len() as u64);
-        airdrop_lamports(&mut client, &drone_addr, &id, total);
+        airdrop_lamports(&client, &drone_addr, &id, total);
         println!("adding more lamports {}", extra);
-        fund_keys(&mut client, &id, &gen_keypairs, extra);
+        fund_keys(&client, &id, &gen_keypairs, extra);
     }
     let start = gen_keypairs.len() - (tx_count * 2) as usize;
     let keypairs = &gen_keypairs[start..];
-    airdrop_lamports(&mut barrier_client, &drone_addr, &barrier_source_keypair, 1);
+    airdrop_lamports(&barrier_client, &drone_addr, &barrier_source_keypair, 1);
 
     println!("Get last ID...");
-    let mut blockhash = client.get_recent_blockhash();
+    let mut blockhash = client.get_recent_blockhash().unwrap();
     println!("Got last ID {:?}", blockhash);
 
-    let first_tx_count = client.transaction_count();
+    let first_tx_count = client.get_transaction_count().expect("transaction count");
     println!("Initial transaction count {}", first_tx_count);
+
+    let exit_signal = Arc::new(AtomicBool::new(false));
 
     // Setup a thread per validator to sample every period
     // collect the max transaction rate and total tx count seen
@@ -204,7 +139,7 @@ fn main() {
         .map(|_| {
             let exit_signal = exit_signal.clone();
             let shared_txs = shared_txs.clone();
-            let leader = leader.clone();
+            let cluster_entrypoint = cluster_entrypoint.clone();
             let shared_tx_active_thread_count = shared_tx_active_thread_count.clone();
             let total_tx_sent_count = total_tx_sent_count.clone();
             Builder::new()
@@ -213,7 +148,7 @@ fn main() {
                     do_tx_transfers(
                         &exit_signal,
                         &shared_txs,
-                        &leader,
+                        &cluster_entrypoint,
                         &shared_tx_active_thread_count,
                         &total_tx_sent_count,
                         thread_batch_sleep_ms,
@@ -241,7 +176,7 @@ fn main() {
             &keypairs[len..],
             threads,
             reclaim_lamports_back_to_source_account,
-            &leader,
+            &cluster_entrypoint,
         );
         // In sustained mode overlap the transfers with generation
         // this has higher average performance but lower peak performance
@@ -294,9 +229,6 @@ fn main() {
         &start.elapsed(),
         total_tx_sent_count.load(Ordering::Relaxed),
     );
-
-    // join the cluster_info client threads
-    gossip_service.join().unwrap();
 }
 
 #[cfg(test)]

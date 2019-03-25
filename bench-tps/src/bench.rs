@@ -1,9 +1,10 @@
 use solana_metrics;
 
 use rayon::prelude::*;
-use solana::client::mk_client;
-use solana::cluster_info::NodeInfo;
-use solana::thin_client::ThinClient;
+use solana::cluster_info::FULLNODE_PORT_RANGE;
+use solana::contact_info::ContactInfo;
+use solana_client::thin_client::create_client;
+use solana_client::thin_client::ThinClient;
 use solana_drone::drone::request_airdrop_transaction;
 use solana_metrics::influxdb;
 use solana_sdk::hash::Hash;
@@ -48,19 +49,19 @@ pub fn sample_tx_count(
     exit_signal: &Arc<AtomicBool>,
     maxes: &Arc<RwLock<Vec<(SocketAddr, NodeStats)>>>,
     first_tx_count: u64,
-    v: &NodeInfo,
+    v: &ContactInfo,
     sample_period: u64,
 ) {
-    let mut client = mk_client(&v);
+    let client = create_client(v.client_facing_addr(), FULLNODE_PORT_RANGE);
     let mut now = Instant::now();
-    let mut initial_tx_count = client.transaction_count();
+    let mut initial_tx_count = client.get_transaction_count().expect("transaction count");
     let mut max_tps = 0.0;
     let mut total;
 
     let log_prefix = format!("{:21}:", v.tpu.to_string());
 
     loop {
-        let tx_count = client.transaction_count();
+        let tx_count = client.get_transaction_count().expect("transaction count");
         assert!(
             tx_count >= initial_tx_count,
             "expected tx_count({}) >= initial_tx_count({})",
@@ -118,9 +119,12 @@ pub fn send_barrier_transaction(
             );
         }
 
-        *blockhash = barrier_client.get_recent_blockhash();
+        *blockhash = barrier_client.get_recent_blockhash().unwrap();
+
+        let transaction =
+            SystemTransaction::new_account(&source_keypair, dest_id, 0, *blockhash, 0);
         let signature = barrier_client
-            .transfer(0, &source_keypair, *dest_id, blockhash)
+            .transfer_signed(&transaction)
             .expect("Unable to send barrier transaction");
 
         let confirmatiom = barrier_client.poll_for_signature(&signature);
@@ -160,7 +164,7 @@ pub fn send_barrier_transaction(
             exit(1);
         }
 
-        let new_blockhash = barrier_client.get_recent_blockhash();
+        let new_blockhash = barrier_client.get_recent_blockhash().unwrap();
         if new_blockhash == *blockhash {
             if poll_count > 0 && poll_count % 8 == 0 {
                 println!("blockhash is not advancing, still at {:?}", *blockhash);
@@ -179,10 +183,10 @@ pub fn generate_txs(
     dest: &[Keypair],
     threads: usize,
     reclaim: bool,
-    leader: &NodeInfo,
+    contact_info: &ContactInfo,
 ) {
-    let mut client = mk_client(leader);
-    let blockhash = client.get_recent_blockhash();
+    let client = create_client(contact_info.client_facing_addr(), FULLNODE_PORT_RANGE);
+    let blockhash = client.get_recent_blockhash().unwrap();
     let tx_count = source.len();
     println!("Signing transactions... {} (reclaim={})", tx_count, reclaim);
     let signing_start = Instant::now();
@@ -196,7 +200,7 @@ pub fn generate_txs(
         .par_iter()
         .map(|(id, keypair)| {
             (
-                SystemTransaction::new_account(id, keypair.pubkey(), 1, blockhash, 0),
+                SystemTransaction::new_account(id, &keypair.pubkey(), 1, blockhash, 0),
                 timestamp(),
             )
         })
@@ -236,12 +240,12 @@ pub fn generate_txs(
 pub fn do_tx_transfers(
     exit_signal: &Arc<AtomicBool>,
     shared_txs: &SharedTransactions,
-    leader: &NodeInfo,
+    contact_info: &ContactInfo,
     shared_tx_thread_count: &Arc<AtomicIsize>,
     total_tx_sent_count: &Arc<AtomicUsize>,
     thread_batch_sleep_ms: usize,
 ) {
-    let client = mk_client(&leader);
+    let client = create_client(contact_info.client_facing_addr(), FULLNODE_PORT_RANGE);
     loop {
         if thread_batch_sleep_ms > 0 {
             sleep(Duration::from_millis(thread_batch_sleep_ms as u64));
@@ -256,7 +260,7 @@ pub fn do_tx_transfers(
             println!(
                 "Transferring 1 unit {} times... to {}",
                 txs0.len(),
-                leader.tpu
+                contact_info.tpu
             );
             let tx_len = txs0.len();
             let transfer_start = Instant::now();
@@ -291,7 +295,7 @@ pub fn do_tx_transfers(
     }
 }
 
-pub fn verify_funding_transfer(client: &mut ThinClient, tx: &Transaction, amount: u64) -> bool {
+pub fn verify_funding_transfer(client: &ThinClient, tx: &Transaction, amount: u64) -> bool {
     for a in &tx.account_keys[1..] {
         if client.get_balance(a).unwrap_or(0) >= amount {
             return true;
@@ -304,7 +308,7 @@ pub fn verify_funding_transfer(client: &mut ThinClient, tx: &Transaction, amount
 /// fund the dests keys by spending all of the source keys into MAX_SPENDS_PER_TX
 /// on every iteration.  This allows us to replay the transfers because the source is either empty,
 /// or full
-pub fn fund_keys(client: &mut ThinClient, source: &Keypair, dests: &[Keypair], lamports: u64) {
+pub fn fund_keys(client: &ThinClient, source: &Keypair, dests: &[Keypair], lamports: u64) {
     let total = lamports * dests.len() as u64;
     let mut funded: Vec<(&Keypair, u64)> = vec![(source, total)];
     let mut notfunded: Vec<&Keypair> = dests.iter().collect();
@@ -372,7 +376,7 @@ pub fn fund_keys(client: &mut ThinClient, source: &Keypair, dests: &[Keypair], l
                     to_fund_txs.len(),
                 );
 
-                let blockhash = client.get_recent_blockhash();
+                let blockhash = client.get_recent_blockhash().unwrap();
 
                 // re-sign retained to_fund_txes with updated blockhash
                 to_fund_txs.par_iter_mut().for_each(|(k, tx)| {
@@ -397,12 +401,7 @@ pub fn fund_keys(client: &mut ThinClient, source: &Keypair, dests: &[Keypair], l
     }
 }
 
-pub fn airdrop_lamports(
-    client: &mut ThinClient,
-    drone_addr: &SocketAddr,
-    id: &Keypair,
-    tx_count: u64,
-) {
+pub fn airdrop_lamports(client: &ThinClient, drone_addr: &SocketAddr, id: &Keypair, tx_count: u64) {
     let starting_balance = client.poll_get_balance(&id.pubkey()).unwrap_or(0);
     metrics_submit_lamport_balance(starting_balance);
     println!("starting balance {}", starting_balance);
@@ -416,7 +415,7 @@ pub fn airdrop_lamports(
             id.pubkey(),
         );
 
-        let blockhash = client.get_recent_blockhash();
+        let blockhash = client.get_recent_blockhash().unwrap();
         match request_airdrop_transaction(&drone_addr, &id.pubkey(), airdrop_amount, blockhash) {
             Ok(transaction) => {
                 let signature = client.transfer_signed(&transaction).unwrap();

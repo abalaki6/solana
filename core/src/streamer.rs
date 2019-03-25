@@ -1,14 +1,17 @@
 //! The `streamer` module defines a set of services for efficiently pulling data from UDP sockets.
 //!
 
-use crate::packet::{Blob, SharedBlobs, SharedPackets};
+use crate::packet::{
+    deserialize_packets_in_blob, Blob, Meta, Packets, SharedBlobs, SharedPackets, PACKET_DATA_SIZE,
+};
 use crate::result::{Error, Result};
+use bincode;
 use solana_metrics::{influxdb, submit};
 use solana_sdk::timing::duration_as_ms;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread::{Builder, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -139,10 +142,63 @@ pub fn blob_receiver(
         .unwrap()
 }
 
+fn recv_blob_packets(sock: &UdpSocket, s: &PacketSender) -> Result<()> {
+    trace!(
+        "recv_blob_packets: receiving on {}",
+        sock.local_addr().unwrap()
+    );
+
+    let meta = Meta::default();
+    let serialized_meta_size = bincode::serialized_size(&meta)? as usize;
+    let serialized_packet_size = serialized_meta_size + PACKET_DATA_SIZE;
+    let blobs = Blob::recv_from(sock)?;
+    for blob in blobs {
+        let r_blob = blob.read().unwrap();
+        let data = {
+            let msg_size = r_blob.size();
+            &r_blob.data()[..msg_size]
+        };
+
+        let packets =
+            deserialize_packets_in_blob(data, serialized_packet_size, serialized_meta_size);
+
+        if packets.is_err() {
+            continue;
+        }
+
+        let packets = packets?;
+        s.send(Arc::new(RwLock::new(Packets::new(packets))))?;
+    }
+
+    Ok(())
+}
+
+pub fn blob_packet_receiver(
+    sock: Arc<UdpSocket>,
+    exit: &Arc<AtomicBool>,
+    s: PacketSender,
+) -> JoinHandle<()> {
+    //DOCUMENTED SIDE-EFFECT
+    //1 second timeout on socket read
+    let timer = Duration::new(1, 0);
+    sock.set_read_timeout(Some(timer))
+        .expect("set socket timeout");
+    let exit = exit.clone();
+    Builder::new()
+        .name("solana-blob_packet_receiver".to_string())
+        .spawn(move || loop {
+            if exit.load(Ordering::Relaxed) {
+                break;
+            }
+            let _ = recv_blob_packets(&sock, &s);
+        })
+        .unwrap()
+}
+
 #[cfg(test)]
 mod test {
+    use super::*;
     use crate::packet::{Blob, Packet, Packets, SharedBlob, PACKET_DATA_SIZE};
-    use crate::streamer::PacketReceiver;
     use crate::streamer::{receiver, responder};
     use std::io;
     use std::io::Write;
@@ -152,26 +208,27 @@ mod test {
     use std::sync::Arc;
     use std::time::Duration;
 
-    fn get_msgs(r: PacketReceiver, num: &mut usize) {
-        for _t in 0..5 {
-            let timer = Duration::new(1, 0);
-            match r.recv_timeout(timer) {
-                Ok(m) => *num += m.read().unwrap().packets.len(),
-                _ => info!("get_msgs error"),
-            }
-            if *num == 10 {
+    fn get_msgs(r: PacketReceiver, num: &mut usize) -> Result<()> {
+        for _ in 0..10 {
+            let m = r.recv_timeout(Duration::new(1, 0))?;
+
+            *num -= m.read().unwrap().packets.len();
+
+            if *num == 0 {
                 break;
             }
         }
+
+        Ok(())
     }
     #[test]
-    pub fn streamer_debug() {
+    fn streamer_debug() {
         write!(io::sink(), "{:?}", Packet::default()).unwrap();
         write!(io::sink(), "{:?}", Packets::default()).unwrap();
         write!(io::sink(), "{:?}", Blob::default()).unwrap();
     }
     #[test]
-    pub fn streamer_send_test() {
+    fn streamer_send_test() {
         let read = UdpSocket::bind("127.0.0.1:0").expect("bind");
         read.set_read_timeout(Some(Duration::new(1, 0))).unwrap();
 
@@ -184,7 +241,7 @@ mod test {
             let (s_responder, r_responder) = channel();
             let t_responder = responder("streamer_send_test", Arc::new(send), r_responder);
             let mut msgs = Vec::new();
-            for i in 0..10 {
+            for i in 0..5 {
                 let b = SharedBlob::default();
                 {
                     let mut w = b.write().unwrap();
@@ -198,9 +255,9 @@ mod test {
             t_responder
         };
 
-        let mut num = 0;
-        get_msgs(r_reader, &mut num);
-        assert_eq!(num, 10);
+        let mut num = 5;
+        get_msgs(r_reader, &mut num).expect("get_msgs");
+        assert_eq!(num, 0);
         exit.store(true, Ordering::Relaxed);
         t_receiver.join().expect("join");
         t_responder.join().expect("join");

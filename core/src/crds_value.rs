@@ -12,57 +12,19 @@ pub enum CrdsValue {
     ContactInfo(ContactInfo),
     /// * Merge Strategy - Latest wallclock is picked
     Vote(Vote),
-    /// * Merge Strategy - Latest wallclock is picked
-    LeaderId(LeaderId),
-}
-
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
-pub struct LeaderId {
-    pub id: Pubkey,
-    pub signature: Signature,
-    pub leader_id: Pubkey,
-    pub wallclock: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Vote {
+    pub from: Pubkey,
     pub transaction: Transaction,
     pub signature: Signature,
     pub wallclock: u64,
 }
 
-impl Signable for LeaderId {
-    fn pubkey(&self) -> Pubkey {
-        self.id
-    }
-
-    fn signable_data(&self) -> Vec<u8> {
-        #[derive(Serialize)]
-        struct SignData {
-            id: Pubkey,
-            leader_id: Pubkey,
-            wallclock: u64,
-        }
-        let data = SignData {
-            id: self.id,
-            leader_id: self.leader_id,
-            wallclock: self.wallclock,
-        };
-        serialize(&data).expect("unable to serialize LeaderId")
-    }
-
-    fn get_signature(&self) -> Signature {
-        self.signature
-    }
-
-    fn set_signature(&mut self, signature: Signature) {
-        self.signature = signature
-    }
-}
-
 impl Signable for Vote {
     fn pubkey(&self) -> Pubkey {
-        self.transaction.account_keys[0]
+        self.from
     }
 
     fn signable_data(&self) -> Vec<u8> {
@@ -93,7 +55,6 @@ impl Signable for Vote {
 pub enum CrdsValueLabel {
     ContactInfo(Pubkey),
     Vote(Pubkey),
-    LeaderId(Pubkey),
 }
 
 impl fmt::Display for CrdsValueLabel {
@@ -101,7 +62,6 @@ impl fmt::Display for CrdsValueLabel {
         match self {
             CrdsValueLabel::ContactInfo(_) => write!(f, "ContactInfo({})", self.pubkey()),
             CrdsValueLabel::Vote(_) => write!(f, "Vote({})", self.pubkey()),
-            CrdsValueLabel::LeaderId(_) => write!(f, "LeaderId({})", self.pubkey()),
         }
     }
 }
@@ -111,26 +71,14 @@ impl CrdsValueLabel {
         match self {
             CrdsValueLabel::ContactInfo(p) => *p,
             CrdsValueLabel::Vote(p) => *p,
-            CrdsValueLabel::LeaderId(p) => *p,
-        }
-    }
-}
-
-impl LeaderId {
-    pub fn new(id: Pubkey, leader_id: Pubkey, wallclock: u64) -> Self {
-        LeaderId {
-            id,
-            signature: Signature::default(),
-            leader_id,
-            wallclock,
         }
     }
 }
 
 impl Vote {
-    // TODO: it might make sense for the transaction to encode the wallclock in the userdata
-    pub fn new(transaction: Transaction, wallclock: u64) -> Self {
+    pub fn new(from: &Pubkey, transaction: Transaction, wallclock: u64) -> Self {
         Vote {
+            from: *from,
             transaction,
             signature: Signature::default(),
             wallclock,
@@ -146,7 +94,6 @@ impl CrdsValue {
         match self {
             CrdsValue::ContactInfo(contact_info) => contact_info.wallclock,
             CrdsValue::Vote(vote) => vote.wallclock,
-            CrdsValue::LeaderId(leader_id) => leader_id.wallclock,
         }
     }
     pub fn label(&self) -> CrdsValueLabel {
@@ -155,18 +102,11 @@ impl CrdsValue {
                 CrdsValueLabel::ContactInfo(contact_info.pubkey())
             }
             CrdsValue::Vote(vote) => CrdsValueLabel::Vote(vote.pubkey()),
-            CrdsValue::LeaderId(leader_id) => CrdsValueLabel::LeaderId(leader_id.pubkey()),
         }
     }
     pub fn contact_info(&self) -> Option<&ContactInfo> {
         match self {
             CrdsValue::ContactInfo(contact_info) => Some(contact_info),
-            _ => None,
-        }
-    }
-    pub fn leader_id(&self) -> Option<&LeaderId> {
-        match self {
-            CrdsValue::LeaderId(leader_id) => Some(leader_id),
             _ => None,
         }
     }
@@ -177,11 +117,10 @@ impl CrdsValue {
         }
     }
     /// Return all the possible labels for a record identified by Pubkey.
-    pub fn record_labels(key: Pubkey) -> [CrdsValueLabel; 3] {
+    pub fn record_labels(key: &Pubkey) -> [CrdsValueLabel; 2] {
         [
-            CrdsValueLabel::ContactInfo(key),
-            CrdsValueLabel::Vote(key),
-            CrdsValueLabel::LeaderId(key),
+            CrdsValueLabel::ContactInfo(*key),
+            CrdsValueLabel::Vote(*key),
         ]
     }
 }
@@ -191,14 +130,12 @@ impl Signable for CrdsValue {
         match self {
             CrdsValue::ContactInfo(contact_info) => contact_info.sign(keypair),
             CrdsValue::Vote(vote) => vote.sign(keypair),
-            CrdsValue::LeaderId(leader_id) => leader_id.sign(keypair),
         };
     }
     fn verify(&self) -> bool {
         match self {
             CrdsValue::ContactInfo(contact_info) => contact_info.verify(),
             CrdsValue::Vote(vote) => vote.verify(),
-            CrdsValue::LeaderId(leader_id) => leader_id.verify(),
         }
     }
 
@@ -206,7 +143,6 @@ impl Signable for CrdsValue {
         match self {
             CrdsValue::ContactInfo(contact_info) => contact_info.pubkey(),
             CrdsValue::Vote(vote) => vote.pubkey(),
-            CrdsValue::LeaderId(leader_id) => leader_id.pubkey(),
         }
     }
 
@@ -233,44 +169,48 @@ mod test {
 
     #[test]
     fn test_labels() {
-        let mut hits = [false; 3];
+        let mut hits = [false; 2];
         // this method should cover all the possible labels
-        for v in &CrdsValue::record_labels(Pubkey::default()) {
+        for v in &CrdsValue::record_labels(&Pubkey::default()) {
             match v {
                 CrdsValueLabel::ContactInfo(_) => hits[0] = true,
                 CrdsValueLabel::Vote(_) => hits[1] = true,
-                CrdsValueLabel::LeaderId(_) => hits[2] = true,
             }
         }
         assert!(hits.iter().all(|x| *x));
     }
     #[test]
     fn test_keys_and_values() {
-        let v = CrdsValue::LeaderId(LeaderId::default());
-        let key = v.clone().leader_id().unwrap().id;
-        assert_eq!(v.wallclock(), 0);
-        assert_eq!(v.label(), CrdsValueLabel::LeaderId(key));
-
         let v = CrdsValue::ContactInfo(ContactInfo::default());
         assert_eq!(v.wallclock(), 0);
         let key = v.clone().contact_info().unwrap().id;
         assert_eq!(v.label(), CrdsValueLabel::ContactInfo(key));
 
-        let v = CrdsValue::Vote(Vote::new(test_tx(), 0));
+        let v = CrdsValue::Vote(Vote::new(&Pubkey::default(), test_tx(), 0));
         assert_eq!(v.wallclock(), 0);
-        let key = v.clone().vote().unwrap().transaction.account_keys[0];
+        let key = v.clone().vote().unwrap().from;
         assert_eq!(v.label(), CrdsValueLabel::Vote(key));
     }
     #[test]
     fn test_signature() {
         let keypair = Keypair::new();
-        let fake_keypair = Keypair::new();
-        let leader = LeaderId::new(keypair.pubkey(), Pubkey::default(), timestamp());
-        let mut v = CrdsValue::LeaderId(leader);
-        v.sign(&keypair);
-        assert!(v.verify());
-        v.sign(&fake_keypair);
-        assert!(!v.verify());
+        let wrong_keypair = Keypair::new();
+        let mut v =
+            CrdsValue::ContactInfo(ContactInfo::new_localhost(&keypair.pubkey(), timestamp()));
+        verify_signatures(&mut v, &keypair, &wrong_keypair);
+        v = CrdsValue::Vote(Vote::new(&keypair.pubkey(), test_tx(), timestamp()));
+        verify_signatures(&mut v, &keypair, &wrong_keypair);
     }
 
+    fn verify_signatures(
+        value: &mut CrdsValue,
+        correct_keypair: &Keypair,
+        wrong_keypair: &Keypair,
+    ) {
+        assert!(!value.verify());
+        value.sign(&correct_keypair);
+        assert!(value.verify());
+        value.sign(&wrong_keypair);
+        assert!(!value.verify());
+    }
 }

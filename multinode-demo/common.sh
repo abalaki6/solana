@@ -21,7 +21,8 @@ if [[ $(uname) != Linux ]]; then
   fi
 fi
 
-if [[ -n $USE_INSTALL ]]; then # Assume |./scripts/cargo-install-all.sh| was run
+
+if [[ -n $USE_INSTALL || ! -f "$(dirname "${BASH_SOURCE[0]}")"/../Cargo.toml ]]; then
   solana_program() {
     declare program="$1"
     printf "solana-%s" "$program"
@@ -108,6 +109,98 @@ tune_system() {
     )
 
   fi
+}
+
+airdrop() {
+  declare keypair_file=$1
+  declare host=$2
+  declare amount=$3
+
+  declare address
+  address=$($solana_wallet --keypair "$keypair_file" address)
+
+  # TODO: Until https://github.com/solana-labs/solana/issues/2355 is resolved
+  # a fullnode needs N lamports as its vote account gets re-created on every
+  # node restart, costing it lamports
+  declare retries=5
+
+  while ! $solana_wallet --keypair "$keypair_file" --host "$host" airdrop "$amount"; do
+
+    # TODO: Consider moving this retry logic into `solana-wallet airdrop`
+    #   itself, currently it does not retry on "Connection refused" errors.
+    ((retries--))
+    if [[ $retries -le 0 ]]; then
+        echo "Airdrop to $address failed."
+        return 1
+    fi
+    echo "Airdrop to $address failed. Remaining retries: $retries"
+    sleep 1
+  done
+
+  return 0
+}
+
+setup_fullnode_staking() {
+  declare drone_address=$1
+  declare fullnode_id_path=$2
+  declare staker_id_path=$3
+
+  declare fullnode_id
+  fullnode_id=$($solana_wallet --keypair "$fullnode_id_path" address)
+
+  declare staker_id
+  staker_id=$($solana_wallet --keypair "$staker_id_path" address)
+
+  if [[ -f "$staker_id_path".configured ]]; then
+    echo "Staking account has already been configured"
+    return 0
+  fi
+
+  # A fullnode requires 43 lamports to function:
+  # - one lamport to keep the node identity public key valid. TODO: really??
+  # - 42 more for the staker account we fund
+  airdrop "$fullnode_id_path" "$drone_address" 43 || return $?
+
+  # A little wrong, fund the staking account from the
+  #  to the node.  Maybe next time consider doing this the opposite
+  #  way or use an ephemeral account
+  $solana_wallet --keypair "$fullnode_id_path" --host "$drone_address" \
+               create-staking-account "$staker_id" 42 || return $?
+
+  # as the staker, set the node as the delegate and the staker as
+  #  the vote-signer
+  $solana_wallet --keypair "$staker_id_path" --host "$drone_address" \
+                 configure-staking-account \
+                 --delegate-account "$fullnode_id" \
+                 --authorize-voter "$staker_id"  || return $?
+
+
+  touch "$staker_id_path".configured
+  return 0
+}
+
+fullnode_usage() {
+  if [[ -n $1 ]]; then
+    echo "$*"
+    echo
+  fi
+  cat <<EOF
+usage: $0 [-x] [--blockstream PATH] [--init-complete-file FILE] [--only-bootstrap-stake] [--no-voting] [--rpc-port port] [rsync network path to bootstrap leader configuration] [network entry point]
+
+Start a full node on the specified network
+
+  -x                        - start a new, dynamically-configured full node. Does not apply to the bootstrap leader
+  -X [label]                - start or restart a dynamically-configured full node with
+                              the specified label. Does not apply to the bootstrap leader
+  --blockstream PATH        - open blockstream at this unix domain socket location
+  --init-complete-file FILE - create this file, if it doesn't already exist, once node initialization is complete
+  --only-bootstrap-stake    - Only stake the bootstrap leader, effectively disabling leader rotation
+  --public-address          - advertise public machine address in gossip.  By default the local machine address is advertised
+  --no-voting               - start node without vote signer
+  --rpc-port port           - custom RPC port for this node
+
+EOF
+  exit 1
 }
 
 # The directory on the bootstrap leader that is rsynced by other full nodes as

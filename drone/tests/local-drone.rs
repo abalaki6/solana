@@ -17,10 +17,10 @@ fn test_local_drone() {
         space: 0,
         program_id: system_program::id(),
     };
-    let mut expected_tx = Transaction::new(
+    let mut expected_tx = Transaction::new_signed(
         &keypair,
         &[to],
-        system_program::id(),
+        &system_program::id(),
         &expected_instruction,
         blockhash,
         0,

@@ -5,8 +5,8 @@ use libc::c_char;
 use log::*;
 use solana_rbpf::{EbpfVmRaw, MemoryRegion};
 use solana_sdk::account::KeyedAccount;
+use solana_sdk::instruction::InstructionError;
 use solana_sdk::loader_instruction::LoaderInstruction;
-use solana_sdk::native_program::ProgramError;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::solana_entrypoint;
 use std::ffi::CStr;
@@ -148,9 +148,9 @@ fn serialize_parameters(
             .unwrap();
         v.write_all(info.unsigned_key().as_ref()).unwrap();
         v.write_u64::<LittleEndian>(info.account.lamports).unwrap();
-        v.write_u64::<LittleEndian>(info.account.userdata.len() as u64)
+        v.write_u64::<LittleEndian>(info.account.data.len() as u64)
             .unwrap();
-        v.write_all(&info.account.userdata).unwrap();
+        v.write_all(&info.account.data).unwrap();
         v.write_all(info.account.owner.as_ref()).unwrap();
     }
     v.write_u64::<LittleEndian>(data.len() as u64).unwrap();
@@ -171,10 +171,10 @@ fn deserialize_parameters(keyed_accounts: &mut [KeyedAccount], buffer: &[u8]) {
 
         start += mem::size_of::<u64>() // skip lamports
                   + mem::size_of::<u64>(); // skip length tag
-        let end = start + info.account.userdata.len();
-        info.account.userdata.clone_from_slice(&buffer[start..end]);
+        let end = start + info.account.data.len();
+        info.account.data.clone_from_slice(&buffer[start..end]);
 
-        start += info.account.userdata.len() // skip userdata
+        start += info.account.data.len() // skip data
                   + mem::size_of::<Pubkey>(); // skip owner
     }
 }
@@ -185,19 +185,19 @@ fn entrypoint(
     keyed_accounts: &mut [KeyedAccount],
     tx_data: &[u8],
     tick_height: u64,
-) -> Result<(), ProgramError> {
+) -> Result<(), InstructionError> {
     solana_logger::setup();
 
     if keyed_accounts[0].account.executable {
         let (progs, params) = keyed_accounts.split_at_mut(1);
-        let prog = &progs[0].account.userdata;
+        let prog = &progs[0].account.data;
         info!("Call BPF program");
         //dump_program(keyed_accounts[0].key, prog);
         let mut vm = match create_vm(prog) {
             Ok(vm) => vm,
             Err(e) => {
                 warn!("Failed to create BPF VM: {}", e);
-                return Err(ProgramError::GenericError);
+                return Err(InstructionError::GenericError);
             }
         };
         let mut v = serialize_parameters(program_id, params, &tx_data, tick_height);
@@ -205,12 +205,12 @@ fn entrypoint(
             Ok(status) => {
                 if 0 == status {
                     warn!("BPF program failed: {}", status);
-                    return Err(ProgramError::GenericError);
+                    return Err(InstructionError::GenericError);
                 }
             }
             Err(e) => {
                 warn!("BPF VM failed to run program: {}", e);
-                return Err(ProgramError::GenericError);
+                return Err(InstructionError::GenericError);
             }
         }
         deserialize_parameters(params, &v);
@@ -221,22 +221,22 @@ fn entrypoint(
     } else if let Ok(instruction) = bincode::deserialize(tx_data) {
         if keyed_accounts[0].signer_key().is_none() {
             warn!("key[0] did not sign the transaction");
-            return Err(ProgramError::GenericError);
+            return Err(InstructionError::GenericError);
         }
         match instruction {
             LoaderInstruction::Write { offset, bytes } => {
                 let offset = offset as usize;
                 let len = bytes.len();
                 debug!("Write: offset={} length={}", offset, len);
-                if keyed_accounts[0].account.userdata.len() < offset + len {
+                if keyed_accounts[0].account.data.len() < offset + len {
                     warn!(
                         "Write overflow: {} < {}",
-                        keyed_accounts[0].account.userdata.len(),
+                        keyed_accounts[0].account.data.len(),
                         offset + len
                     );
-                    return Err(ProgramError::GenericError);
+                    return Err(InstructionError::GenericError);
                 }
-                keyed_accounts[0].account.userdata[offset..offset + len].copy_from_slice(&bytes);
+                keyed_accounts[0].account.data[offset..offset + len].copy_from_slice(&bytes);
             }
             LoaderInstruction::Finalize => {
                 keyed_accounts[0].account.executable = true;
@@ -248,7 +248,7 @@ fn entrypoint(
         }
     } else {
         warn!("Invalid program transaction: {:?}", tx_data);
-        return Err(ProgramError::GenericError);
+        return Err(InstructionError::GenericError);
     }
     Ok(())
 }

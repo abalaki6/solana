@@ -1,13 +1,32 @@
-//! The `budget_expr` module provides a domain-specific language for payment plans. Users create BudgetExpr objects that
+//! The `budget_expr` module provides a domain-specific language for pa&yment plans. Users create BudgetExpr objects that
 //! are given to an interpreter. The interpreter listens for `Witness` transactions,
 //! which it uses to reduce the payment plan. When the budget is reduced to a
 //! `Payment`, the payment is executed.
 
-use crate::payment_plan::{Payment, Witness};
 use chrono::prelude::*;
 use serde_derive::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::mem;
+
+/// The types of events a payment plan can process.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+pub enum Witness {
+    /// The current time.
+    Timestamp(DateTime<Utc>),
+
+    /// A signature from Pubkey.
+    Signature,
+}
+
+/// Some amount of lamports that should be sent to the `to` `Pubkey`.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+pub struct Payment {
+    /// Amount to be paid.
+    pub lamports: u64,
+
+    /// The `Pubkey` that `lamports` should be paid to.
+    pub to: Pubkey,
+}
 
 /// A data type representing a `Witness` that the payment plan is waiting on.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
@@ -52,56 +71,91 @@ pub enum BudgetExpr {
 
 impl BudgetExpr {
     /// Create the simplest budget - one that pays `lamports` to Pubkey.
-    pub fn new_payment(lamports: u64, to: Pubkey) -> Self {
-        BudgetExpr::Pay(Payment { lamports, to })
+    pub fn new_payment(lamports: u64, to: &Pubkey) -> Self {
+        BudgetExpr::Pay(Payment { lamports, to: *to })
     }
 
     /// Create a budget that pays `lamports` to `to` after being witnessed by `from`.
-    pub fn new_authorized_payment(from: Pubkey, lamports: u64, to: Pubkey) -> Self {
+    pub fn new_authorized_payment(from: &Pubkey, lamports: u64, to: &Pubkey) -> Self {
         BudgetExpr::After(
-            Condition::Signature(from),
+            Condition::Signature(*from),
             Box::new(Self::new_payment(lamports, to)),
+        )
+    }
+
+    /// Create a budget that pays `lamports` to `to` after being witnessed by `witness` unless
+    /// canceled with a signature from `from`.
+    pub fn new_cancelable_authorized_payment(
+        witness: &Pubkey,
+        lamports: u64,
+        to: &Pubkey,
+        from: Option<Pubkey>,
+    ) -> Self {
+        if from.is_none() {
+            return Self::new_authorized_payment(witness, lamports, to);
+        }
+        let from = from.unwrap();
+        BudgetExpr::Or(
+            (
+                Condition::Signature(*witness),
+                Box::new(BudgetExpr::new_payment(lamports, to)),
+            ),
+            (
+                Condition::Signature(from),
+                Box::new(BudgetExpr::new_payment(lamports, &from)),
+            ),
         )
     }
 
     /// Create a budget that pays lamports` to `to` after being witnessed by 2x `from`s
     pub fn new_2_2_multisig_payment(
-        from0: Pubkey,
-        from1: Pubkey,
+        from0: &Pubkey,
+        from1: &Pubkey,
         lamports: u64,
-        to: Pubkey,
+        to: &Pubkey,
     ) -> Self {
         BudgetExpr::And(
-            Condition::Signature(from0),
-            Condition::Signature(from1),
+            Condition::Signature(*from0),
+            Condition::Signature(*from1),
             Box::new(Self::new_payment(lamports, to)),
         )
     }
 
-    /// Create a budget that pays `lamports` to `to` after the given DateTime.
-    pub fn new_future_payment(dt: DateTime<Utc>, from: Pubkey, lamports: u64, to: Pubkey) -> Self {
+    /// Create a budget that pays `lamports` to `to` after the given DateTime signed
+    /// by `dt_pubkey`.
+    pub fn new_future_payment(
+        dt: DateTime<Utc>,
+        dt_pubkey: &Pubkey,
+        lamports: u64,
+        to: &Pubkey,
+    ) -> Self {
         BudgetExpr::After(
-            Condition::Timestamp(dt, from),
+            Condition::Timestamp(dt, *dt_pubkey),
             Box::new(Self::new_payment(lamports, to)),
         )
     }
 
     /// Create a budget that pays `lamports` to `to` after the given DateTime
-    /// unless cancelled by `from`.
+    /// signed by `dt_pubkey` unless canceled by `from`.
     pub fn new_cancelable_future_payment(
         dt: DateTime<Utc>,
-        from: Pubkey,
+        dt_pubkey: &Pubkey,
         lamports: u64,
-        to: Pubkey,
+        to: &Pubkey,
+        from: Option<Pubkey>,
     ) -> Self {
+        if from.is_none() {
+            return Self::new_future_payment(dt, dt_pubkey, lamports, to);
+        }
+        let from = from.unwrap();
         BudgetExpr::Or(
             (
-                Condition::Timestamp(dt, from),
+                Condition::Timestamp(dt, *dt_pubkey),
                 Box::new(Self::new_payment(lamports, to)),
             ),
             (
                 Condition::Signature(from),
-                Box::new(Self::new_payment(lamports, to)),
+                Box::new(Self::new_payment(lamports, &from)),
             ),
         )
     }
@@ -183,10 +237,12 @@ mod tests {
         let dt = Utc.ymd(2014, 11, 14).and_hms(8, 9, 10);
         let from = Pubkey::default();
         let to = Pubkey::default();
-        assert!(BudgetExpr::new_payment(42, to).verify(42));
-        assert!(BudgetExpr::new_authorized_payment(from, 42, to).verify(42));
-        assert!(BudgetExpr::new_future_payment(dt, from, 42, to).verify(42));
-        assert!(BudgetExpr::new_cancelable_future_payment(dt, from, 42, to).verify(42));
+        assert!(BudgetExpr::new_payment(42, &to).verify(42));
+        assert!(BudgetExpr::new_authorized_payment(&from, 42, &to).verify(42));
+        assert!(BudgetExpr::new_future_payment(dt, &from, 42, &to).verify(42));
+        assert!(
+            BudgetExpr::new_cancelable_future_payment(dt, &from, 42, &to, Some(from)).verify(42)
+        );
     }
 
     #[test]
@@ -194,9 +250,9 @@ mod tests {
         let from = Pubkey::default();
         let to = Pubkey::default();
 
-        let mut expr = BudgetExpr::new_authorized_payment(from, 42, to);
+        let mut expr = BudgetExpr::new_authorized_payment(&from, 42, &to);
         expr.apply_witness(&Witness::Signature, &from);
-        assert_eq!(expr, BudgetExpr::new_payment(42, to));
+        assert_eq!(expr, BudgetExpr::new_payment(42, &to));
     }
 
     #[test]
@@ -205,9 +261,9 @@ mod tests {
         let from = Keypair::new().pubkey();
         let to = Keypair::new().pubkey();
 
-        let mut expr = BudgetExpr::new_future_payment(dt, from, 42, to);
+        let mut expr = BudgetExpr::new_future_payment(dt, &from, 42, &to);
         expr.apply_witness(&Witness::Timestamp(dt), &from);
-        assert_eq!(expr, BudgetExpr::new_payment(42, to));
+        assert_eq!(expr, BudgetExpr::new_payment(42, &to));
     }
 
     #[test]
@@ -218,7 +274,7 @@ mod tests {
         let from = Keypair::new().pubkey();
         let to = Keypair::new().pubkey();
 
-        let mut expr = BudgetExpr::new_future_payment(dt, from, 42, to);
+        let mut expr = BudgetExpr::new_future_payment(dt, &from, 42, &to);
         let orig_expr = expr.clone();
         expr.apply_witness(&Witness::Timestamp(dt), &to); // <-- Attack!
         assert_eq!(expr, orig_expr);
@@ -230,13 +286,13 @@ mod tests {
         let from = Pubkey::default();
         let to = Pubkey::default();
 
-        let mut expr = BudgetExpr::new_cancelable_future_payment(dt, from, 42, to);
+        let mut expr = BudgetExpr::new_cancelable_future_payment(dt, &from, 42, &to, Some(from));
         expr.apply_witness(&Witness::Timestamp(dt), &from);
-        assert_eq!(expr, BudgetExpr::new_payment(42, to));
+        assert_eq!(expr, BudgetExpr::new_payment(42, &to));
 
-        let mut expr = BudgetExpr::new_cancelable_future_payment(dt, from, 42, to);
+        let mut expr = BudgetExpr::new_cancelable_future_payment(dt, &from, 42, &to, Some(from));
         expr.apply_witness(&Witness::Signature, &from);
-        assert_eq!(expr, BudgetExpr::new_payment(42, from));
+        assert_eq!(expr, BudgetExpr::new_payment(42, &from));
     }
     #[test]
     fn test_2_2_multisig_payment() {
@@ -244,9 +300,9 @@ mod tests {
         let from1 = Keypair::new().pubkey();
         let to = Pubkey::default();
 
-        let mut expr = BudgetExpr::new_2_2_multisig_payment(from0, from1, 42, to);
+        let mut expr = BudgetExpr::new_2_2_multisig_payment(&from0, &from1, 42, &to);
         expr.apply_witness(&Witness::Signature, &from0);
-        assert_eq!(expr, BudgetExpr::new_authorized_payment(from1, 42, to));
+        assert_eq!(expr, BudgetExpr::new_authorized_payment(&from1, 42, &to));
     }
 
     #[test]
@@ -256,12 +312,12 @@ mod tests {
         let from2 = Keypair::new().pubkey();
         let to = Pubkey::default();
 
-        let expr = BudgetExpr::new_2_2_multisig_payment(from0, from1, 42, to);
+        let expr = BudgetExpr::new_2_2_multisig_payment(&from0, &from1, 42, &to);
         let mut expr = BudgetExpr::After(Condition::Signature(from2), Box::new(expr));
 
         expr.apply_witness(&Witness::Signature, &from2);
         expr.apply_witness(&Witness::Signature, &from0);
-        assert_eq!(expr, BudgetExpr::new_authorized_payment(from1, 42, to));
+        assert_eq!(expr, BudgetExpr::new_authorized_payment(&from1, 42, &to));
     }
 
     #[test]
@@ -271,16 +327,16 @@ mod tests {
         let dt = Utc.ymd(2014, 11, 11).and_hms(7, 7, 7);
         let to = Pubkey::default();
 
-        let expr = BudgetExpr::new_2_2_multisig_payment(from0, from1, 42, to);
+        let expr = BudgetExpr::new_2_2_multisig_payment(&from0, &from1, 42, &to);
         let mut expr = BudgetExpr::After(Condition::Timestamp(dt, from0), Box::new(expr));
 
         expr.apply_witness(&Witness::Timestamp(dt), &from0);
         assert_eq!(
             expr,
-            BudgetExpr::new_2_2_multisig_payment(from0, from1, 42, to)
+            BudgetExpr::new_2_2_multisig_payment(&from0, &from1, 42, &to)
         );
 
         expr.apply_witness(&Witness::Signature, &from0);
-        assert_eq!(expr, BudgetExpr::new_authorized_payment(from1, 42, to));
+        assert_eq!(expr, BudgetExpr::new_authorized_payment(&from1, 42, &to));
     }
 }

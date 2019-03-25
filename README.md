@@ -44,7 +44,7 @@ $ source $HOME/.cargo/env
 $ rustup component add rustfmt-preview
 ```
 
-If your rustc version is lower than 1.31.0, please update it:
+If your rustc version is lower than 1.33.0, please update it:
 
 ```bash
 $ rustup update
@@ -81,12 +81,6 @@ Run the test suite:
 
 ```bash
 $ cargo test --all
-```
-
-To emulate all the tests that will run on a Pull Request, run:
-
-```bash
-$ ./ci/run-local.sh
 ```
 
 Local Testnet

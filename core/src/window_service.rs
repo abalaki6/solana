@@ -3,7 +3,7 @@
 use crate::blocktree::Blocktree;
 use crate::cluster_info::ClusterInfo;
 use crate::db_window::*;
-use crate::repair_service::RepairService;
+use crate::repair_service::{RepairService, RepairSlotRange};
 use crate::result::{Error, Result};
 use crate::service::Service;
 use crate::streamer::{BlobReceiver, BlobSender};
@@ -103,9 +103,15 @@ impl WindowService {
         retransmit: BlobSender,
         repair_socket: Arc<UdpSocket>,
         exit: &Arc<AtomicBool>,
+        repair_slot_range: RepairSlotRange,
     ) -> WindowService {
-        let repair_service =
-            RepairService::new(blocktree.clone(), exit, repair_socket, cluster_info.clone());
+        let repair_service = RepairService::new(
+            blocktree.clone(),
+            exit,
+            repair_socket,
+            cluster_info.clone(),
+            repair_slot_range,
+        );
         let exit = exit.clone();
         let t_window = Builder::new()
             .name("solana-window".to_string())
@@ -153,6 +159,7 @@ mod test {
     use crate::blocktree::Blocktree;
     use crate::cluster_info::{ClusterInfo, Node};
     use crate::entry::make_consecutive_blobs;
+    use crate::repair_service::RepairSlotRange;
     use crate::service::Service;
     use crate::streamer::{blob_receiver, responder};
     use crate::window_service::WindowService;
@@ -172,9 +179,8 @@ mod test {
         let leader_node = Node::new_localhost();
         let validator_node = Node::new_localhost();
         let exit = Arc::new(AtomicBool::new(false));
-        let mut cluster_info_me = ClusterInfo::new(validator_node.info.clone());
+        let cluster_info_me = ClusterInfo::new_with_invalid_keypair(validator_node.info.clone());
         let me_id = leader_node.info.id;
-        cluster_info_me.set_leader(me_id);
         let subs = Arc::new(RwLock::new(cluster_info_me));
 
         let (s_reader, r_reader) = channel();
@@ -191,6 +197,7 @@ mod test {
             s_retransmit,
             Arc::new(leader_node.sockets.repair),
             &exit,
+            RepairSlotRange::default(),
         );
         let t_responder = {
             let (s_responder, r_responder) = channel();
@@ -244,7 +251,7 @@ mod test {
         let leader_node = Node::new_localhost();
         let validator_node = Node::new_localhost();
         let exit = Arc::new(AtomicBool::new(false));
-        let cluster_info_me = ClusterInfo::new(validator_node.info.clone());
+        let cluster_info_me = ClusterInfo::new_with_invalid_keypair(validator_node.info.clone());
         let me_id = leader_node.info.id;
         let subs = Arc::new(RwLock::new(cluster_info_me));
 
@@ -262,6 +269,7 @@ mod test {
             s_retransmit,
             Arc::new(leader_node.sockets.repair),
             &exit,
+            RepairSlotRange::default(),
         );
         let t_responder = {
             let (s_responder, r_responder) = channel();
@@ -278,7 +286,6 @@ mod test {
             }
             s_responder.send(msgs).expect("send");
 
-            subs.write().unwrap().set_leader(me_id);
             let mut msgs1 = Vec::new();
             for v in 1..5 {
                 let i = 9 + v;

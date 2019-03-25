@@ -95,119 +95,10 @@ mod test {
     use crate::erasure::test::{generate_blocktree_from_window, setup_window_ledger};
     #[cfg(all(feature = "erasure", test))]
     use crate::erasure::{NUM_CODING, NUM_DATA};
-    use crate::packet::{index_blobs, Blob, Packet, Packets, SharedBlob, PACKET_DATA_SIZE};
-    use crate::streamer::{receiver, responder, PacketReceiver};
+    use crate::packet::{index_blobs, Blob};
     use solana_sdk::signature::{Keypair, KeypairUtil};
-    use std::io;
-    use std::io::Write;
-    use std::net::UdpSocket;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc::channel;
     use std::sync::Arc;
-    use std::time::Duration;
 
-    fn get_msgs(r: PacketReceiver, num: &mut usize) {
-        for _t in 0..5 {
-            let timer = Duration::new(1, 0);
-            match r.recv_timeout(timer) {
-                Ok(m) => *num += m.read().unwrap().packets.len(),
-                e => info!("error {:?}", e),
-            }
-            if *num == 10 {
-                break;
-            }
-        }
-    }
-    #[test]
-    pub fn streamer_debug() {
-        write!(io::sink(), "{:?}", Packet::default()).unwrap();
-        write!(io::sink(), "{:?}", Packets::default()).unwrap();
-        write!(io::sink(), "{:?}", Blob::default()).unwrap();
-    }
-
-    #[test]
-    pub fn streamer_send_test() {
-        let read = UdpSocket::bind("127.0.0.1:0").expect("bind");
-        read.set_read_timeout(Some(Duration::new(1, 0))).unwrap();
-
-        let addr = read.local_addr().unwrap();
-        let send = UdpSocket::bind("127.0.0.1:0").expect("bind");
-        let exit = Arc::new(AtomicBool::new(false));
-        let (s_reader, r_reader) = channel();
-        let t_receiver = receiver(Arc::new(read), &exit, s_reader, "window-streamer-test");
-        let t_responder = {
-            let (s_responder, r_responder) = channel();
-            let t_responder = responder("streamer_send_test", Arc::new(send), r_responder);
-            let mut msgs = Vec::new();
-            for i in 0..10 {
-                let b = SharedBlob::default();
-                {
-                    let mut w = b.write().unwrap();
-                    w.data[0] = i as u8;
-                    w.meta.size = PACKET_DATA_SIZE;
-                    w.meta.set_addr(&addr);
-                }
-                msgs.push(b);
-            }
-            s_responder.send(msgs).expect("send");
-            t_responder
-        };
-
-        let mut num = 0;
-        get_msgs(r_reader, &mut num);
-        assert_eq!(num, 10);
-        exit.store(true, Ordering::Relaxed);
-        t_receiver.join().expect("join");
-        t_responder.join().expect("join");
-    }
-    /*
-        #[test]
-        pub fn test_send_to_retransmit_stage() {
-            let leader = Keypair::new().pubkey();
-            let nonleader = Keypair::new().pubkey();
-            let mut leader_scheduler = LeaderScheduler::default();
-            leader_scheduler.set_leader_schedule(vec![leader]);
-            let leader_scheduler = Arc::new(RwLock::new(leader_scheduler));
-            let blob = SharedBlob::default();
-
-            let (blob_sender, blob_receiver) = channel();
-
-            // Expect all blobs to be sent to retransmit_stage
-            blob.write().unwrap().forward(false);
-            retransmit_blobs(
-                &vec![blob.clone()],
-                &leader_scheduler,
-                &blob_sender,
-                &nonleader,
-            )
-            .expect("Expect successful retransmit");
-            let _ = blob_receiver
-                .try_recv()
-                .expect("Expect input blob to be retransmitted");
-
-            blob.write().unwrap().forward(true);
-            retransmit_blobs(
-                &vec![blob.clone()],
-                &leader_scheduler,
-                &blob_sender,
-                &nonleader,
-            )
-            .expect("Expect successful retransmit");
-            let output_blob = blob_receiver
-                .try_recv()
-                .expect("Expect input blob to be retransmitted");
-
-            // retransmit_blobs shouldn't be modifying the blob. That is retransmit stage's job now
-            assert_eq!(*output_blob[0].read().unwrap(), *blob.read().unwrap());
-
-            // Expect blob from leader while currently leader to not be retransmitted
-            // Even when forward is set
-            blob.write().unwrap().forward(true);
-            retransmit_blobs(&vec![blob], &leader_scheduler, &blob_sender, &leader)
-                .expect("Expect successful retransmit");
-            assert!(blob_receiver.try_recv().is_err());
-        }
-    */
     #[test]
     pub fn test_find_missing_data_indexes_sanity() {
         let slot = 0;
@@ -222,7 +113,7 @@ mod test {
         assert_eq!(blocktree.find_missing_data_indexes(slot, 4, 3, 1), empty);
         assert_eq!(blocktree.find_missing_data_indexes(slot, 1, 2, 0), empty);
 
-        let mut blobs = make_tiny_test_entries(2).to_blobs();
+        let mut blobs = make_tiny_test_entries(2).to_single_entry_blobs();
 
         const ONE: u64 = 1;
         const OTHER: u64 = 4;
@@ -263,7 +154,7 @@ mod test {
         let gap = 10;
         assert!(gap > 3);
         let num_entries = 10;
-        let mut blobs = make_tiny_test_entries(num_entries).to_blobs();
+        let mut blobs = make_tiny_test_entries(num_entries).to_single_entry_blobs();
         for (i, b) in blobs.iter_mut().enumerate() {
             b.set_index(i as u64 * gap);
             b.set_slot(slot);
@@ -344,7 +235,8 @@ mod test {
 
         let num_entries_per_slot = 10;
         let num_slots = 2;
-        let mut blobs = make_tiny_test_entries(num_slots * num_entries_per_slot).to_blobs();
+        let mut blobs =
+            make_tiny_test_entries(num_slots * num_entries_per_slot).to_single_entry_blobs();
 
         // Insert every nth entry for each slot
         let nth = 3;
@@ -413,9 +305,9 @@ mod test {
 
         // Write entries
         let num_entries = 10;
-        let shared_blobs = make_tiny_test_entries(num_entries).to_shared_blobs();
+        let shared_blobs = make_tiny_test_entries(num_entries).to_single_entry_shared_blobs();
 
-        index_blobs(&shared_blobs, &Keypair::new().pubkey(), &mut 0, slot);
+        index_blobs(&shared_blobs, &Keypair::new().pubkey(), 0, slot, 0);
 
         let blob_locks: Vec<_> = shared_blobs.iter().map(|b| b.read().unwrap()).collect();
         let blobs: Vec<&Blob> = blob_locks.iter().map(|b| &**b).collect();
@@ -505,7 +397,7 @@ mod test {
         let original_entries = make_tiny_test_entries(num_entries);
         let shared_blobs = original_entries.clone().to_shared_blobs();
 
-        index_blobs(&shared_blobs, &Keypair::new().pubkey(), &mut 0, 0);
+        index_blobs(&shared_blobs, &Keypair::new().pubkey(), 0, 0, 0);
 
         for blob in shared_blobs.iter().rev() {
             process_blob(&blocktree, blob).expect("Expect successful processing of blob");

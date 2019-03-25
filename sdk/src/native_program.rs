@@ -1,49 +1,6 @@
 use crate::account::KeyedAccount;
+use crate::instruction::InstructionError;
 use crate::pubkey::Pubkey;
-use std;
-
-/// Reasons a program might have rejected an instruction.
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum ProgramError {
-    /// The program instruction returned an error
-    GenericError,
-
-    /// The arguments provided to a program instruction where invalid
-    InvalidArgument,
-
-    /// An instruction resulted in an account with a negative balance
-    /// The difference from InsufficientFundsForFee is that the transaction was executed by the
-    /// contract
-    ResultWithNegativeLamports,
-
-    /// Program's instruction lamport balance does not equal the balance after the instruction
-    UnbalancedInstruction,
-
-    /// Program modified an account's program id
-    ModifiedProgramId,
-
-    /// Program spent the lamports of an account that doesn't belong to it
-    ExternalAccountLamportSpend,
-
-    /// Program modified the userdata of an account that doesn't belong to it
-    ExternalAccountUserdataModified,
-
-    /// An account's userdata contents was invalid
-    InvalidUserdata,
-
-    /// An account's userdata was too small
-    UserdataTooSmall,
-
-    /// SystemInstruction::Assign was attempted on an account unowned by the system program
-    AssignOfUnownedAccount,
-}
-
-impl std::fmt::Display for ProgramError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "error")
-    }
-}
-impl std::error::Error for ProgramError {}
 
 // All native programs export a symbol named process()
 pub const ENTRYPOINT: &str = "process";
@@ -54,7 +11,7 @@ pub type Entrypoint = unsafe extern "C" fn(
     keyed_accounts: &mut [KeyedAccount],
     data: &[u8],
     tick_height: u64,
-) -> Result<(), ProgramError>;
+) -> Result<(), InstructionError>;
 
 // Convenience macro to define the native program entrypoint.  Supply a fn to this macro that
 // conforms to the `Entrypoint` type signature.
@@ -63,12 +20,32 @@ macro_rules! solana_entrypoint(
     ($entrypoint:ident) => (
         #[no_mangle]
         pub extern "C" fn process(
-            program_id: &Pubkey,
-            keyed_accounts: &mut [KeyedAccount],
+            program_id: &solana_sdk::pubkey::Pubkey,
+            keyed_accounts: &mut [solana_sdk::account::KeyedAccount],
             data: &[u8],
             tick_height: u64
-        ) -> Result<(), ProgramError> {
+        ) -> Result<(), solana_sdk::instruction::InstructionError> {
             $entrypoint(program_id, keyed_accounts, data, tick_height)
+        }
+    )
+);
+
+// Macro to define an entrypoint from a native `process_instruction` function.
+#[macro_export]
+macro_rules! process_instruction_entrypoint(
+    ($process_instruction:ident) => (
+        solana_sdk::solana_entrypoint!(process_instruction_entrypoint);
+        fn process_instruction_entrypoint(
+            program_id: &solana_sdk::pubkey::Pubkey,
+            keyed_accounts: &mut [solana_sdk::account::KeyedAccount],
+            data: &[u8],
+            tick_height: u64,
+        ) -> Result<(), solana_sdk::instruction::InstructionError> {
+            solana_logger::setup();
+
+            log::trace!("process_instruction: {:?}", data);
+            log::trace!("keyed_accounts: {:?}", keyed_accounts);
+            $process_instruction(program_id, keyed_accounts, data, tick_height)
         }
     )
 );

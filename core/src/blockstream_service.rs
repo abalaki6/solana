@@ -80,13 +80,13 @@ impl BlockstreamService {
                 tick_height += 1;
             }
             blockstream
-                .emit_entry_event(slot, tick_height, slot_leader, &entry)
+                .emit_entry_event(slot, tick_height, &slot_leader, &entry)
                 .unwrap_or_else(|e| {
                     debug!("Blockstream error: {:?}, {:?}", e, blockstream.output);
                 });
             if i == entries.len() - 1 {
                 blockstream
-                    .emit_block_event(slot, tick_height, slot_leader, entry.hash)
+                    .emit_block_event(slot, tick_height, &slot_leader, entry.hash)
                     .unwrap_or_else(|e| {
                         debug!("Blockstream error: {:?}, {:?}", e, blockstream.output);
                     });
@@ -127,7 +127,7 @@ mod test {
         genesis_block.ticks_per_slot = ticks_per_slot;
 
         let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
-        let blocktree = Blocktree::open_config(&ledger_path, ticks_per_slot).unwrap();
+        let blocktree = Blocktree::open(&ledger_path).unwrap();
 
         // Set up blockstream
         let mut blockstream = Blockstream::new("test_stream".to_string());
@@ -140,7 +140,7 @@ mod test {
 
         let keypair = Keypair::new();
         let mut blockhash = entries[3].hash;
-        let tx = SystemTransaction::new_account(&keypair, keypair.pubkey(), 1, Hash::default(), 0);
+        let tx = SystemTransaction::new_account(&keypair, &keypair.pubkey(), 1, Hash::default(), 0);
         let entry = Entry::new(&mut blockhash, 1, vec![tx]);
         blockhash = entry.hash;
         entries.push(entry);
@@ -150,7 +150,9 @@ mod test {
         let expected_entries = entries.clone();
         let expected_tick_heights = [5, 6, 7, 8, 8, 9];
 
-        blocktree.write_entries(1, 0, 0, &entries).unwrap();
+        blocktree
+            .write_entries(1, 0, 0, ticks_per_slot, &entries)
+            .unwrap();
 
         slot_full_sender.send((1, leader_id)).unwrap();
         BlockstreamService::process_entries(

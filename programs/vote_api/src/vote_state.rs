@@ -7,7 +7,7 @@ use bincode::{deserialize, serialize_into, serialized_size, ErrorKind};
 use log::*;
 use serde_derive::{Deserialize, Serialize};
 use solana_sdk::account::{Account, KeyedAccount};
-use solana_sdk::native_program::ProgramError;
+use solana_sdk::instruction::InstructionError;
 use solana_sdk::pubkey::Pubkey;
 use std::collections::VecDeque;
 
@@ -39,24 +39,29 @@ impl Lockout {
     pub fn expiration_slot(&self) -> u64 {
         self.slot + self.lockout()
     }
+    pub fn is_expired(&self, slot: u64) -> bool {
+        self.expiration_slot() < slot
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct VoteState {
     pub votes: VecDeque<Lockout>,
     pub delegate_id: Pubkey,
+    pub authorized_voter_id: Pubkey,
     pub root_slot: Option<u64>,
     credits: u64,
 }
 
 impl VoteState {
-    pub fn new(delegate_id: Pubkey) -> Self {
+    pub fn new(staker_id: &Pubkey) -> Self {
         let votes = VecDeque::new();
         let credits = 0;
         let root_slot = None;
         Self {
             votes,
-            delegate_id,
+            delegate_id: *staker_id,
+            authorized_voter_id: *staker_id,
             credits,
             root_slot,
         }
@@ -71,14 +76,14 @@ impl VoteState {
         serialized_size(&vote_state).unwrap() as usize
     }
 
-    pub fn deserialize(input: &[u8]) -> Result<Self, ProgramError> {
-        deserialize(input).map_err(|_| ProgramError::InvalidUserdata)
+    pub fn deserialize(input: &[u8]) -> Result<Self, InstructionError> {
+        deserialize(input).map_err(|_| InstructionError::InvalidAccountData)
     }
 
-    pub fn serialize(&self, output: &mut [u8]) -> Result<(), ProgramError> {
+    pub fn serialize(&self, output: &mut [u8]) -> Result<(), InstructionError> {
         serialize_into(output, self).map_err(|err| match *err {
-            ErrorKind::SizeLimit => ProgramError::UserdataTooSmall,
-            _ => ProgramError::GenericError,
+            ErrorKind::SizeLimit => InstructionError::AccountDataTooSmall,
+            _ => InstructionError::GenericError,
         })
     }
 
@@ -108,6 +113,15 @@ impl VoteState {
         self.double_lockouts();
     }
 
+    pub fn nth_recent_vote(&self, position: usize) -> Option<&Lockout> {
+        if position < self.votes.len() {
+            let pos = self.votes.len() - 1 - position;
+            self.votes.get(pos)
+        } else {
+            None
+        }
+    }
+
     /// Number of "credits" owed to this account from the mining pool. Submit this
     /// VoteState to the Rewards program to trade credits for lamports.
     pub fn credits(&self) -> u64 {
@@ -121,11 +135,7 @@ impl VoteState {
 
     fn pop_expired_votes(&mut self, slot: u64) {
         loop {
-            if self
-                .votes
-                .back()
-                .map_or(false, |v| v.expiration_slot() < slot)
-            {
+            if self.votes.back().map_or(false, |v| v.is_expired(slot)) {
                 self.votes.pop_back();
             } else {
                 break;
@@ -149,25 +159,54 @@ impl VoteState {
 
 pub fn delegate_stake(
     keyed_accounts: &mut [KeyedAccount],
-    node_id: Pubkey,
-) -> Result<(), ProgramError> {
+    node_id: &Pubkey,
+) -> Result<(), InstructionError> {
     if !check_id(&keyed_accounts[0].account.owner) {
         error!("account[0] is not assigned to the VOTE_PROGRAM");
-        Err(ProgramError::InvalidArgument)?;
+        Err(InstructionError::InvalidArgument)?;
     }
 
     if keyed_accounts[0].signer_key().is_none() {
         error!("account[0] should sign the transaction");
-        Err(ProgramError::InvalidArgument)?;
+        Err(InstructionError::InvalidArgument)?;
     }
 
-    let vote_state = VoteState::deserialize(&keyed_accounts[0].account.userdata);
+    let vote_state = VoteState::deserialize(&keyed_accounts[0].account.data);
     if let Ok(mut vote_state) = vote_state {
-        vote_state.delegate_id = node_id;
-        vote_state.serialize(&mut keyed_accounts[0].account.userdata)?;
+        vote_state.delegate_id = *node_id;
+        vote_state.serialize(&mut keyed_accounts[0].account.data)?;
     } else {
-        error!("account[0] does not valid userdata");
-        Err(ProgramError::InvalidUserdata)?;
+        error!("account[0] does not valid data");
+        Err(InstructionError::InvalidAccountData)?;
+    }
+
+    Ok(())
+}
+
+/// Authorize the given pubkey to sign votes. This may be called multiple times,
+/// but will implicitly withdraw authorization from the previously authorized
+/// voter. The default voter is the owner of the vote account's pubkey.
+pub fn authorize_voter(
+    keyed_accounts: &mut [KeyedAccount],
+    voter_id: &Pubkey,
+) -> Result<(), InstructionError> {
+    if !check_id(&keyed_accounts[0].account.owner) {
+        error!("account[0] is not assigned to the VOTE_PROGRAM");
+        Err(InstructionError::InvalidArgument)?;
+    }
+
+    if keyed_accounts[0].signer_key().is_none() {
+        error!("account[0] should sign the transaction");
+        Err(InstructionError::InvalidArgument)?;
+    }
+
+    let vote_state = VoteState::deserialize(&keyed_accounts[0].account.data);
+    if let Ok(mut vote_state) = vote_state {
+        vote_state.authorized_voter_id = *voter_id;
+        vote_state.serialize(&mut keyed_accounts[0].account.data)?;
+    } else {
+        error!("account[0] does not valid data");
+        Err(InstructionError::InvalidAccountData)?;
     }
 
     Ok(())
@@ -176,71 +215,86 @@ pub fn delegate_stake(
 /// Initialize the vote_state for a vote account
 /// Assumes that the account is being init as part of a account creation or balance transfer and
 /// that the transaction must be signed by the staker's keys
-pub fn initialize_account(keyed_accounts: &mut [KeyedAccount]) -> Result<(), ProgramError> {
+pub fn initialize_account(keyed_accounts: &mut [KeyedAccount]) -> Result<(), InstructionError> {
     if !check_id(&keyed_accounts[0].account.owner) {
         error!("account[0] is not assigned to the VOTE_PROGRAM");
-        Err(ProgramError::InvalidArgument)?;
+        Err(InstructionError::InvalidArgument)?;
     }
 
     let staker_id = keyed_accounts[0].unsigned_key();
-    let vote_state = VoteState::deserialize(&keyed_accounts[0].account.userdata);
+    let vote_state = VoteState::deserialize(&keyed_accounts[0].account.data);
     if let Ok(vote_state) = vote_state {
         if vote_state.delegate_id == Pubkey::default() {
-            let vote_state = VoteState::new(*staker_id);
-            vote_state.serialize(&mut keyed_accounts[0].account.userdata)?;
+            let vote_state = VoteState::new(staker_id);
+            vote_state.serialize(&mut keyed_accounts[0].account.data)?;
         } else {
-            error!("account[0] userdata already initialized");
-            Err(ProgramError::InvalidUserdata)?;
+            error!("account[0] data already initialized");
+            Err(InstructionError::InvalidAccountData)?;
         }
     } else {
-        error!("account[0] does not have valid userdata");
-        Err(ProgramError::InvalidUserdata)?;
+        error!("account[0] does not have valid data");
+        Err(InstructionError::InvalidAccountData)?;
     }
 
     Ok(())
 }
 
-pub fn process_vote(keyed_accounts: &mut [KeyedAccount], vote: Vote) -> Result<(), ProgramError> {
+pub fn process_vote(
+    keyed_accounts: &mut [KeyedAccount],
+    vote: Vote,
+) -> Result<(), InstructionError> {
     if !check_id(&keyed_accounts[0].account.owner) {
         error!("account[0] is not assigned to the VOTE_PROGRAM");
-        Err(ProgramError::InvalidArgument)?;
+        Err(InstructionError::InvalidArgument)?;
     }
 
-    if keyed_accounts[0].signer_key().is_none() {
-        error!("account[0] should sign the transaction");
-        Err(ProgramError::InvalidArgument)?;
+    let mut vote_state = VoteState::deserialize(&keyed_accounts[0].account.data)?;
+
+    // If no voter was authorized, expect account[0] to be the signer, otherwise account[1].
+    let signer_index = if vote_state.authorized_voter_id == *keyed_accounts[0].unsigned_key() {
+        0
+    } else {
+        1
+    };
+
+    if keyed_accounts.get(signer_index).is_none() {
+        error!("account[{}] not provided", signer_index);
+        Err(InstructionError::InvalidArgument)?;
+    }
+    if keyed_accounts[signer_index].signer_key().is_none() {
+        error!("account[{}] should sign the transaction", signer_index);
+        Err(InstructionError::InvalidArgument)?;
     }
 
-    let mut vote_state = VoteState::deserialize(&keyed_accounts[0].account.userdata)?;
     vote_state.process_vote(vote);
-    vote_state.serialize(&mut keyed_accounts[0].account.userdata)?;
+    vote_state.serialize(&mut keyed_accounts[0].account.data)?;
     Ok(())
 }
 
-pub fn clear_credits(keyed_accounts: &mut [KeyedAccount]) -> Result<(), ProgramError> {
+pub fn clear_credits(keyed_accounts: &mut [KeyedAccount]) -> Result<(), InstructionError> {
     if !check_id(&keyed_accounts[0].account.owner) {
         error!("account[0] is not assigned to the VOTE_PROGRAM");
-        Err(ProgramError::InvalidArgument)?;
+        Err(InstructionError::InvalidArgument)?;
     }
 
-    let mut vote_state = VoteState::deserialize(&keyed_accounts[0].account.userdata)?;
+    let mut vote_state = VoteState::deserialize(&keyed_accounts[0].account.data)?;
     vote_state.clear_credits();
-    vote_state.serialize(&mut keyed_accounts[0].account.userdata)?;
+    vote_state.serialize(&mut keyed_accounts[0].account.data)?;
     Ok(())
 }
 
 pub fn create_vote_account(lamports: u64) -> Account {
     let space = VoteState::max_size();
-    Account::new(lamports, space, id())
+    Account::new(lamports, space, &id())
 }
 
 pub fn initialize_and_deserialize(
     vote_id: &Pubkey,
     vote_account: &mut Account,
-) -> Result<VoteState, ProgramError> {
+) -> Result<VoteState, InstructionError> {
     let mut keyed_accounts = [KeyedAccount::new(vote_id, false, vote_account)];
     initialize_account(&mut keyed_accounts)?;
-    let vote_state = VoteState::deserialize(&vote_account.userdata).unwrap();
+    let vote_state = VoteState::deserialize(&vote_account.data).unwrap();
     Ok(vote_state)
 }
 
@@ -248,10 +302,10 @@ pub fn vote_and_deserialize(
     vote_id: &Pubkey,
     vote_account: &mut Account,
     vote: Vote,
-) -> Result<VoteState, ProgramError> {
+) -> Result<VoteState, InstructionError> {
     let mut keyed_accounts = [KeyedAccount::new(vote_id, true, vote_account)];
     process_vote(&mut keyed_accounts, vote)?;
-    let vote_state = VoteState::deserialize(&vote_account.userdata).unwrap();
+    let vote_state = VoteState::deserialize(&vote_account.data).unwrap();
     Ok(vote_state)
 }
 
@@ -266,7 +320,7 @@ mod tests {
         let mut vote_account = create_vote_account(100);
 
         let bogus_account_id = Keypair::new().pubkey();
-        let mut bogus_account = Account::new(100, 0, id());
+        let mut bogus_account = Account::new(100, 0, &id());
 
         let mut keyed_accounts = [KeyedAccount::new(
             &bogus_account_id,
@@ -281,7 +335,7 @@ mod tests {
 
         // reinit should fail
         let res = initialize_account(&mut keyed_accounts);
-        assert_eq!(res, Err(ProgramError::InvalidUserdata));
+        assert_eq!(res, Err(InstructionError::InvalidAccountData));
     }
 
     #[test]
@@ -326,7 +380,7 @@ mod tests {
         let vote = Vote::new(1);
         let mut keyed_accounts = [KeyedAccount::new(&vote_id, false, &mut vote_account)];
         let res = process_vote(&mut keyed_accounts, vote);
-        assert_eq!(res, Err(ProgramError::InvalidArgument));
+        assert_eq!(res, Err(InstructionError::InvalidArgument));
     }
 
     #[test]
@@ -335,15 +389,14 @@ mod tests {
         let mut vote_account = create_vote_account(100);
 
         let vote = Vote::new(1);
-        let vote_state = vote_and_deserialize(&vote_id, &mut vote_account, vote.clone()).unwrap();
-        assert_eq!(vote_state.delegate_id, Pubkey::default());
-        assert_eq!(vote_state.votes, vec![Lockout::new(&vote)]);
+        let res = vote_and_deserialize(&vote_id, &mut vote_account, vote.clone());
+        assert_eq!(res, Err(InstructionError::InvalidArgument));
     }
 
     #[test]
     fn test_vote_lockout() {
         let voter_id = Keypair::new().pubkey();
-        let mut vote_state = VoteState::new(voter_id);
+        let mut vote_state = VoteState::new(&voter_id);
 
         for i in 0..(MAX_LOCKOUT_HISTORY + 1) {
             vote_state.process_vote(Vote::new((INITIAL_LOCKOUT as usize * i) as u64));
@@ -373,7 +426,7 @@ mod tests {
     #[test]
     fn test_vote_double_lockout_after_expiration() {
         let voter_id = Keypair::new().pubkey();
-        let mut vote_state = VoteState::new(voter_id);
+        let mut vote_state = VoteState::new(&voter_id);
 
         for i in 0..3 {
             let vote = Vote::new(i as u64);
@@ -399,7 +452,7 @@ mod tests {
     #[test]
     fn test_vote_credits() {
         let voter_id = Keypair::new().pubkey();
-        let mut vote_state = VoteState::new(voter_id);
+        let mut vote_state = VoteState::new(&voter_id);
 
         for i in 0..MAX_LOCKOUT_HISTORY {
             vote_state.process_vote(Vote::new(i as u64));
@@ -415,6 +468,34 @@ mod tests {
         assert_eq!(vote_state.credits(), 3);
         vote_state.clear_credits();
         assert_eq!(vote_state.credits(), 0);
+    }
+
+    #[test]
+    fn test_duplicate_vote() {
+        let voter_id = Keypair::new().pubkey();
+        let mut vote_state = VoteState::new(&voter_id);
+        vote_state.process_vote(Vote::new(0));
+        vote_state.process_vote(Vote::new(1));
+        vote_state.process_vote(Vote::new(0));
+        assert_eq!(vote_state.nth_recent_vote(0).unwrap().slot, 1);
+        assert_eq!(vote_state.nth_recent_vote(1).unwrap().slot, 0);
+        assert!(vote_state.nth_recent_vote(2).is_none());
+    }
+
+    #[test]
+    fn test_nth_recent_vote() {
+        let voter_id = Keypair::new().pubkey();
+        let mut vote_state = VoteState::new(&voter_id);
+        for i in 0..MAX_LOCKOUT_HISTORY {
+            vote_state.process_vote(Vote::new(i as u64));
+        }
+        for i in 0..(MAX_LOCKOUT_HISTORY - 1) {
+            assert_eq!(
+                vote_state.nth_recent_vote(i).unwrap().slot as usize,
+                MAX_LOCKOUT_HISTORY - i - 1,
+            );
+        }
+        assert!(vote_state.nth_recent_vote(MAX_LOCKOUT_HISTORY).is_none());
     }
 
     fn check_lockouts(vote_state: &VoteState) {

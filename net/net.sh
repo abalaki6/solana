@@ -117,7 +117,8 @@ loadConfigFile
 build() {
   declare MAYBE_DOCKER=
   if [[ $(uname) != Linux ]]; then
-    MAYBE_DOCKER="ci/docker-run.sh solanalabs/rust"
+    source ci/rust-version.sh
+    MAYBE_DOCKER="ci/docker-run.sh +$rust_stable_docker_image"
   fi
   SECONDS=0
   (
@@ -277,7 +278,8 @@ start() {
       rm -f "$SOLANA_ROOT"/solana-release.tar.bz2
       (
         set -x
-        curl -o "$SOLANA_ROOT"/solana-release.tar.bz2 http://solana-release.s3.amazonaws.com/"$releaseChannel"/solana-release.tar.bz2
+        curl -o "$SOLANA_ROOT"/solana-release.tar.bz2 \
+          http://solana-release.s3.amazonaws.com/"$releaseChannel"/solana-release-x86_64-unknown-linux-gnu.tar.bz2
       )
       tarballFilename="$SOLANA_ROOT"/solana-release.tar.bz2
     fi
@@ -285,7 +287,7 @@ start() {
       set -x
       rm -rf "$SOLANA_ROOT"/solana-release
       (cd "$SOLANA_ROOT"; tar jxv) < "$tarballFilename"
-      cat "$SOLANA_ROOT"/solana-release/version.txt
+      cat "$SOLANA_ROOT"/solana-release/version.yml
     )
     ;;
   local)
@@ -370,7 +372,10 @@ start() {
   case $deployMethod in
   tar)
     networkVersion="$(
-      tail -n1 "$SOLANA_ROOT"/solana-release/version.txt || echo "tar-unknown"
+      (
+        set -o pipefail
+        grep "^version: " "$SOLANA_ROOT"/solana-release/version.yml | head -n1 | cut -d\  -f2
+      ) || echo "tar-unknown"
     )"
     ;;
   local)
@@ -406,7 +411,7 @@ stopNode() {
         pgid=\$(ps opgid= \$(cat \$pid) | tr -d '[:space:]')
         sudo kill -- -\$pgid
       done
-      for pattern in solana- remote-; do
+      for pattern in node solana- remote-; do
         pkill -9 \$pattern
       done
     "

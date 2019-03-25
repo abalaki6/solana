@@ -1,6 +1,13 @@
+use crate::instruction::{AccountMeta, Instruction};
 use crate::pubkey::Pubkey;
 use crate::system_program;
-use crate::transaction_builder::BuilderInstruction;
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub enum SystemError {
+    AccountAlreadyInUse,
+    ResultWithNegativeLamports,
+    SourceNotSystemAccount,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum SystemInstruction {
@@ -26,28 +33,47 @@ pub enum SystemInstruction {
 
 impl SystemInstruction {
     pub fn new_program_account(
-        from_id: Pubkey,
-        to_id: Pubkey,
+        from_id: &Pubkey,
+        to_id: &Pubkey,
         lamports: u64,
         space: u64,
-        program_id: Pubkey,
-    ) -> BuilderInstruction {
-        BuilderInstruction::new(
+        program_id: &Pubkey,
+    ) -> Instruction {
+        let account_metas = vec![
+            AccountMeta::new(*from_id, true),
+            AccountMeta::new(*to_id, false),
+        ];
+        Instruction::new(
             system_program::id(),
             &SystemInstruction::CreateAccount {
                 lamports,
                 space,
-                program_id,
+                program_id: *program_id,
             },
-            vec![(from_id, true), (to_id, false)],
+            account_metas,
         )
     }
 
-    pub fn new_move(from_id: Pubkey, to_id: Pubkey, lamports: u64) -> BuilderInstruction {
-        BuilderInstruction::new(
+    pub fn new_assign(from_id: &Pubkey, program_id: &Pubkey) -> Instruction {
+        let account_metas = vec![AccountMeta::new(*from_id, true)];
+        Instruction::new(
+            system_program::id(),
+            &SystemInstruction::Assign {
+                program_id: *program_id,
+            },
+            account_metas,
+        )
+    }
+
+    pub fn new_move(from_id: &Pubkey, to_id: &Pubkey, lamports: u64) -> Instruction {
+        let account_metas = vec![
+            AccountMeta::new(*from_id, true),
+            AccountMeta::new(*to_id, false),
+        ];
+        Instruction::new(
             system_program::id(),
             &SystemInstruction::Move { lamports },
-            vec![(from_id, true), (to_id, false)],
+            account_metas,
         )
     }
 }

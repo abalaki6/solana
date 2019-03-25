@@ -4,21 +4,13 @@ use crate::entry::{Entry, EntrySlice};
 use crate::leader_schedule_utils;
 use rayon::prelude::*;
 use solana_metrics::counter::Counter;
-use solana_runtime::bank::{Bank, BankError, Result};
+use solana_runtime::bank::{Bank, Result};
 use solana_sdk::genesis_block::GenesisBlock;
 use solana_sdk::timing::duration_as_ms;
 use solana_sdk::timing::MAX_RECENT_BLOCKHASHES;
+use std::result;
 use std::sync::Arc;
 use std::time::Instant;
-
-pub fn process_entry(bank: &Bank, entry: &Entry) -> Result<()> {
-    if !entry.is_tick() {
-        first_err(&bank.process_transactions(&entry.transactions))?;
-    } else {
-        bank.register_tick(&entry.hash);
-    }
-    Ok(())
-}
 
 fn first_err(results: &[Result<()>]) -> Result<()> {
     for r in results {
@@ -45,12 +37,12 @@ fn par_execute_entries(bank: &Bank, entries: &[(&Entry, Vec<Result<()>>)]) -> Re
     first_err(&results)
 }
 
-/// process entries in parallel
+/// Process an ordered list of entries in parallel
 /// 1. In order lock accounts for each entry while the lock succeeds, up to a Tick entry
 /// 2. Process the locked group in parallel
 /// 3. Register the `Tick` if it's available
 /// 4. Update the leader scheduler, goto 1
-fn par_process_entries(bank: &Bank, entries: &[Entry]) -> Result<()> {
+pub fn process_entries(bank: &Bank, entries: &[Entry]) -> Result<()> {
     // accumulator for entries that can be processed in parallel
     let mut mt_group = vec![];
     for entry in entries {
@@ -81,32 +73,22 @@ fn par_process_entries(bank: &Bank, entries: &[Entry]) -> Result<()> {
     Ok(())
 }
 
-/// Process an ordered list of entries.
-pub fn process_entries(bank: &Bank, entries: &[Entry]) -> Result<()> {
-    par_process_entries(bank, entries)
-}
-
-/// Process an ordered list of entries, populating a circular buffer "tail"
-/// as we go.
-fn process_block(bank: &Bank, entries: &[Entry]) -> Result<()> {
-    for entry in entries {
-        process_entry(bank, entry)?;
-    }
-
-    Ok(())
-}
-
 #[derive(Debug, PartialEq)]
 pub struct BankForksInfo {
     pub bank_slot: u64,
     pub entry_height: u64,
 }
 
+#[derive(Debug)]
+pub enum BlocktreeProcessorError {
+    LedgerVerificationFailed,
+}
+
 pub fn process_blocktree(
     genesis_block: &GenesisBlock,
     blocktree: &Blocktree,
     account_paths: Option<String>,
-) -> Result<(BankForks, Vec<BankForksInfo>)> {
+) -> result::Result<(BankForks, Vec<BankForksInfo>), BlocktreeProcessorError> {
     let now = Instant::now();
     info!("processing ledger...");
 
@@ -122,7 +104,7 @@ pub fn process_blocktree(
             .meta(slot)
             .map_err(|err| {
                 warn!("Failed to load meta for slot {}: {:?}", slot, err);
-                BankError::LedgerVerificationFailed
+                BlocktreeProcessorError::LedgerVerificationFailed
             })?
             .unwrap();
 
@@ -137,7 +119,7 @@ pub fn process_blocktree(
         // Fetch all entries for this slot
         let mut entries = blocktree.get_slot_entries(slot, 0, None).map_err(|err| {
             warn!("Failed to load entries for slot {}: {:?}", slot, err);
-            BankError::LedgerVerificationFailed
+            BlocktreeProcessorError::LedgerVerificationFailed
         })?;
 
         if slot == 0 {
@@ -146,16 +128,15 @@ pub fn process_blocktree(
             // processed by the bank, skip over it.
             if entries.is_empty() {
                 warn!("entry0 not present");
-                return Err(BankError::LedgerVerificationFailed);
+                return Err(BlocktreeProcessorError::LedgerVerificationFailed);
             }
-            let entry0 = &entries[0];
+            let entry0 = entries.remove(0);
             if !(entry0.is_tick() && entry0.verify(&last_entry_hash)) {
                 warn!("Ledger proof of history failed at entry0");
-                return Err(BankError::LedgerVerificationFailed);
+                return Err(BlocktreeProcessorError::LedgerVerificationFailed);
             }
             last_entry_hash = entry0.hash;
             entry_height += 1;
-            entries = entries.drain(1..).collect();
         }
 
         if !entries.is_empty() {
@@ -164,12 +145,12 @@ pub fn process_blocktree(
                     "Ledger proof of history failed at slot: {}, entry: {}",
                     slot, entry_height
                 );
-                return Err(BankError::LedgerVerificationFailed);
+                return Err(BlocktreeProcessorError::LedgerVerificationFailed);
             }
 
-            process_block(&bank, &entries).map_err(|err| {
+            process_entries(&bank, &entries).map_err(|err| {
                 warn!("Failed to process entries for slot {}: {:?}", slot, err);
-                BankError::LedgerVerificationFailed
+                BlocktreeProcessorError::LedgerVerificationFailed
             })?;
 
             last_entry_hash = entries.last().unwrap().hash;
@@ -195,7 +176,7 @@ pub fn process_blocktree(
                 .meta(next_slot)
                 .map_err(|err| {
                     warn!("Failed to load meta for slot {}: {:?}", slot, err);
-                    BankError::LedgerVerificationFailed
+                    BlocktreeProcessorError::LedgerVerificationFailed
                 })?
                 .unwrap();
 
@@ -204,7 +185,7 @@ pub fn process_blocktree(
             if next_meta.is_full() {
                 let next_bank = Arc::new(Bank::new_from_parent(
                     &bank,
-                    leader_schedule_utils::slot_leader_at(next_slot, &bank),
+                    &leader_schedule_utils::slot_leader_at(next_slot, &bank).unwrap(),
                     next_slot,
                 ));
                 trace!("Add child bank for slot={}", next_slot);
@@ -251,6 +232,7 @@ mod tests {
     use solana_sdk::hash::Hash;
     use solana_sdk::signature::{Keypair, KeypairUtil};
     use solana_sdk::system_transaction::SystemTransaction;
+    use solana_sdk::transaction::TransactionError;
 
     fn fill_blocktree_slot_with_ticks(
         blocktree: &Blocktree,
@@ -291,8 +273,8 @@ mod tests {
         let (ledger_path, mut blockhash) = create_new_tmp_ledger!(&genesis_block);
         debug!("ledger_path: {:?}", ledger_path);
 
-        let blocktree = Blocktree::open_config(&ledger_path, ticks_per_slot)
-            .expect("Expected to successfully open database ledger");
+        let blocktree =
+            Blocktree::open(&ledger_path).expect("Expected to successfully open database ledger");
 
         // Write slot 1
         // slot 1, points at slot 0.  Missing one tick
@@ -351,8 +333,8 @@ mod tests {
                    slot 4
 
         */
-        let blocktree = Blocktree::open_config(&ledger_path, ticks_per_slot)
-            .expect("Expected to successfully open database ledger");
+        let blocktree =
+            Blocktree::open(&ledger_path).expect("Expected to successfully open database ledger");
 
         // Fork 1, ending at slot 3
         let last_slot1_entry_hash =
@@ -400,32 +382,32 @@ mod tests {
     fn test_first_err() {
         assert_eq!(first_err(&[Ok(())]), Ok(()));
         assert_eq!(
-            first_err(&[Ok(()), Err(BankError::DuplicateSignature)]),
-            Err(BankError::DuplicateSignature)
+            first_err(&[Ok(()), Err(TransactionError::DuplicateSignature)]),
+            Err(TransactionError::DuplicateSignature)
         );
         assert_eq!(
             first_err(&[
                 Ok(()),
-                Err(BankError::DuplicateSignature),
-                Err(BankError::AccountInUse)
+                Err(TransactionError::DuplicateSignature),
+                Err(TransactionError::AccountInUse)
             ]),
-            Err(BankError::DuplicateSignature)
+            Err(TransactionError::DuplicateSignature)
         );
         assert_eq!(
             first_err(&[
                 Ok(()),
-                Err(BankError::AccountInUse),
-                Err(BankError::DuplicateSignature)
+                Err(TransactionError::AccountInUse),
+                Err(TransactionError::DuplicateSignature)
             ]),
-            Err(BankError::AccountInUse)
+            Err(TransactionError::AccountInUse)
         );
         assert_eq!(
             first_err(&[
-                Err(BankError::AccountInUse),
+                Err(TransactionError::AccountInUse),
                 Ok(()),
-                Err(BankError::DuplicateSignature)
+                Err(TransactionError::DuplicateSignature)
             ]),
-            Err(BankError::AccountInUse)
+            Err(TransactionError::AccountInUse)
         );
     }
 
@@ -439,7 +421,7 @@ mod tests {
         let slot_entries = create_ticks(genesis_block.ticks_per_slot - 1, genesis_block.hash());
         let tx = SystemTransaction::new_account(
             &mint_keypair,
-            keypair.pubkey(),
+            &keypair.pubkey(),
             1,
             slot_entries.last().unwrap().hash,
             0,
@@ -448,11 +430,11 @@ mod tests {
         // First, ensure the TX is rejected because of the unregistered last ID
         assert_eq!(
             bank.process_transaction(&tx),
-            Err(BankError::BlockhashNotFound)
+            Err(TransactionError::BlockhashNotFound)
         );
 
         // Now ensure the TX is accepted despite pointing to the ID of an empty entry.
-        par_process_entries(&bank, &slot_entries).unwrap();
+        process_entries(&bank, &slot_entries).unwrap();
         assert_eq!(bank.process_transaction(&tx), Ok(()));
     }
 
@@ -460,7 +442,7 @@ mod tests {
     fn test_process_ledger_simple() {
         solana_logger::setup();
         let leader_pubkey = Keypair::new().pubkey();
-        let (genesis_block, mint_keypair) = GenesisBlock::new_with_leader(100, leader_pubkey, 50);
+        let (genesis_block, mint_keypair) = GenesisBlock::new_with_leader(100, &leader_pubkey, 50);
         let (ledger_path, mut last_entry_hash) = create_new_tmp_ledger!(&genesis_block);
         debug!("ledger_path: {:?}", ledger_path);
 
@@ -470,15 +452,15 @@ mod tests {
             // Transfer one token from the mint to a random account
             let keypair = Keypair::new();
             let tx =
-                SystemTransaction::new_account(&mint_keypair, keypair.pubkey(), 1, blockhash, 0);
+                SystemTransaction::new_account(&mint_keypair, &keypair.pubkey(), 1, blockhash, 0);
             let entry = Entry::new(&last_entry_hash, 1, vec![tx]);
             last_entry_hash = entry.hash;
             entries.push(entry);
 
             // Add a second Transaction that will produce a
-            // ProgramError<0, ResultWithNegativeLamports> error when processed
+            // InstructionError<0, ResultWithNegativeLamports> error when processed
             let keypair2 = Keypair::new();
-            let tx = SystemTransaction::new_account(&keypair, keypair2.pubkey(), 42, blockhash, 0);
+            let tx = SystemTransaction::new_account(&keypair, &keypair2.pubkey(), 42, blockhash, 0);
             let entry = Entry::new(&last_entry_hash, 1, vec![tx]);
             last_entry_hash = entry.hash;
             entries.push(entry);
@@ -489,7 +471,9 @@ mod tests {
 
         let blocktree =
             Blocktree::open(&ledger_path).expect("Expected to successfully open database ledger");
-        blocktree.write_entries(1, 0, 0, &entries).unwrap();
+        blocktree
+            .write_entries(1, 0, 0, genesis_block.ticks_per_slot, &entries)
+            .unwrap();
         let entry_height = genesis_block.ticks_per_slot + entries.len() as u64;
         let (bank_forks, bank_forks_info) =
             process_blocktree(&genesis_block, &blocktree, None).unwrap();
@@ -532,19 +516,19 @@ mod tests {
     }
 
     #[test]
-    fn test_par_process_entries_tick() {
+    fn test_process_entries_tick() {
         let (genesis_block, _mint_keypair) = GenesisBlock::new(1000);
         let bank = Bank::new(&genesis_block);
 
         // ensure bank can process a tick
         assert_eq!(bank.tick_height(), 0);
         let tick = next_entry(&genesis_block.hash(), 1, vec![]);
-        assert_eq!(par_process_entries(&bank, &[tick.clone()]), Ok(()));
+        assert_eq!(process_entries(&bank, &[tick.clone()]), Ok(()));
         assert_eq!(bank.tick_height(), 1);
     }
 
     #[test]
-    fn test_par_process_entries_2_entries_collision() {
+    fn test_process_entries_2_entries_collision() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(1000);
         let bank = Bank::new(&genesis_block);
         let keypair1 = Keypair::new();
@@ -555,7 +539,7 @@ mod tests {
         // ensure bank can process 2 entries that have a common account and no tick is registered
         let tx = SystemTransaction::new_account(
             &mint_keypair,
-            keypair1.pubkey(),
+            &keypair1.pubkey(),
             2,
             bank.last_blockhash(),
             0,
@@ -563,20 +547,20 @@ mod tests {
         let entry_1 = next_entry(&blockhash, 1, vec![tx]);
         let tx = SystemTransaction::new_account(
             &mint_keypair,
-            keypair2.pubkey(),
+            &keypair2.pubkey(),
             2,
             bank.last_blockhash(),
             0,
         );
         let entry_2 = next_entry(&entry_1.hash, 1, vec![tx]);
-        assert_eq!(par_process_entries(&bank, &[entry_1, entry_2]), Ok(()));
+        assert_eq!(process_entries(&bank, &[entry_1, entry_2]), Ok(()));
         assert_eq!(bank.get_balance(&keypair1.pubkey()), 2);
         assert_eq!(bank.get_balance(&keypair2.pubkey()), 2);
         assert_eq!(bank.last_blockhash(), blockhash);
     }
 
     #[test]
-    fn test_par_process_entries_2_txes_collision() {
+    fn test_process_entries_2_txes_collision() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(1000);
         let bank = Bank::new(&genesis_block);
         let keypair1 = Keypair::new();
@@ -585,11 +569,11 @@ mod tests {
 
         // fund: put 4 in each of 1 and 2
         assert_matches!(
-            bank.transfer(4, &mint_keypair, keypair1.pubkey(), bank.last_blockhash()),
+            bank.transfer(4, &mint_keypair, &keypair1.pubkey(), bank.last_blockhash()),
             Ok(_)
         );
         assert_matches!(
-            bank.transfer(4, &mint_keypair, keypair2.pubkey(), bank.last_blockhash()),
+            bank.transfer(4, &mint_keypair, &keypair2.pubkey(), bank.last_blockhash()),
             Ok(_)
         );
 
@@ -599,7 +583,7 @@ mod tests {
             1,
             vec![SystemTransaction::new_account(
                 &keypair1,
-                mint_keypair.pubkey(),
+                &mint_keypair.pubkey(),
                 1,
                 bank.last_blockhash(),
                 0,
@@ -612,14 +596,14 @@ mod tests {
             vec![
                 SystemTransaction::new_account(
                     &keypair2,
-                    keypair3.pubkey(),
+                    &keypair3.pubkey(),
                     2,
                     bank.last_blockhash(),
                     0,
                 ), // should be fine
                 SystemTransaction::new_account(
                     &keypair1,
-                    mint_keypair.pubkey(),
+                    &mint_keypair.pubkey(),
                     2,
                     bank.last_blockhash(),
                     0,
@@ -628,7 +612,7 @@ mod tests {
         );
 
         assert_eq!(
-            par_process_entries(&bank, &[entry_1_to_mint, entry_2_to_3_mint_to_1]),
+            process_entries(&bank, &[entry_1_to_mint, entry_2_to_3_mint_to_1]),
             Ok(())
         );
 
@@ -638,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn test_par_process_entries_2_entries_par() {
+    fn test_process_entries_2_entries_par() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(1000);
         let bank = Bank::new(&genesis_block);
         let keypair1 = Keypair::new();
@@ -649,7 +633,7 @@ mod tests {
         //load accounts
         let tx = SystemTransaction::new_account(
             &mint_keypair,
-            keypair1.pubkey(),
+            &keypair1.pubkey(),
             1,
             bank.last_blockhash(),
             0,
@@ -657,7 +641,7 @@ mod tests {
         assert_eq!(bank.process_transaction(&tx), Ok(()));
         let tx = SystemTransaction::new_account(
             &mint_keypair,
-            keypair2.pubkey(),
+            &keypair2.pubkey(),
             1,
             bank.last_blockhash(),
             0,
@@ -668,7 +652,7 @@ mod tests {
         let blockhash = bank.last_blockhash();
         let tx = SystemTransaction::new_account(
             &keypair1,
-            keypair3.pubkey(),
+            &keypair3.pubkey(),
             1,
             bank.last_blockhash(),
             0,
@@ -676,20 +660,20 @@ mod tests {
         let entry_1 = next_entry(&blockhash, 1, vec![tx]);
         let tx = SystemTransaction::new_account(
             &keypair2,
-            keypair4.pubkey(),
+            &keypair4.pubkey(),
             1,
             bank.last_blockhash(),
             0,
         );
         let entry_2 = next_entry(&entry_1.hash, 1, vec![tx]);
-        assert_eq!(par_process_entries(&bank, &[entry_1, entry_2]), Ok(()));
+        assert_eq!(process_entries(&bank, &[entry_1, entry_2]), Ok(()));
         assert_eq!(bank.get_balance(&keypair3.pubkey()), 1);
         assert_eq!(bank.get_balance(&keypair4.pubkey()), 1);
         assert_eq!(bank.last_blockhash(), blockhash);
     }
 
     #[test]
-    fn test_par_process_entries_2_entries_tick() {
+    fn test_process_entries_2_entries_tick() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(1000);
         let bank = Bank::new(&genesis_block);
         let keypair1 = Keypair::new();
@@ -700,7 +684,7 @@ mod tests {
         //load accounts
         let tx = SystemTransaction::new_account(
             &mint_keypair,
-            keypair1.pubkey(),
+            &keypair1.pubkey(),
             1,
             bank.last_blockhash(),
             0,
@@ -708,7 +692,7 @@ mod tests {
         assert_eq!(bank.process_transaction(&tx), Ok(()));
         let tx = SystemTransaction::new_account(
             &mint_keypair,
-            keypair2.pubkey(),
+            &keypair2.pubkey(),
             1,
             bank.last_blockhash(),
             0,
@@ -721,19 +705,19 @@ mod tests {
         }
 
         // ensure bank can process 2 entries that do not have a common account and tick is registered
-        let tx = SystemTransaction::new_account(&keypair2, keypair3.pubkey(), 1, blockhash, 0);
+        let tx = SystemTransaction::new_account(&keypair2, &keypair3.pubkey(), 1, blockhash, 0);
         let entry_1 = next_entry(&blockhash, 1, vec![tx]);
         let tick = next_entry(&entry_1.hash, 1, vec![]);
         let tx = SystemTransaction::new_account(
             &keypair1,
-            keypair4.pubkey(),
+            &keypair4.pubkey(),
             1,
             bank.last_blockhash(),
             0,
         );
         let entry_2 = next_entry(&tick.hash, 1, vec![tx]);
         assert_eq!(
-            par_process_entries(&bank, &[entry_1.clone(), tick.clone(), entry_2.clone()]),
+            process_entries(&bank, &[entry_1.clone(), tick.clone(), entry_2.clone()]),
             Ok(())
         );
         assert_eq!(bank.get_balance(&keypair3.pubkey()), 1);
@@ -742,15 +726,15 @@ mod tests {
         // ensure that an error is returned for an empty account (keypair2)
         let tx = SystemTransaction::new_account(
             &keypair2,
-            keypair3.pubkey(),
+            &keypair3.pubkey(),
             1,
             bank.last_blockhash(),
             0,
         );
         let entry_3 = next_entry(&entry_2.hash, 1, vec![tx]);
         assert_eq!(
-            par_process_entries(&bank, &[entry_3]),
-            Err(BankError::AccountNotFound)
+            process_entries(&bank, &[entry_3]),
+            Err(TransactionError::AccountNotFound)
         );
     }
 }

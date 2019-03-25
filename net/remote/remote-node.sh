@@ -76,7 +76,7 @@ local|tar)
 
     maybeNoLeaderRotation=
     if ! $leaderRotation; then
-      maybeNoLeaderRotation="--no-leader-rotation"
+      maybeNoLeaderRotation="--only-bootstrap-stake"
     fi
     maybePublicAddress=
     if $publicNetwork; then
@@ -96,7 +96,7 @@ local|tar)
 
     args=()
     if ! $leaderRotation; then
-      args+=("--no-leader-rotation")
+      args+=("--only-bootstrap-stake")
     fi
     if $publicNetwork; then
       args+=("--public-address")
@@ -104,9 +104,14 @@ local|tar)
     if [[ $nodeType = blockstreamer ]]; then
       args+=(
         --blockstream /tmp/solana-blockstream.sock
-        --no-signer
+        --no-voting
       )
     fi
+
+    args+=(
+      --gossip-port 8001
+      --rpc-port 8899
+    )
 
     set -x
     if [[ $skipSetup != true ]]; then
@@ -114,8 +119,26 @@ local|tar)
     fi
 
     if [[ $nodeType = blockstreamer ]]; then
+      # Sneak the mint-id.json from the bootstrap leader and run another drone
+      # with it on the blockstreamer node.  Typically the blockstreamer node has
+      # a static IP/DNS name for hosting the blockexplorer web app, and is
+      # a location that somebody would expect to be able to airdrop from
+      scp "$entrypointIp":~/solana/config-local/mint-id.json config-local/
+      ./multinode-demo/drone.sh > drone.log 2>&1 &
+
       npm install @solana/blockexplorer@1
       npx solana-blockexplorer > blockexplorer.log 2>&1 &
+
+      # Confirm the blockexplorer is accessible
+      curl --head --retry 3 --retry-connrefused http://localhost:5000/
+
+      # Redirect port 80 to port 5000
+      sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+      sudo iptables -A INPUT -p tcp --dport 5000 -j ACCEPT
+      sudo iptables -A PREROUTING -t nat -p tcp --dport 80 -j REDIRECT --to-port 5000
+
+      # Confirm the blockexplorer is now globally accessible
+      curl --head "$(curl ifconfig.io)"
     fi
     ./multinode-demo/fullnode.sh "${args[@]}" "$entrypointIp":~/solana "$entrypointIp:8001" > fullnode.log 2>&1 &
     ;;

@@ -132,10 +132,10 @@ impl Drone {
                         space: 0,
                         program_id: system_program::id(),
                     };
-                    let mut transaction = Transaction::new(
+                    let mut transaction = Transaction::new_signed(
                         &self.mint_keypair,
                         &[to],
-                        system_program::id(),
+                        &system_program::id(),
                         &create_instruction,
                         blockhash,
                         0, /*fee*/
@@ -273,7 +273,7 @@ pub fn run_local_drone(mint_keypair: Keypair, sender: Sender<SocketAddr>) {
                         .unwrap()
                         .process_drone_request(&bytes)
                         .unwrap();
-                    info!("Airdrop response_bytes: {:?}", response_bytes.to_vec());
+                    trace!("Airdrop response_bytes: {:?}", response_bytes.to_vec());
                     Ok(response_bytes)
                 });
                 let server = writer
@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(tx.program_ids, vec![system_program::id()]);
 
         assert_eq!(tx.instructions.len(), 1);
-        let instruction: SystemInstruction = deserialize(&tx.instructions[0].userdata).unwrap();
+        let instruction: SystemInstruction = deserialize(&tx.instructions[0].data).unwrap();
         assert_eq!(
             instruction,
             SystemInstruction::CreateAccount {
@@ -408,10 +408,10 @@ mod tests {
             space: 0,
             program_id: system_program::id(),
         };
-        let mut expected_tx = Transaction::new(
+        let mut expected_tx = Transaction::new_signed(
             &keypair,
             &[to],
-            system_program::id(),
+            &system_program::id(),
             &expected_instruction,
             blockhash,
             0,

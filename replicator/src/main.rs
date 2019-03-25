@@ -1,15 +1,17 @@
-use clap::{crate_version, App, Arg};
-use solana::cluster_info::{Node, NodeInfo};
+use clap::{crate_description, crate_name, crate_version, App, Arg};
+use solana::cluster_info::Node;
+use solana::contact_info::ContactInfo;
 use solana::replicator::Replicator;
 use solana::socketaddr;
 use solana_sdk::signature::{read_keypair, Keypair, KeypairUtil};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::process::exit;
+use std::sync::Arc;
 
 fn main() {
     solana_logger::setup();
 
-    let matches = App::new("replicator")
+    let matches = App::new(crate_name!()).about(crate_description!())
         .version(crate_version!())
         .arg(
             Arg::with_name("identity")
@@ -65,7 +67,7 @@ fn main() {
         }
         addr
     };
-    let node = Node::new_with_external_ip(keypair.pubkey(), &gossip_addr);
+    let node = Node::new_replicator_with_external_ip(&keypair.pubkey(), &gossip_addr);
 
     println!(
         "replicating the data with keypair={:?} gossip_addr={:?}",
@@ -78,9 +80,12 @@ fn main() {
         .map(|network| network.parse().expect("failed to parse network address"))
         .unwrap();
 
-    let leader_info = NodeInfo::new_entry_point(&network_addr);
+    let leader_info = ContactInfo::new_gossip_entry_point(&network_addr);
 
-    let replicator = Replicator::new(ledger_path, node, &leader_info, &keypair, None).unwrap();
+    let mut replicator =
+        Replicator::new(ledger_path, node, leader_info, Arc::new(keypair), None).unwrap();
 
-    replicator.join();
+    replicator.run();
+
+    replicator.close();
 }

@@ -24,6 +24,7 @@ use crate::retransmit_stage::RetransmitStage;
 use crate::rpc_subscriptions::RpcSubscriptions;
 use crate::service::Service;
 use crate::storage_stage::{StorageStage, StorageState};
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, KeypairUtil};
 use std::net::UdpSocket;
 use std::sync::atomic::AtomicBool;
@@ -54,6 +55,7 @@ impl Tvu {
     /// * `blocktree` - the ledger itself
     #[allow(clippy::new_ret_no_self, clippy::too_many_arguments)]
     pub fn new<T>(
+        vote_account: &Pubkey,
         voting_keypair: Option<Arc<T>>,
         bank_forks: &Arc<RwLock<BankForks>>,
         bank_forks_info: &[BankForksInfo],
@@ -105,7 +107,8 @@ impl Tvu {
         );
 
         let (replay_stage, slot_full_receiver, forward_entry_receiver) = ReplayStage::new(
-            keypair.pubkey(),
+            &keypair.pubkey(),
+            vote_account,
             voting_keypair,
             blocktree.clone(),
             &bank_forks,
@@ -180,7 +183,7 @@ pub mod tests {
         solana_logger::setup();
         let leader = Node::new_localhost();
         let target1_keypair = Keypair::new();
-        let target1 = Node::new_localhost_with_pubkey(target1_keypair.pubkey());
+        let target1 = Node::new_localhost_with_pubkey(&target1_keypair.pubkey());
 
         let starting_balance = 10_000;
         let (genesis_block, _mint_keypair) = GenesisBlock::new(starting_balance);
@@ -192,9 +195,8 @@ pub mod tests {
         }];
 
         //start cluster_info1
-        let mut cluster_info1 = ClusterInfo::new(target1.info.clone());
+        let mut cluster_info1 = ClusterInfo::new_with_invalid_keypair(target1.info.clone());
         cluster_info1.insert_info(leader.info.clone());
-        cluster_info1.set_leader(leader.info.id);
         let cref1 = Arc::new(RwLock::new(cluster_info1));
 
         let blocktree_path = get_tmp_ledger_path!();
@@ -202,8 +204,10 @@ pub mod tests {
             .expect("Expected to successfully open ledger");
         let bank = bank_forks.working_bank();
         let (exit, poh_recorder, poh_service, _entry_receiver) = create_test_recorder(&bank);
+        let voting_keypair = Keypair::new();
         let tvu = Tvu::new(
-            Some(Arc::new(Keypair::new())),
+            &voting_keypair.pubkey(),
+            Some(Arc::new(voting_keypair)),
             &Arc::new(RwLock::new(bank_forks)),
             &bank_forks_info,
             &cref1,

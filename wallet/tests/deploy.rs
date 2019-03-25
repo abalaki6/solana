@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
-use solana::rpc_request::{RpcClient, RpcRequest, RpcRequestHandler};
-use solana::thin_client::new_fullnode;
+use solana::fullnode::new_fullnode_for_tests;
+use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_request::RpcRequest;
 use solana_drone::drone::run_local_drone;
 use solana_sdk::bpf_loader;
 use solana_wallet::wallet::{process_command, WalletCommand, WalletConfig};
@@ -19,13 +20,13 @@ fn test_wallet_deploy_program() {
     pathbuf.push("noop");
     pathbuf.set_extension("so");
 
-    let (server, leader_data, alice, ledger_path) = new_fullnode();
+    let (server, leader_data, alice, ledger_path) = new_fullnode_for_tests();
 
     let (sender, receiver) = channel();
     run_local_drone(alice, sender);
     let drone_addr = receiver.recv().unwrap();
 
-    let rpc_client = RpcClient::new_from_socket(leader_data.rpc);
+    let rpc_client = RpcClient::new_socket(leader_data.rpc);
 
     let mut config = WalletConfig::default();
     config.drone_port = drone_addr.port();
@@ -47,7 +48,7 @@ fn test_wallet_deploy_program() {
 
     let params = json!([program_id_str]);
     let account_info = rpc_client
-        .make_rpc_request(1, RpcRequest::GetAccountInfo, Some(params))
+        .retry_make_rpc_request(&RpcRequest::GetAccountInfo, Some(params), 0)
         .unwrap();
     let account_info_obj = account_info.as_object().unwrap();
     assert_eq!(
@@ -70,11 +71,7 @@ fn test_wallet_deploy_program() {
     file.read_to_end(&mut elf).unwrap();
 
     assert_eq!(
-        account_info_obj
-            .get("userdata")
-            .unwrap()
-            .as_array()
-            .unwrap(),
+        account_info_obj.get("data").unwrap().as_array().unwrap(),
         &elf
     );
 

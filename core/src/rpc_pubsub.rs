@@ -1,12 +1,12 @@
 //! The `pubsub` module implements a threaded subscription service on client RPC request
 
-use crate::rpc_status::RpcSignatureStatus;
 use crate::rpc_subscriptions::RpcSubscriptions;
 use bs58;
 use jsonrpc_core::{Error, ErrorCode, Result};
 use jsonrpc_derive::rpc;
 use jsonrpc_pubsub::typed::Subscriber;
 use jsonrpc_pubsub::{Session, SubscriptionId};
+use solana_client::rpc_signature_status::RpcSignatureStatus;
 use solana_sdk::account::Account;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
@@ -17,7 +17,7 @@ use std::sync::{atomic, Arc};
 pub trait RpcSolPubSub {
     type Metadata;
 
-    // Get notification every time account userdata is changed
+    // Get notification every time account data is changed
     // Accepts pubkey parameter as base-58 encoded string
     #[pubsub(
         subscription = "accountNotification",
@@ -33,6 +33,23 @@ pub trait RpcSolPubSub {
         name = "accountUnsubscribe"
     )]
     fn account_unsubscribe(&self, _: Option<Self::Metadata>, _: SubscriptionId) -> Result<bool>;
+
+    // Get notification every time account data owned by a particular program is changed
+    // Accepts pubkey parameter as base-58 encoded string
+    #[pubsub(
+        subscription = "programNotification",
+        subscribe,
+        name = "programSubscribe"
+    )]
+    fn program_subscribe(&self, _: Self::Metadata, _: Subscriber<(String, Account)>, _: String);
+
+    // Unsubscribe from account notification subscription.
+    #[pubsub(
+        subscription = "programNotification",
+        unsubscribe,
+        name = "programUnsubscribe"
+    )]
+    fn program_unsubscribe(&self, _: Option<Self::Metadata>, _: SubscriptionId) -> Result<bool>;
 
     // Get notification when signature is verified
     // Accepts signature parameter as base-58 encoded string
@@ -113,6 +130,51 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
         }
     }
 
+    fn program_subscribe(
+        &self,
+        _meta: Self::Metadata,
+        subscriber: Subscriber<(String, Account)>,
+        pubkey_str: String,
+    ) {
+        let pubkey_vec = bs58::decode(pubkey_str).into_vec().unwrap();
+        if pubkey_vec.len() != mem::size_of::<Pubkey>() {
+            subscriber
+                .reject(Error {
+                    code: ErrorCode::InvalidParams,
+                    message: "Invalid Request: Invalid pubkey provided".into(),
+                    data: None,
+                })
+                .unwrap();
+            return;
+        }
+        let pubkey = Pubkey::new(&pubkey_vec);
+
+        let id = self.uid.fetch_add(1, atomic::Ordering::SeqCst);
+        let sub_id = SubscriptionId::Number(id as u64);
+        info!("program_subscribe: account={:?} id={:?}", pubkey, sub_id);
+        let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+
+        self.subscriptions
+            .add_program_subscription(&pubkey, &sub_id, &sink)
+    }
+
+    fn program_unsubscribe(
+        &self,
+        _meta: Option<Self::Metadata>,
+        id: SubscriptionId,
+    ) -> Result<bool> {
+        info!("program_unsubscribe: id={:?}", id);
+        if self.subscriptions.remove_program_subscription(&id) {
+            Ok(true)
+        } else {
+            Err(Error {
+                code: ErrorCode::InvalidParams,
+                message: "Invalid Request: Subscription id does not exist".into(),
+                data: None,
+            })
+        }
+    }
+
     fn signature_subscribe(
         &self,
         _meta: Self::Metadata,
@@ -165,7 +227,7 @@ mod tests {
     use jsonrpc_core::Response;
     use jsonrpc_pubsub::{PubSubHandler, Session};
     use solana_budget_api;
-    use solana_budget_api::budget_transaction::BudgetTransaction;
+    use solana_budget_api::budget_instruction::BudgetInstruction;
     use solana_runtime::bank::{self, Bank};
     use solana_sdk::genesis_block::GenesisBlock;
     use solana_sdk::pubkey::Pubkey;
@@ -187,7 +249,7 @@ mod tests {
         // Simulate a block boundary
         Ok(Arc::new(Bank::new_from_parent(
             &bank,
-            Pubkey::default(),
+            &Pubkey::default(),
             bank.slot() + 1,
         )))
     }
@@ -208,7 +270,7 @@ mod tests {
         let rpc = RpcSolPubSubImpl::default();
 
         // Test signature subscriptions
-        let tx = SystemTransaction::new_move(&alice, bob_pubkey, 20, blockhash, 0);
+        let tx = SystemTransaction::new_move(&alice, &bob_pubkey, 20, blockhash, 0);
 
         let session = create_session();
         let (subscriber, _id_receiver, mut receiver) =
@@ -240,7 +302,7 @@ mod tests {
         let rpc = RpcSolPubSubImpl::default();
         io.extend_with(rpc.to_delegate());
 
-        let tx = SystemTransaction::new_move(&alice, bob_pubkey, 20, blockhash, 0);
+        let tx = SystemTransaction::new_move(&alice, &bob_pubkey, 20, blockhash, 0);
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"signatureSubscribe","params":["{}"]}}"#,
             tx.signatures[0].to_string()
@@ -270,7 +332,13 @@ mod tests {
 
     #[test]
     fn test_account_subscribe() {
-        let (genesis_block, alice) = GenesisBlock::new(10_000);
+        let (mut genesis_block, alice) = GenesisBlock::new(10_000);
+
+        // This test depends on the budget program
+        genesis_block
+            .native_programs
+            .push(("solana_budget_program".to_string(), solana_budget_api::id()));
+
         let bob_pubkey = Keypair::new().pubkey();
         let witness = Keypair::new();
         let contract_funds = Keypair::new();
@@ -286,73 +354,24 @@ mod tests {
         let (subscriber, _id_receiver, mut receiver) = Subscriber::new_test("accountNotification");
         rpc.account_subscribe(session, subscriber, contract_state.pubkey().to_string());
 
-        let tx = SystemTransaction::new_program_account(
-            &alice,
-            contract_funds.pubkey(),
-            blockhash,
-            50,
-            0,
-            budget_program_id,
-            0,
-        );
+        let tx = SystemTransaction::new_account(&alice, &contract_funds.pubkey(), 51, blockhash, 0);
         let arc_bank = process_transaction_and_notify(&arc_bank, &tx, &rpc.subscriptions).unwrap();
 
-        let tx = SystemTransaction::new_program_account(
-            &alice,
-            contract_state.pubkey(),
-            blockhash,
-            1,
-            196,
-            budget_program_id,
-            0,
-        );
-
-        let arc_bank = process_transaction_and_notify(&arc_bank, &tx, &rpc.subscriptions).unwrap();
-
-        // Test signature confirmation notification #1
-        let string = receiver.poll();
-
-        let expected_userdata = arc_bank
-            .get_account(&contract_state.pubkey())
-            .unwrap()
-            .userdata;
-
-        let expected = json!({
-           "jsonrpc": "2.0",
-           "method": "accountNotification",
-           "params": {
-               "result": {
-                   "owner": budget_program_id,
-                   "lamports": 1,
-                   "userdata": expected_userdata,
-                   "executable": executable,
-
-               },
-               "subscription": 0,
-           }
-        });
-
-        if let Async::Ready(Some(response)) = string.unwrap() {
-            assert_eq!(serde_json::to_string(&expected).unwrap(), response);
-        }
-        let tx = BudgetTransaction::new_when_signed(
-            &contract_funds,
-            bob_pubkey,
-            contract_state.pubkey(),
-            witness.pubkey(),
+        let ixs = BudgetInstruction::new_when_signed(
+            &contract_funds.pubkey(),
+            &bob_pubkey,
+            &contract_state.pubkey(),
+            &witness.pubkey(),
             None,
-            50,
-            blockhash,
+            51,
         );
+        let tx = Transaction::new_signed_instructions(&[&contract_funds], ixs, blockhash, 0);
         let arc_bank = process_transaction_and_notify(&arc_bank, &tx, &rpc.subscriptions).unwrap();
         sleep(Duration::from_millis(200));
 
-        // Test signature confirmation notification #2
+        // Test signature confirmation notification #1
         let string = receiver.poll();
-        let expected_userdata = arc_bank
-            .get_account(&contract_state.pubkey())
-            .unwrap()
-            .userdata;
+        let expected_data = arc_bank.get_account(&contract_state.pubkey()).unwrap().data;
         let expected = json!({
            "jsonrpc": "2.0",
            "method": "accountNotification",
@@ -360,7 +379,7 @@ mod tests {
                "result": {
                    "owner": budget_program_id,
                    "lamports": 51,
-                   "userdata": expected_userdata,
+                   "data": expected_data,
                     "executable": executable,
                },
                "subscription": 0,
@@ -371,39 +390,19 @@ mod tests {
             assert_eq!(serde_json::to_string(&expected).unwrap(), response);
         }
 
-        let tx = SystemTransaction::new_account(&alice, witness.pubkey(), 1, blockhash, 0);
+        let tx = SystemTransaction::new_account(&alice, &witness.pubkey(), 1, blockhash, 0);
         let arc_bank = process_transaction_and_notify(&arc_bank, &tx, &rpc.subscriptions).unwrap();
         sleep(Duration::from_millis(200));
-        let tx = BudgetTransaction::new_signature(
-            &witness,
-            contract_state.pubkey(),
-            bob_pubkey,
-            blockhash,
+        let ix = BudgetInstruction::new_apply_signature(
+            &witness.pubkey(),
+            &contract_state.pubkey(),
+            &bob_pubkey,
         );
+        let tx = Transaction::new_signed_instructions(&[&witness], vec![ix], blockhash, 0);
         let arc_bank = process_transaction_and_notify(&arc_bank, &tx, &rpc.subscriptions).unwrap();
         sleep(Duration::from_millis(200));
 
-        let expected_userdata = arc_bank
-            .get_account(&contract_state.pubkey())
-            .unwrap()
-            .userdata;
-        let expected = json!({
-           "jsonrpc": "2.0",
-           "method": "accountNotification",
-           "params": {
-               "result": {
-                   "owner": budget_program_id,
-                   "lamports": 1,
-                   "userdata": expected_userdata,
-                    "executable": executable,
-               },
-               "subscription": 0,
-           }
-        });
-        let string = receiver.poll();
-        if let Async::Ready(Some(response)) = string.unwrap() {
-            assert_eq!(serde_json::to_string(&expected).unwrap(), response);
-        }
+        assert_eq!(arc_bank.get_account(&contract_state.pubkey()), None);
     }
 
     #[test]

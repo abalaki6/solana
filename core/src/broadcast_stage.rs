@@ -43,23 +43,8 @@ impl Broadcast {
         blocktree: &Arc<Blocktree>,
     ) -> Result<()> {
         let timer = Duration::new(1, 0);
-        let (bank, entries) = receiver.recv_timeout(timer)?;
-        let mut broadcast_table = cluster_info
-            .read()
-            .unwrap()
-            .sorted_tvu_peers(&staking_utils::delegated_stakes(&bank));
-        // Layer 1, leader nodes are limited to the fanout size.
-        broadcast_table.truncate(DATA_PLANE_FANOUT);
-        inc_new_counter_info!("broadcast_service-num_peers", broadcast_table.len() + 1);
-
-        let max_tick_height = (bank.slot() + 1) * bank.ticks_per_slot() - 1;
-        // TODO: Fix BankingStage/BroadcastStage to operate on `slot` directly instead of
-        // `max_tick_height`
-        let mut blob_index = blocktree
-            .meta(bank.slot())
-            .expect("Database error")
-            .map(|meta| meta.consumed)
-            .unwrap_or(0);
+        let (mut bank, entries) = receiver.recv_timeout(timer)?;
+        let mut max_tick_height = (bank.slot() + 1) * bank.ticks_per_slot() - 1;
 
         let now = Instant::now();
         let mut num_entries = entries.len();
@@ -67,17 +52,35 @@ impl Broadcast {
         let mut last_tick = entries.last().map(|v| v.1).unwrap_or(0);
         ventries.push(entries);
 
-        while let Ok((same_bank, entries)) = receiver.try_recv() {
-            num_entries += entries.len();
-            last_tick = entries.last().map(|v| v.1).unwrap_or(0);
-            ventries.push(entries);
-            assert!(last_tick <= max_tick_height);
-            assert!(same_bank.slot() == bank.slot());
-            if last_tick == max_tick_height {
-                break;
+        assert!(last_tick <= max_tick_height,);
+        if last_tick != max_tick_height {
+            while let Ok((same_bank, entries)) = receiver.try_recv() {
+                // If the bank changed, that implies the previous slot was interrupted and we do not have to
+                // broadcast its entries.
+                if same_bank.slot() != bank.slot() {
+                    num_entries = 0;
+                    ventries.clear();
+                    bank = same_bank.clone();
+                    max_tick_height = (bank.slot() + 1) * bank.ticks_per_slot() - 1;
+                }
+                num_entries += entries.len();
+                last_tick = entries.last().map(|v| v.1).unwrap_or(0);
+                ventries.push(entries);
+                assert!(last_tick <= max_tick_height,);
+                if last_tick == max_tick_height {
+                    break;
+                }
             }
         }
 
+        let mut broadcast_table = cluster_info
+            .read()
+            .unwrap()
+            .sorted_tvu_peers(&staking_utils::delegated_stakes(&bank));
+        // Layer 1, leader nodes are limited to the fanout size.
+        broadcast_table.truncate(DATA_PLANE_FANOUT);
+
+        inc_new_counter_info!("broadcast_service-num_peers", broadcast_table.len() + 1);
         inc_new_counter_info!("broadcast_service-entries_received", num_entries);
 
         let to_blobs_start = Instant::now();
@@ -90,19 +93,20 @@ impl Broadcast {
             })
             .collect();
 
-        index_blobs(&blobs, &self.id, &mut blob_index, bank.slot());
-        let parent = bank.parents().first().map(|bank| bank.slot()).unwrap_or(0);
-        for b in blobs.iter() {
-            b.write().unwrap().set_parent(parent);
-        }
+        let blob_index = blocktree
+            .meta(bank.slot())
+            .expect("Database error")
+            .map(|meta| meta.consumed)
+            .unwrap_or(0);
 
-        let to_blobs_elapsed = duration_as_ms(&to_blobs_start.elapsed());
+        index_blobs(
+            &blobs,
+            &self.id,
+            blob_index,
+            bank.slot(),
+            bank.parent().map_or(0, |parent| parent.slot()),
+        );
 
-        let broadcast_start = Instant::now();
-
-        inc_new_counter_info!("streamer-broadcast-sent", blobs.len());
-
-        assert!(last_tick <= max_tick_height);
         let contains_last_tick = last_tick == max_tick_height;
 
         if contains_last_tick {
@@ -111,8 +115,14 @@ impl Broadcast {
 
         blocktree.write_shared_blobs(&blobs)?;
 
+        let to_blobs_elapsed = duration_as_ms(&to_blobs_start.elapsed());
+
+        let broadcast_start = Instant::now();
+
         // Send out data
         ClusterInfo::broadcast(&self.id, contains_last_tick, &broadcast_table, sock, &blobs)?;
+
+        inc_new_counter_info!("streamer-broadcast-sent", blobs.len());
 
         // Fill in the coding blob data from the window data blobs
         #[cfg(feature = "erasure")]
@@ -271,7 +281,7 @@ mod test {
     }
 
     fn setup_dummy_broadcast_service(
-        leader_pubkey: Pubkey,
+        leader_pubkey: &Pubkey,
         ledger_path: &str,
         entry_receiver: Receiver<WorkingBankEntries>,
     ) -> MockBroadcastStage {
@@ -283,10 +293,10 @@ mod test {
 
         // Make a node to broadcast to
         let buddy_keypair = Keypair::new();
-        let broadcast_buddy = Node::new_localhost_with_pubkey(buddy_keypair.pubkey());
+        let broadcast_buddy = Node::new_localhost_with_pubkey(&buddy_keypair.pubkey());
 
         // Fill the cluster_info with the buddy's info
-        let mut cluster_info = ClusterInfo::new(leader_info.info.clone());
+        let mut cluster_info = ClusterInfo::new_with_invalid_keypair(leader_info.info.clone());
         cluster_info.insert_info(broadcast_buddy.info);
         let cluster_info = Arc::new(RwLock::new(cluster_info));
 
@@ -322,7 +332,7 @@ mod test {
 
             let (entry_sender, entry_receiver) = channel();
             let broadcast_service = setup_dummy_broadcast_service(
-                leader_keypair.pubkey(),
+                &leader_keypair.pubkey(),
                 &ledger_path,
                 entry_receiver,
             );

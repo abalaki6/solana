@@ -18,7 +18,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 pub struct Tpu {
-    pub id: Pubkey,
     fetch_stage: FetchStage,
     sigverify_stage: SigVerifyStage,
     banking_stage: BankingStage,
@@ -27,12 +26,14 @@ pub struct Tpu {
 }
 
 impl Tpu {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        id: Pubkey,
+        id: &Pubkey,
         cluster_info: &Arc<RwLock<ClusterInfo>>,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
         entry_receiver: Receiver<WorkingBankEntries>,
         transactions_sockets: Vec<UdpSocket>,
+        tpu_via_blobs_sockets: Vec<UdpSocket>,
         broadcast_socket: UdpSocket,
         sigverify_disabled: bool,
         blocktree: &Arc<Blocktree>,
@@ -41,8 +42,12 @@ impl Tpu {
         cluster_info.write().unwrap().set_leader(id);
 
         let (packet_sender, packet_receiver) = channel();
-        let fetch_stage =
-            FetchStage::new_with_sender(transactions_sockets, &exit, &packet_sender.clone());
+        let fetch_stage = FetchStage::new_with_sender(
+            transactions_sockets,
+            tpu_via_blobs_sockets,
+            &exit,
+            &packet_sender.clone(),
+        );
         let cluster_info_vote_listener =
             ClusterInfoVoteListener::new(&exit, cluster_info.clone(), packet_sender);
 
@@ -60,7 +65,6 @@ impl Tpu {
         );
 
         Self {
-            id,
             fetch_stage,
             sigverify_stage,
             banking_stage,

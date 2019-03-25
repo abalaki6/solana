@@ -5,10 +5,10 @@
 use crate::packet::{Blob, SharedBlob, BLOB_DATA_SIZE};
 use crate::poh::Poh;
 use crate::result::Result;
-use bincode::{deserialize, serialize_into, serialized_size};
+use bincode::{deserialize, serialized_size};
 use chrono::prelude::Utc;
 use rayon::prelude::*;
-use solana_budget_api::budget_transaction::BudgetTransaction;
+use solana_budget_api::budget_instruction::BudgetInstruction;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, KeypairUtil};
@@ -16,7 +16,6 @@ use solana_sdk::transaction::Transaction;
 use solana_vote_api::vote_instruction::Vote;
 use solana_vote_api::vote_transaction::VoteTransaction;
 use std::borrow::Borrow;
-use std::io::Cursor;
 use std::mem::size_of;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, RwLock};
@@ -102,14 +101,7 @@ impl Entry {
     }
 
     pub fn to_blob(&self) -> Blob {
-        let mut blob = Blob::default();
-        let pos = {
-            let mut out = Cursor::new(blob.data_mut());
-            serialize_into(&mut out, &self).expect("failed to serialize output");
-            out.position() as usize
-        };
-        blob.set_size(pos);
-        blob
+        Blob::from_serializable(&vec![&self])
     }
 
     /// Estimate serialized_size of Entry without creating an Entry.
@@ -120,42 +112,6 @@ impl Entry {
             .sum();
         // num_hashes   +    hash  +              txs
         (2 * size_of::<u64>() + size_of::<Hash>()) as u64 + txs_size
-    }
-
-    pub fn num_will_fit(transactions: &[Transaction]) -> usize {
-        if transactions.is_empty() {
-            return 0;
-        }
-        let mut num = transactions.len();
-        let mut upper = transactions.len();
-        let mut lower = 1; // if one won't fit, we have a lot of TODOs
-        let mut next = transactions.len(); // optimistic
-        loop {
-            debug!(
-                "num {}, upper {} lower {} next {} transactions.len() {}",
-                num,
-                upper,
-                lower,
-                next,
-                transactions.len()
-            );
-            if Self::serialized_size(&transactions[..num]) <= BLOB_DATA_SIZE as u64 {
-                next = (upper + num) / 2;
-                lower = num;
-                debug!("num {} fits, maybe too well? trying {}", num, next);
-            } else {
-                next = (lower + num) / 2;
-                upper = num;
-                debug!("num {} doesn't fit! trying {}", num, next);
-            }
-            // same as last time
-            if next == num {
-                debug!("converged on num {}", num);
-                break;
-            }
-            num = next;
-        }
-        num
     }
 
     /// Creates the next Tick Entry `num_hashes` after `start_hash`.
@@ -233,15 +189,14 @@ where
     let mut num_ticks = 0;
 
     for blob in blobs.into_iter() {
-        let entry: Entry = {
+        let new_entries: Vec<Entry> = {
             let msg_size = blob.borrow().size();
             deserialize(&blob.borrow().data()[..msg_size])?
         };
 
-        if entry.is_tick() {
-            num_ticks += 1
-        }
-        entries.push(entry)
+        let num_new_ticks: u64 = new_entries.iter().map(|entry| entry.is_tick() as u64).sum();
+        num_ticks += num_new_ticks;
+        entries.extend(new_entries)
     }
     Ok((entries, num_ticks))
 }
@@ -252,6 +207,8 @@ pub trait EntrySlice {
     fn verify(&self, start_hash: &Hash) -> bool;
     fn to_shared_blobs(&self) -> Vec<SharedBlob>;
     fn to_blobs(&self) -> Vec<Blob>;
+    fn to_single_entry_blobs(&self) -> Vec<Blob>;
+    fn to_single_entry_shared_blobs(&self) -> Vec<SharedBlob>;
     fn votes(&self) -> Vec<(Pubkey, Vote, Hash)>;
 }
 
@@ -278,11 +235,30 @@ impl EntrySlice for [Entry] {
     }
 
     fn to_blobs(&self) -> Vec<Blob> {
-        self.iter().map(|entry| entry.to_blob()).collect()
+        split_serializable_chunks(
+            &self,
+            BLOB_DATA_SIZE as u64,
+            &|s| bincode::serialized_size(&s).unwrap(),
+            &mut |entries: &[Entry]| Blob::from_serializable(entries),
+        )
     }
 
     fn to_shared_blobs(&self) -> Vec<SharedBlob> {
-        self.iter().map(|entry| entry.to_shared_blob()).collect()
+        self.to_blobs()
+            .into_iter()
+            .map(|b| Arc::new(RwLock::new(b)))
+            .collect()
+    }
+
+    fn to_single_entry_shared_blobs(&self) -> Vec<SharedBlob> {
+        self.to_single_entry_blobs()
+            .into_iter()
+            .map(|b| Arc::new(RwLock::new(b)))
+            .collect()
+    }
+
+    fn to_single_entry_blobs(&self) -> Vec<Blob> {
+        self.iter().map(|entry| entry.to_blob()).collect()
     }
 
     fn votes(&self) -> Vec<(Pubkey, Vote, Hash)> {
@@ -303,6 +279,67 @@ pub fn next_entry_mut(start: &mut Hash, num_hashes: u64, transactions: Vec<Trans
     entry
 }
 
+pub fn num_will_fit<T, F>(serializables: &[T], max_size: u64, serialized_size: &F) -> usize
+where
+    F: Fn(&[T]) -> u64,
+{
+    if serializables.is_empty() {
+        return 0;
+    }
+    let mut num = serializables.len();
+    let mut upper = serializables.len();
+    let mut lower = 1; // if one won't fit, we have a lot of TODOs
+    let mut next = serializables.len(); // optimistic
+    loop {
+        debug!(
+            "num {}, upper {} lower {} next {} serializables.len() {}",
+            num,
+            upper,
+            lower,
+            next,
+            serializables.len()
+        );
+        if serialized_size(&serializables[..num]) <= max_size {
+            next = (upper + num) / 2;
+            lower = num;
+            debug!("num {} fits, maybe too well? trying {}", num, next);
+        } else {
+            next = (lower + num) / 2;
+            upper = num;
+            debug!("num {} doesn't fit! trying {}", num, next);
+        }
+        // same as last time
+        if next == num {
+            debug!("converged on num {}", num);
+            break;
+        }
+        num = next;
+    }
+    num
+}
+
+pub fn split_serializable_chunks<T, R, F1, F2>(
+    serializables: &[T],
+    max_size: u64,
+    serialized_size: &F1,
+    converter: &mut F2,
+) -> Vec<R>
+where
+    F1: Fn(&[T]) -> u64,
+    F2: FnMut(&[T]) -> R,
+{
+    let mut result = vec![];
+    let mut chunk_start = 0;
+    while chunk_start < serializables.len() {
+        let chunk_end =
+            chunk_start + num_will_fit(&serializables[chunk_start..], max_size, serialized_size);
+        result.push(converter(&serializables[chunk_start..chunk_end]));
+        chunk_start = chunk_end;
+    }
+
+    result
+}
+
 /// Creates the next entries for given transactions, outputs
 /// updates start_hash to hash of last Entry, sets num_hashes to 0
 pub fn next_entries_mut(
@@ -310,61 +347,12 @@ pub fn next_entries_mut(
     num_hashes: &mut u64,
     transactions: Vec<Transaction>,
 ) -> Vec<Entry> {
-    // TODO: ?? find a number that works better than |?
-    //                                               V
-    if transactions.is_empty() || transactions.len() == 1 {
-        vec![Entry::new_mut(start_hash, num_hashes, transactions)]
-    } else {
-        let mut chunk_start = 0;
-        let mut entries = Vec::new();
-
-        while chunk_start < transactions.len() {
-            let mut chunk_end = transactions.len();
-            let mut upper = chunk_end;
-            let mut lower = chunk_start;
-            let mut next = chunk_end; // be optimistic that all will fit
-
-            // binary search for how many transactions will fit in an Entry (i.e. a BLOB)
-            loop {
-                debug!(
-                    "chunk_end {}, upper {} lower {} next {} transactions.len() {}",
-                    chunk_end,
-                    upper,
-                    lower,
-                    next,
-                    transactions.len()
-                );
-                if Entry::serialized_size(&transactions[chunk_start..chunk_end])
-                    <= BLOB_DATA_SIZE as u64
-                {
-                    next = (upper + chunk_end) / 2;
-                    lower = chunk_end;
-                    debug!(
-                        "chunk_end {} fits, maybe too well? trying {}",
-                        chunk_end, next
-                    );
-                } else {
-                    next = (lower + chunk_end) / 2;
-                    upper = chunk_end;
-                    debug!("chunk_end {} doesn't fit! trying {}", chunk_end, next);
-                }
-                // same as last time
-                if next == chunk_end {
-                    debug!("converged on chunk_end {}", chunk_end);
-                    break;
-                }
-                chunk_end = next;
-            }
-            entries.push(Entry::new_mut(
-                start_hash,
-                num_hashes,
-                transactions[chunk_start..chunk_end].to_vec(),
-            ));
-            chunk_start = chunk_end;
-        }
-
-        entries
-    }
+    split_serializable_chunks(
+        &transactions[..],
+        BLOB_DATA_SIZE as u64,
+        &Entry::serialized_size,
+        &mut |txs: &[Transaction]| Entry::new_mut(start_hash, num_hashes, txs.to_vec()),
+    )
 }
 
 /// Creates the next Entries for given transactions
@@ -390,22 +378,15 @@ pub fn create_ticks(num_ticks: u64, mut hash: Hash) -> Vec<Entry> {
 
 pub fn make_tiny_test_entries_from_hash(start: &Hash, num: usize) -> Vec<Entry> {
     let keypair = Keypair::new();
+    let pubkey = keypair.pubkey();
 
     let mut hash = *start;
     let mut num_hashes = 0;
     (0..num)
         .map(|_| {
-            Entry::new_mut(
-                &mut hash,
-                &mut num_hashes,
-                vec![BudgetTransaction::new_timestamp(
-                    &keypair,
-                    keypair.pubkey(),
-                    keypair.pubkey(),
-                    Utc::now(),
-                    *start,
-                )],
-            )
+            let ix = BudgetInstruction::new_apply_timestamp(&pubkey, &pubkey, &pubkey, Utc::now());
+            let tx = Transaction::new_signed_instructions(&[&keypair], vec![ix], *start, 0);
+            Entry::new_mut(&mut hash, &mut num_hashes, vec![tx])
         })
         .collect()
 }
@@ -420,14 +401,10 @@ pub fn make_large_test_entries(num_entries: usize) -> Vec<Entry> {
     let zero = Hash::default();
     let one = solana_sdk::hash::hash(&zero.as_ref());
     let keypair = Keypair::new();
+    let pubkey = keypair.pubkey();
 
-    let tx = BudgetTransaction::new_timestamp(
-        &keypair,
-        keypair.pubkey(),
-        keypair.pubkey(),
-        Utc::now(),
-        one,
-    );
+    let ix = BudgetInstruction::new_apply_timestamp(&pubkey, &pubkey, &pubkey, Utc::now());
+    let tx = Transaction::new_signed_instructions(&[&keypair], vec![ix], one, 0);
 
     let serialized_size = tx.serialized_size().unwrap();
     let num_txs = BLOB_DATA_SIZE / serialized_size as usize;
@@ -446,7 +423,7 @@ pub fn make_consecutive_blobs(
 ) -> Vec<SharedBlob> {
     let entries = create_ticks(num_blobs_to_make, start_hash);
 
-    let blobs = entries.to_shared_blobs();
+    let blobs = entries.to_single_entry_shared_blobs();
     let mut index = start_height;
     for blob in &blobs {
         let mut blob = blob.write().unwrap();
@@ -480,6 +457,24 @@ mod tests {
     use solana_sdk::system_transaction::SystemTransaction;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+    fn create_sample_payment(keypair: &Keypair, hash: Hash) -> Transaction {
+        let pubkey = keypair.pubkey();
+        let ixs = BudgetInstruction::new_payment(&pubkey, &pubkey, 1);
+        Transaction::new_signed_instructions(&[keypair], ixs, hash, 0)
+    }
+
+    fn create_sample_timestamp(keypair: &Keypair, hash: Hash) -> Transaction {
+        let pubkey = keypair.pubkey();
+        let ix = BudgetInstruction::new_apply_timestamp(&pubkey, &pubkey, &pubkey, Utc::now());
+        Transaction::new_signed_instructions(&[keypair], vec![ix], hash, 0)
+    }
+
+    fn create_sample_signature(keypair: &Keypair, hash: Hash) -> Transaction {
+        let pubkey = keypair.pubkey();
+        let ix = BudgetInstruction::new_apply_signature(&pubkey, &pubkey, &pubkey);
+        Transaction::new_signed_instructions(&[keypair], vec![ix], hash, 0)
+    }
+
     #[test]
     fn test_entry_verify() {
         let zero = Hash::default();
@@ -496,8 +491,8 @@ mod tests {
 
         // First, verify entries
         let keypair = Keypair::new();
-        let tx0 = SystemTransaction::new_account(&keypair, keypair.pubkey(), 0, zero, 0);
-        let tx1 = SystemTransaction::new_account(&keypair, keypair.pubkey(), 1, zero, 0);
+        let tx0 = SystemTransaction::new_account(&keypair, &keypair.pubkey(), 0, zero, 0);
+        let tx1 = SystemTransaction::new_account(&keypair, &keypair.pubkey(), 1, zero, 0);
         let mut e0 = Entry::new(&zero, 0, vec![tx0.clone(), tx1.clone()]);
         assert!(e0.verify(&zero));
 
@@ -513,15 +508,8 @@ mod tests {
 
         // First, verify entries
         let keypair = Keypair::new();
-        let tx0 = BudgetTransaction::new_timestamp(
-            &keypair,
-            keypair.pubkey(),
-            keypair.pubkey(),
-            Utc::now(),
-            zero,
-        );
-        let tx1 =
-            BudgetTransaction::new_signature(&keypair, keypair.pubkey(), keypair.pubkey(), zero);
+        let tx0 = create_sample_timestamp(&keypair, zero);
+        let tx1 = create_sample_signature(&keypair, zero);
         let mut e0 = Entry::new(&zero, 0, vec![tx0.clone(), tx1.clone()]);
         assert!(e0.verify(&zero));
 
@@ -543,13 +531,7 @@ mod tests {
         assert_eq!(tick.hash, zero);
 
         let keypair = Keypair::new();
-        let tx0 = BudgetTransaction::new_timestamp(
-            &keypair,
-            keypair.pubkey(),
-            keypair.pubkey(),
-            Utc::now(),
-            zero,
-        );
+        let tx0 = create_sample_timestamp(&keypair, zero);
         let entry0 = next_entry(&zero, 1, vec![tx0.clone()]);
         assert_eq!(entry0.num_hashes, 1);
         assert_eq!(entry0.hash, next_hash(&zero, 1, &vec![tx0]));
@@ -560,7 +542,7 @@ mod tests {
     fn test_next_entry_panic() {
         let zero = Hash::default();
         let keypair = Keypair::new();
-        let tx = SystemTransaction::new_account(&keypair, keypair.pubkey(), 0, zero, 0);
+        let tx = SystemTransaction::new_account(&keypair, &keypair.pubkey(), 0, zero, 0);
         next_entry(&zero, 0, vec![tx]);
     }
 
@@ -568,7 +550,7 @@ mod tests {
     fn test_serialized_size() {
         let zero = Hash::default();
         let keypair = Keypair::new();
-        let tx = SystemTransaction::new_account(&keypair, keypair.pubkey(), 0, zero, 0);
+        let tx = SystemTransaction::new_account(&keypair, &keypair.pubkey(), 0, zero, 0);
         let entry = next_entry(&zero, 1, vec![tx.clone()]);
         assert_eq!(
             Entry::serialized_size(&[tx]),
@@ -596,14 +578,8 @@ mod tests {
         let one = hash(&zero.as_ref());
         let keypair = Keypair::new();
         let vote_account = Keypair::new();
-        let tx0 = VoteTransaction::new_vote(&vote_account, 1, one, 1);
-        let tx1 = BudgetTransaction::new_timestamp(
-            &keypair,
-            keypair.pubkey(),
-            keypair.pubkey(),
-            Utc::now(),
-            one,
-        );
+        let tx0 = VoteTransaction::new_vote(&vote_account.pubkey(), &vote_account, 1, one, 1);
+        let tx1 = create_sample_timestamp(&keypair, one);
         //
         // TODO: this magic number and the mix of transaction types
         //       is designed to fill up a Blob more or less exactly,
@@ -620,12 +596,29 @@ mod tests {
     }
 
     #[test]
-    fn test_entries_to_shared_blobs() {
+    fn test_entries_to_blobs() {
         solana_logger::setup();
         let entries = make_test_entries();
 
         let blob_q = entries.to_blobs();
 
+        assert_eq!(reconstruct_entries_from_blobs(blob_q).unwrap().0, entries);
+    }
+
+    #[test]
+    fn test_multiple_entries_to_blobs() {
+        solana_logger::setup();
+        let num_blobs = 10;
+        let serialized_size =
+            bincode::serialized_size(&make_tiny_test_entries_from_hash(&Hash::default(), 1))
+                .unwrap();
+
+        let num_entries = (num_blobs * BLOB_DATA_SIZE as u64) / serialized_size;
+        let entries = make_tiny_test_entries_from_hash(&Hash::default(), num_entries as usize);
+
+        let blob_q = entries.to_blobs();
+
+        assert_eq!(blob_q.len() as u64, num_blobs);
         assert_eq!(reconstruct_entries_from_blobs(blob_q).unwrap().0, entries);
     }
 
@@ -644,8 +637,9 @@ mod tests {
         let next_hash = solana_sdk::hash::hash(&hash.as_ref());
         let keypair = Keypair::new();
         let vote_account = Keypair::new();
-        let tx_small = VoteTransaction::new_vote(&vote_account, 1, next_hash, 2);
-        let tx_large = BudgetTransaction::new(&keypair, keypair.pubkey(), 1, next_hash);
+        let tx_small =
+            VoteTransaction::new_vote(&vote_account.pubkey(), &vote_account, 1, next_hash, 2);
+        let tx_large = create_sample_payment(&keypair, next_hash);
 
         let tx_small_size = tx_small.serialized_size().unwrap() as usize;
         let tx_large_size = tx_large.serialized_size().unwrap() as usize;
@@ -684,4 +678,40 @@ mod tests {
         assert!(entries0.verify(&hash));
     }
 
+    #[test]
+    fn test_num_will_fit_empty() {
+        let serializables: Vec<u32> = vec![];
+        let result = num_will_fit(&serializables[..], 8, &|_| 4);
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_num_fit() {
+        let serializables_vec: Vec<u8> = (0..10).map(|_| 1).collect();
+        let serializables = &serializables_vec[..];
+        let sum = |i: &[u8]| (0..i.len()).into_iter().sum::<usize>() as u64;
+        // sum[0] is = 0, but sum[0..1] > 0, so result contains 1 item
+        let result = num_will_fit(serializables, 0, &sum);
+        assert_eq!(result, 1);
+
+        // sum[0..3] is <= 8, but sum[0..4] > 8, so result contains 3 items
+        let result = num_will_fit(serializables, 8, &sum);
+        assert_eq!(result, 4);
+
+        // sum[0..1] is = 1, but sum[0..2] > 0, so result contains 2 items
+        let result = num_will_fit(serializables, 1, &sum);
+        assert_eq!(result, 2);
+
+        // sum[0..9] = 45, so contains all items
+        let result = num_will_fit(serializables, 45, &sum);
+        assert_eq!(result, 10);
+
+        // sum[0..8] <= 44, but sum[0..9] = 45, so contains all but last item
+        let result = num_will_fit(serializables, 44, &sum);
+        assert_eq!(result, 9);
+
+        // sum[0..9] <= 46, but contains all items
+        let result = num_will_fit(serializables, 46, &sum);
+        assert_eq!(result, 10);
+    }
 }

@@ -1,25 +1,29 @@
 use crate::blob_fetch_stage::BlobFetchStage;
 use crate::blocktree::Blocktree;
-use crate::blocktree_processor;
 #[cfg(feature = "chacha")]
 use crate::chacha::{chacha_cbc_encrypt_ledger, CHACHA_BLOCK_SIZE};
-use crate::client::mk_client;
-use crate::cluster_info::{ClusterInfo, Node, NodeInfo};
+use crate::cluster_info::{ClusterInfo, Node, FULLNODE_PORT_RANGE};
+use crate::contact_info::ContactInfo;
 use crate::gossip_service::GossipService;
-use crate::result::{self, Result};
-use crate::rpc_request::{RpcClient, RpcRequest, RpcRequestHandler};
+use crate::packet::to_shared_blob;
+use crate::repair_service::RepairSlotRange;
+use crate::result::Result;
 use crate::service::Service;
 use crate::storage_stage::{get_segment_from_entry, ENTRIES_PER_SEGMENT};
-use crate::streamer::BlobReceiver;
-use crate::thin_client::{retry_get_balance, ThinClient};
+use crate::streamer::receiver;
+use crate::streamer::responder;
 use crate::window_service::WindowService;
+use bincode::deserialize;
 use rand::thread_rng;
 use rand::Rng;
+use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_request::RpcRequest;
+use solana_client::thin_client::{create_client, ThinClient};
 use solana_drone::drone::{request_airdrop_transaction, DRONE_PORT};
-use solana_sdk::genesis_block::GenesisBlock;
 use solana_sdk::hash::{Hash, Hasher};
 use solana_sdk::signature::{Keypair, KeypairUtil, Signature};
-use solana_storage_api::StorageTransaction;
+use solana_sdk::transaction::Transaction;
+use solana_storage_api::storage_instruction::StorageInstruction;
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
@@ -28,21 +32,41 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::{Error, ErrorKind};
 use std::mem::size_of;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
+use std::path::PathBuf;
+use std::result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, RwLock};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::thread::spawn;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+#[derive(Serialize, Deserialize)]
+pub enum ReplicatorRequest {
+    GetSlotHeight(SocketAddr),
+}
 
 pub struct Replicator {
     gossip_service: GossipService,
     fetch_stage: BlobFetchStage,
     window_service: WindowService,
-    pub retransmit_receiver: BlobReceiver,
+    thread_handles: Vec<JoinHandle<()>>,
     exit: Arc<AtomicBool>,
-    entry_height: u64,
+    slot: u64,
+    ledger_path: String,
+    keypair: Arc<Keypair>,
+    signature: ring::signature::Signature,
+    cluster_entrypoint: ContactInfo,
+    ledger_data_file_encrypted: PathBuf,
+    sampling_offsets: Vec<u64>,
+    hash: Hash,
+    #[cfg(feature = "chacha")]
+    num_chacha_blocks: usize,
+    #[cfg(feature = "chacha")]
+    blocktree: Arc<Blocktree>,
 }
 
 pub fn sample_file(in_path: &Path, sample_offsets: &[u64]) -> io::Result<Hash> {
@@ -94,6 +118,54 @@ fn get_entry_heights_from_blockhash(
     segment_index * ENTRIES_PER_SEGMENT
 }
 
+fn create_request_processor(
+    socket: UdpSocket,
+    exit: &Arc<AtomicBool>,
+    slot: u64,
+) -> Vec<JoinHandle<()>> {
+    let mut thread_handles = vec![];
+    let (s_reader, r_reader) = channel();
+    let (s_responder, r_responder) = channel();
+    let storage_socket = Arc::new(socket);
+    let t_receiver = receiver(
+        storage_socket.clone(),
+        exit,
+        s_reader,
+        "replicator-receiver",
+    );
+    thread_handles.push(t_receiver);
+
+    let t_responder = responder("replicator-responder", storage_socket.clone(), r_responder);
+    thread_handles.push(t_responder);
+
+    let exit4 = exit.clone();
+    let t_processor = spawn(move || loop {
+        let packets = r_reader.recv_timeout(Duration::from_secs(1));
+        if let Ok(packets) = packets {
+            for packet in &packets.read().unwrap().packets {
+                let req: result::Result<ReplicatorRequest, Box<bincode::ErrorKind>> =
+                    deserialize(&packet.data[..packet.meta.size]);
+                match req {
+                    Ok(ReplicatorRequest::GetSlotHeight(from)) => {
+                        if let Ok(blob) = to_shared_blob(slot, from) {
+                            let _ = s_responder.send(vec![blob]);
+                        }
+                    }
+                    Err(e) => {
+                        info!("invalid request: {:?}", e);
+                    }
+                }
+            }
+        }
+        if exit4.load(Ordering::Relaxed) {
+            break;
+        }
+    });
+    thread_handles.push(t_processor);
+
+    thread_handles
+}
+
 impl Replicator {
     /// Returns a Result that contains a replicator on success
     ///
@@ -101,7 +173,7 @@ impl Replicator {
     /// * `ledger_path` - path to where the ledger will be stored.
     /// Causes panic if none
     /// * `node` - The replicator node
-    /// * `leader_info` - NodeInfo representing the leader
+    /// * `cluster_entrypoint` - ContactInfo representing an entry into the network
     /// * `keypair` - Keypair for this replicator
     /// * `timeout` - (optional) timeout for polling for leader/downloading the ledger. Defaults to
     /// 30 seconds
@@ -109,23 +181,17 @@ impl Replicator {
     pub fn new(
         ledger_path: &str,
         node: Node,
-        leader_info: &NodeInfo,
-        keypair: &Keypair,
-        timeout: Option<Duration>,
+        cluster_entrypoint: ContactInfo,
+        keypair: Arc<Keypair>,
+        _timeout: Option<Duration>,
     ) -> Result<Self> {
         let exit = Arc::new(AtomicBool::new(false));
-        let timeout = timeout.unwrap_or_else(|| Duration::new(30, 0));
 
         info!("Replicator: id: {}", keypair.pubkey());
         info!("Creating cluster info....");
-        let cluster_info = Arc::new(RwLock::new(ClusterInfo::new(node.info.clone())));
-
-        let leader_pubkey = leader_info.id;
-        {
-            let mut cluster_info_w = cluster_info.write().unwrap();
-            cluster_info_w.insert_info(leader_info.clone());
-            cluster_info_w.set_leader(leader_pubkey);
-        }
+        let mut cluster_info = ClusterInfo::new(node.info.clone(), keypair.clone());
+        cluster_info.set_entrypoint(cluster_entrypoint.clone());
+        let cluster_info = Arc::new(RwLock::new(cluster_info));
 
         // Create Blocktree, eventually will simply repurpose the input
         // ledger path as the Blocktree path once we replace the ledger with
@@ -135,16 +201,8 @@ impl Replicator {
         let blocktree =
             Blocktree::open(ledger_path).expect("Expected to be able to open database ledger");
 
-        let genesis_block =
-            GenesisBlock::load(ledger_path).expect("Expected to successfully open genesis block");
-
-        let (_bank_forks, _bank_forks_info) =
-            blocktree_processor::process_blocktree(&genesis_block, &blocktree, None)
-                .expect("process_blocktree failed");
-
         let blocktree = Arc::new(blocktree);
 
-        //TODO(sagar) Does replicator need a bank also ?
         let gossip_service = GossipService::new(
             &cluster_info,
             Some(blocktree.clone()),
@@ -153,18 +211,20 @@ impl Replicator {
             &exit,
         );
 
-        info!("polling for leader");
-        let leader = Self::poll_for_leader(&cluster_info, timeout)?;
-
-        info!("Got leader: {:?}", leader);
+        info!("Looking for leader at {:?}", cluster_entrypoint);
+        crate::gossip_service::discover(&cluster_entrypoint.gossip, 1)?;
 
         let (storage_blockhash, storage_entry_height) =
             Self::poll_for_blockhash_and_entry_height(&cluster_info)?;
 
+        let node_info = node.info.clone();
         let signature = keypair.sign(storage_blockhash.as_ref());
-        let entry_height = get_entry_heights_from_blockhash(&signature, storage_entry_height);
+        let slot = get_entry_heights_from_blockhash(&signature, storage_entry_height);
+        info!("replicating slot: {}", slot);
 
-        info!("replicating entry_height: {}", entry_height);
+        let mut repair_slot_range = RepairSlotRange::default();
+        repair_slot_range.end = slot + ENTRIES_PER_SEGMENT;
+        repair_slot_range.start = slot;
 
         let repair_socket = Arc::new(node.sockets.repair);
         let mut blob_sockets: Vec<Arc<UdpSocket>> =
@@ -173,7 +233,6 @@ impl Replicator {
         let (blob_fetch_sender, blob_fetch_receiver) = channel();
         let fetch_stage = BlobFetchStage::new_multi_socket(blob_sockets, &blob_fetch_sender, &exit);
 
-        // todo: pull blobs off the retransmit_receiver and recycle them?
         let (retransmit_sender, retransmit_receiver) = channel();
 
         let window_service = WindowService::new(
@@ -183,46 +242,138 @@ impl Replicator {
             retransmit_sender,
             repair_socket,
             &exit,
+            repair_slot_range,
         );
 
+        let mut thread_handles =
+            create_request_processor(node.sockets.storage.unwrap(), &exit, slot);
+
+        // receive blobs from retransmit and drop them.
+        let exit2 = exit.clone();
+        let t_retransmit = spawn(move || loop {
+            let _ = retransmit_receiver.recv_timeout(Duration::from_secs(1));
+            if exit2.load(Ordering::Relaxed) {
+                break;
+            }
+        });
+        thread_handles.push(t_retransmit);
+
+        let exit3 = exit.clone();
+        let blocktree1 = blocktree.clone();
+        let t_replicate = spawn(move || loop {
+            Self::wait_for_ledger_download(slot, &blocktree1, &exit3, &node_info, &cluster_info);
+            if exit3.load(Ordering::Relaxed) {
+                break;
+            }
+        });
+        thread_handles.push(t_replicate);
+
+        Ok(Self {
+            gossip_service,
+            fetch_stage,
+            window_service,
+            thread_handles,
+            exit,
+            slot,
+            ledger_path: ledger_path.to_string(),
+            keypair: keypair.clone(),
+            signature,
+            cluster_entrypoint,
+            ledger_data_file_encrypted: PathBuf::default(),
+            sampling_offsets: vec![],
+            hash: Hash::default(),
+            #[cfg(feature = "chacha")]
+            num_chacha_blocks: 0,
+            #[cfg(feature = "chacha")]
+            blocktree,
+        })
+    }
+
+    pub fn run(&mut self) {
+        self.encrypt_ledger()
+            .expect("ledger encrypt not successful");
+        loop {
+            self.create_sampling_offsets();
+            if self.sample_file_to_create_mining_hash().is_err() {
+                info!("Error sampling file, exiting...");
+                break;
+            }
+            self.submit_mining_proof();
+        }
+    }
+
+    fn wait_for_ledger_download(
+        start_slot: u64,
+        blocktree: &Arc<Blocktree>,
+        exit: &Arc<AtomicBool>,
+        node_info: &ContactInfo,
+        cluster_info: &Arc<RwLock<ClusterInfo>>,
+    ) {
         info!("window created, waiting for ledger download done");
-        let _start = Instant::now();
         let mut _received_so_far = 0;
 
-        /*while !done.load(Ordering::Relaxed) {
-            sleep(Duration::from_millis(100));
-
-            let elapsed = start.elapsed();
-            received_so_far += entry_receiver.try_recv().map(|v| v.len()).unwrap_or(0);
-
-            if received_so_far == 0 && elapsed > timeout {
-                return Err(result::Error::IO(io::Error::new(
-                    ErrorKind::TimedOut,
-                    "Timed out waiting to receive any blocks",
-                )));
+        let mut current_slot = start_slot;
+        'outer: loop {
+            while let Ok(meta) = blocktree.meta(current_slot) {
+                if let Some(meta) = meta {
+                    if meta.is_connected {
+                        current_slot += 1;
+                        warn!("current slot: {}", current_slot);
+                        if current_slot >= start_slot + ENTRIES_PER_SEGMENT {
+                            break 'outer;
+                        }
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
-        }*/
+            if exit.load(Ordering::Relaxed) {
+                break;
+            }
+            sleep(Duration::from_secs(1));
+        }
 
         info!("Done receiving entries from window_service");
 
-        let mut node_info = node.info.clone();
-        node_info.tvu = "0.0.0.0:0".parse().unwrap();
+        // Remove replicator from the data plane
+        let mut contact_info = node_info.clone();
+        contact_info.tvu = "0.0.0.0:0".parse().unwrap();
         {
             let mut cluster_info_w = cluster_info.write().unwrap();
-            cluster_info_w.insert_info(node_info);
+            cluster_info_w.insert_self(contact_info);
+        }
+    }
+
+    fn encrypt_ledger(&mut self) -> Result<()> {
+        let ledger_path = Path::new(&self.ledger_path);
+        self.ledger_data_file_encrypted = ledger_path.join("ledger.enc");
+
+        #[cfg(feature = "chacha")]
+        {
+            let mut ivec = [0u8; 64];
+            ivec.copy_from_slice(self.signature.as_ref());
+
+            let num_encrypted_bytes = chacha_cbc_encrypt_ledger(
+                &self.blocktree,
+                self.slot,
+                &self.ledger_data_file_encrypted,
+                &mut ivec,
+            )?;
+
+            self.num_chacha_blocks = num_encrypted_bytes / CHACHA_BLOCK_SIZE;
         }
 
-        let mut client = mk_client(&leader);
+        info!("Done encrypting the ledger");
+        Ok(())
+    }
 
-        Self::get_airdrop_lamports(&mut client, keypair, &leader_info);
-        info!("Done downloading ledger at {}", ledger_path);
-
-        let ledger_path = Path::new(ledger_path);
-        let ledger_data_file_encrypted = ledger_path.join("ledger.enc");
-        let mut sampling_offsets = Vec::new();
+    fn create_sampling_offsets(&mut self) {
+        self.sampling_offsets.clear();
 
         #[cfg(not(feature = "chacha"))]
-        sampling_offsets.push(0);
+        self.sampling_offsets.push(0);
 
         #[cfg(feature = "chacha")]
         {
@@ -230,53 +381,39 @@ impl Replicator {
             use rand::{Rng, SeedableRng};
             use rand_chacha::ChaChaRng;
 
-            let mut ivec = [0u8; 64];
-            ivec.copy_from_slice(signature.as_ref());
-
-            let num_encrypted_bytes = chacha_cbc_encrypt_ledger(
-                &blocktree,
-                entry_height,
-                &ledger_data_file_encrypted,
-                &mut ivec,
-            )?;
-
-            let num_chacha_blocks = num_encrypted_bytes / CHACHA_BLOCK_SIZE;
             let mut rng_seed = [0u8; 32];
-            rng_seed.copy_from_slice(&signature.as_ref()[0..32]);
+            rng_seed.copy_from_slice(&self.signature.as_ref()[0..32]);
             let mut rng = ChaChaRng::from_seed(rng_seed);
             for _ in 0..NUM_STORAGE_SAMPLES {
-                sampling_offsets.push(rng.gen_range(0, num_chacha_blocks) as u64);
+                self.sampling_offsets
+                    .push(rng.gen_range(0, self.num_chacha_blocks) as u64);
             }
         }
+    }
 
-        info!("Done encrypting the ledger");
+    fn sample_file_to_create_mining_hash(&mut self) -> Result<()> {
+        self.hash = sample_file(&self.ledger_data_file_encrypted, &self.sampling_offsets)?;
+        info!("sampled hash: {}", self.hash);
+        Ok(())
+    }
 
-        match sample_file(&ledger_data_file_encrypted, &sampling_offsets) {
-            Ok(hash) => {
-                let blockhash = client.get_recent_blockhash();
-                info!("sampled hash: {}", hash);
-                let mut tx = StorageTransaction::new_mining_proof(
-                    &keypair,
-                    hash,
-                    blockhash,
-                    entry_height,
-                    Signature::new(signature.as_ref()),
-                );
-                client
-                    .retry_transfer(&keypair, &mut tx, 10)
-                    .expect("transfer didn't work!");
-            }
-            Err(e) => info!("Error occurred while sampling: {:?}", e),
-        }
+    fn submit_mining_proof(&self) {
+        let client = create_client(
+            self.cluster_entrypoint.client_facing_addr(),
+            FULLNODE_PORT_RANGE,
+        );
+        Self::get_airdrop_lamports(&client, &self.keypair, &self.cluster_entrypoint);
 
-        Ok(Self {
-            gossip_service,
-            fetch_stage,
-            window_service,
-            retransmit_receiver,
-            exit,
-            entry_height,
-        })
+        let ix = StorageInstruction::new_mining_proof(
+            &self.keypair.pubkey(),
+            self.hash,
+            self.slot,
+            Signature::new(self.signature.as_ref()),
+        );
+        let mut tx = Transaction::new(vec![ix]);
+        client
+            .retry_transfer(&self.keypair, &mut tx, 10)
+            .expect("transfer didn't work!");
     }
 
     pub fn close(self) {
@@ -288,41 +425,13 @@ impl Replicator {
         self.gossip_service.join().unwrap();
         self.fetch_stage.join().unwrap();
         self.window_service.join().unwrap();
-
-        // Drain the queue here to prevent self.retransmit_receiver from being dropped
-        // before the window_service thread is joined
-        let mut retransmit_queue_count = 0;
-        while let Ok(_blob) = self.retransmit_receiver.recv_timeout(Duration::new(1, 0)) {
-            retransmit_queue_count += 1;
+        for handle in self.thread_handles {
+            handle.join().unwrap();
         }
-        debug!("retransmit channel count: {}", retransmit_queue_count);
     }
 
     pub fn entry_height(&self) -> u64 {
-        self.entry_height
-    }
-
-    fn poll_for_leader(
-        cluster_info: &Arc<RwLock<ClusterInfo>>,
-        timeout: Duration,
-    ) -> Result<NodeInfo> {
-        let start = Instant::now();
-        loop {
-            if let Some(l) = cluster_info.read().unwrap().get_gossip_top_leader() {
-                return Ok(l.clone());
-            }
-
-            let elapsed = start.elapsed();
-            if elapsed > timeout {
-                return Err(result::Error::IO(io::Error::new(
-                    ErrorKind::TimedOut,
-                    "Timed out waiting to receive any blocks",
-                )));
-            }
-
-            sleep(Duration::from_millis(900));
-            info!("{}", cluster_info.read().unwrap().node_info_trace());
-        }
+        self.slot
     }
 
     fn poll_for_blockhash_and_entry_height(
@@ -334,22 +443,21 @@ impl Replicator {
                 let rpc_peers = cluster_info.rpc_peers();
                 debug!("rpc peers: {:?}", rpc_peers);
                 let node_idx = thread_rng().gen_range(0, rpc_peers.len());
-                RpcClient::new_from_socket(rpc_peers[node_idx].rpc)
+                RpcClient::new_socket(rpc_peers[node_idx].rpc)
             };
-
             let storage_blockhash = rpc_client
-                .make_rpc_request(2, RpcRequest::GetStorageBlockhash, None)
+                .retry_make_rpc_request(&RpcRequest::GetStorageBlockhash, None, 0)
                 .expect("rpc request")
                 .to_string();
             let storage_entry_height = rpc_client
-                .make_rpc_request(2, RpcRequest::GetStorageEntryHeight, None)
+                .retry_make_rpc_request(&RpcRequest::GetStorageEntryHeight, None, 0)
                 .expect("rpc request")
                 .as_u64()
                 .unwrap();
+            info!("max entry_height: {}", storage_entry_height);
             if get_segment_from_entry(storage_entry_height) != 0 {
                 return Ok((storage_blockhash, storage_entry_height));
             }
-            info!("max entry_height: {}", storage_entry_height);
             sleep(Duration::from_secs(3));
         }
         Err(Error::new(
@@ -358,14 +466,18 @@ impl Replicator {
         ))?
     }
 
-    fn get_airdrop_lamports(client: &mut ThinClient, keypair: &Keypair, leader_info: &NodeInfo) {
-        if retry_get_balance(client, &keypair.pubkey(), None).is_none() {
-            let mut drone_addr = leader_info.tpu;
+    fn get_airdrop_lamports(
+        client: &ThinClient,
+        keypair: &Keypair,
+        cluster_entrypoint: &ContactInfo,
+    ) {
+        if client.wait_for_balance(&keypair.pubkey(), None).is_none() {
+            let mut drone_addr = cluster_entrypoint.tpu;
             drone_addr.set_port(DRONE_PORT);
 
             let airdrop_amount = 1;
 
-            let blockhash = client.get_recent_blockhash();
+            let blockhash = client.get_recent_blockhash().expect("blockhash");
             match request_airdrop_transaction(
                 &drone_addr,
                 &keypair.pubkey(),

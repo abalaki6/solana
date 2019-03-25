@@ -1,7 +1,8 @@
 //! The `vote_signer_proxy` votes on the `blockhash` of the bank at a regular cadence
 
-use crate::rpc_request::{RpcClient, RpcRequest};
 use jsonrpc_core;
+use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_request::RpcRequest;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, KeypairUtil, Signature};
 use solana_vote_signer::rpc::LocalVoteSigner;
@@ -15,7 +16,7 @@ pub struct RemoteVoteSigner {
 
 impl RemoteVoteSigner {
     pub fn new(signer: SocketAddr) -> Self {
-        let rpc_client = RpcClient::new_from_socket(signer);
+        let rpc_client = RpcClient::new_socket(signer);
         Self { rpc_client }
     }
 }
@@ -23,32 +24,37 @@ impl RemoteVoteSigner {
 impl VoteSigner for RemoteVoteSigner {
     fn register(
         &self,
-        pubkey: Pubkey,
+        pubkey: &Pubkey,
         sig: &Signature,
         msg: &[u8],
     ) -> jsonrpc_core::Result<Pubkey> {
         let params = json!([pubkey, sig, msg]);
         let resp = self
             .rpc_client
-            .retry_make_rpc_request(1, &RpcRequest::RegisterNode, Some(params), 5)
+            .retry_make_rpc_request(&RpcRequest::RegisterNode, Some(params), 5)
             .unwrap();
         let vote_account: Pubkey = serde_json::from_value(resp).unwrap();
         Ok(vote_account)
     }
-    fn sign(&self, pubkey: Pubkey, sig: &Signature, msg: &[u8]) -> jsonrpc_core::Result<Signature> {
+    fn sign(
+        &self,
+        pubkey: &Pubkey,
+        sig: &Signature,
+        msg: &[u8],
+    ) -> jsonrpc_core::Result<Signature> {
         let params = json!([pubkey, sig, msg]);
         let resp = self
             .rpc_client
-            .retry_make_rpc_request(1, &RpcRequest::SignVote, Some(params), 0)
+            .retry_make_rpc_request(&RpcRequest::SignVote, Some(params), 0)
             .unwrap();
         let vote_signature: Signature = serde_json::from_value(resp).unwrap();
         Ok(vote_signature)
     }
-    fn deregister(&self, pubkey: Pubkey, sig: &Signature, msg: &[u8]) -> jsonrpc_core::Result<()> {
+    fn deregister(&self, pubkey: &Pubkey, sig: &Signature, msg: &[u8]) -> jsonrpc_core::Result<()> {
         let params = json!([pubkey, sig, msg]);
         let _resp = self
             .rpc_client
-            .retry_make_rpc_request(1, &RpcRequest::DeregisterNode, Some(params), 5)
+            .retry_make_rpc_request(&RpcRequest::DeregisterNode, Some(params), 5)
             .unwrap();
         Ok(())
     }
@@ -70,7 +76,9 @@ impl KeypairUtil for VotingKeypair {
 
     fn sign_message(&self, msg: &[u8]) -> Signature {
         let sig = self.keypair.sign_message(msg);
-        self.signer.sign(self.keypair.pubkey(), &sig, &msg).unwrap()
+        self.signer
+            .sign(&self.keypair.pubkey(), &sig, &msg)
+            .unwrap()
     }
 }
 
@@ -85,7 +93,7 @@ impl VotingKeypair {
         let msg = "Registering a new node";
         let sig = keypair.sign_message(msg.as_bytes());
         let vote_account = signer
-            .register(keypair.pubkey(), &sig, msg.as_bytes())
+            .register(&keypair.pubkey(), &sig, msg.as_bytes())
             .unwrap();
         Self {
             keypair: keypair.clone(),
@@ -109,13 +117,33 @@ pub mod tests {
         lamports: u64,
     ) {
         let blockhash = bank.last_blockhash();
-        let tx = VoteTransaction::new_account(from_keypair, *voting_pubkey, blockhash, lamports, 0);
+        let tx = VoteTransaction::new_account(from_keypair, voting_pubkey, blockhash, lamports, 0);
+        bank.process_transaction(&tx).unwrap();
+    }
+
+    pub fn new_vote_account_with_delegate(
+        from_keypair: &Keypair,
+        voting_keypair: &Keypair,
+        delegate: &Pubkey,
+        bank: &Bank,
+        lamports: u64,
+    ) {
+        let blockhash = bank.last_blockhash();
+        let tx = VoteTransaction::new_account_with_delegate(
+            from_keypair,
+            voting_keypair,
+            delegate,
+            blockhash,
+            lamports,
+            0,
+        );
         bank.process_transaction(&tx).unwrap();
     }
 
     pub fn push_vote<T: KeypairUtil>(voting_keypair: &T, bank: &Bank, slot: u64) {
         let blockhash = bank.last_blockhash();
-        let tx = VoteTransaction::new_vote(voting_keypair, slot, blockhash, 0);
+        let tx =
+            VoteTransaction::new_vote(&voting_keypair.pubkey(), voting_keypair, slot, blockhash, 0);
         bank.process_transaction(&tx).unwrap();
     }
 

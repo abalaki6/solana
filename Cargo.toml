@@ -1,86 +1,33 @@
-[package]
-name = "solana-workspace"
-description = "Blockchain, Rebuilt for Scale"
-version = "0.12.0"
-documentation = "https://docs.rs/solana"
-homepage = "https://solana.com/"
-readme = "README.md"
-repository = "https://github.com/solana-labs/solana"
-authors = ["Solana Maintainers <maintainers@solana.com>"]
-license = "Apache-2.0"
-edition = "2018"
-
-[badges]
-codecov = { repository = "solana-labs/solana", branch = "master", service = "github" }
-
-[features]
-chacha = ["solana/chacha"]
-cuda = ["solana/cuda"]
-erasure = ["solana/erasure"]
-
-[dev-dependencies]
-bincode = "1.1.2"
-bs58 = "0.2.0"
-hashbrown = "0.1.8"
-log = "0.4.2"
-rand = "0.6.5"
-rayon = "1.0.0"
-reqwest = "0.9.11"
-serde_json = "1.0.39"
-solana = { path = "core", version = "0.12.0" }
-solana-logger = { path = "logger", version = "0.12.0" }
-solana-netutil = { path = "netutil", version = "0.12.0" }
-solana-runtime = { path = "runtime", version = "0.12.0" }
-solana-sdk = { path = "sdk", version = "0.12.0" }
-sys-info = "0.5.6"
-
-[[bench]]
-name = "banking_stage"
-
-[[bench]]
-name = "blocktree"
-
-[[bench]]
-name = "ledger"
-
-[[bench]]
-name = "gen_keys"
-
-[[bench]]
-name = "sigverify"
-
-[[bench]]
-required-features = ["chacha"]
-name = "chacha"
-
 [workspace]
 members = [
     ".",
     "bench-streamer",
     "bench-tps",
-    "core",
     "drone",
     "fullnode",
     "genesis",
+    "install",
     "keygen",
+    "kvstore",
     "ledger-tool",
     "logger",
     "metrics",
     "programs/bpf",
     "programs/bpf_loader",
-    "programs/budget",
     "programs/budget_api",
-    "programs/token",
+    "programs/budget_program",
+    "programs/config_api",
+    "programs/config_program",
+    "programs/exchange_api",
+    "programs/exchange_program",
     "programs/token_api",
-    "programs/failure",
-    "programs/noop",
-    "programs/rewards",
-    "programs/rewards_api",
-    "programs/storage",
+    "programs/token_program",
+    "programs/failure_program",
+    "programs/noop_program",
     "programs/storage_api",
-    "programs/system",
-    "programs/vote",
+    "programs/storage_program",
     "programs/vote_api",
+    "programs/vote_program",
     "replicator",
     "sdk",
     "upload-perf",

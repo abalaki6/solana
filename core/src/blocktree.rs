@@ -5,119 +5,79 @@
 use crate::entry::Entry;
 use crate::packet::{Blob, SharedBlob, BLOB_HEADER_SIZE};
 use crate::result::{Error, Result};
+#[cfg(feature = "kvstore")]
+use solana_kvstore as kvstore;
+
 use bincode::{deserialize, serialize};
-use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
+
 use hashbrown::HashMap;
-use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, DBRawIterator, IteratorMode, Options, WriteBatch, DB,
-};
-use serde::de::DeserializeOwned;
+
+#[cfg(not(feature = "kvstore"))]
+use rocksdb;
+
 use serde::Serialize;
+
 use solana_sdk::genesis_block::GenesisBlock;
 use solana_sdk::hash::Hash;
 use solana_sdk::signature::{Keypair, KeypairUtil};
-use solana_sdk::timing::DEFAULT_TICKS_PER_SLOT;
+
 use std::borrow::{Borrow, Cow};
 use std::cell::RefCell;
 use std::cmp;
 use std::fs;
 use std::io;
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 
-pub type BlocktreeRawIterator = rocksdb::DBRawIterator;
+mod db;
+#[cfg(feature = "kvstore")]
+mod kvs;
+#[cfg(not(feature = "kvstore"))]
+mod rocks;
 
+#[cfg(feature = "kvstore")]
+use self::kvs::{DataCf, ErasureCf, Kvs, MetaCf};
+#[cfg(not(feature = "kvstore"))]
+use self::rocks::{DataCf, ErasureCf, MetaCf, Rocks};
+
+pub use db::{
+    Cursor, Database, IDataCf, IErasureCf, IMetaCf, IWriteBatch, LedgerColumnFamily,
+    LedgerColumnFamilyRaw,
+};
+
+#[cfg(not(feature = "kvstore"))]
+pub type BlocktreeRawIterator = <Rocks as Database>::Cursor;
+#[cfg(feature = "kvstore")]
+pub type BlocktreeRawIterator = <Kvs as Database>::Cursor;
+
+#[cfg(not(feature = "kvstore"))]
+pub type WriteBatch = <Rocks as Database>::WriteBatch;
+#[cfg(feature = "kvstore")]
+pub type WriteBatch = <Kvs as Database>::WriteBatch;
+
+#[cfg(not(feature = "kvstore"))]
+type KeyRef = <Rocks as Database>::KeyRef;
+#[cfg(feature = "kvstore")]
+type KeyRef = <Kvs as Database>::KeyRef;
+
+#[cfg(not(feature = "kvstore"))]
+pub type Key = <Rocks as Database>::Key;
+#[cfg(feature = "kvstore")]
+pub type Key = <Kvs as Database>::Key;
+
+#[cfg(not(feature = "kvstore"))]
 pub const BLOCKTREE_DIRECTORY: &str = "rocksdb";
-// A good value for this is the number of cores on the machine
-const TOTAL_THREADS: i32 = 8;
-const MAX_WRITE_BUFFER_SIZE: usize = 512 * 1024 * 1024;
+#[cfg(feature = "kvstore")]
+pub const BLOCKTREE_DIRECTORY: &str = "kvstore";
 
 #[derive(Debug)]
 pub enum BlocktreeError {
     BlobForIndexExists,
     InvalidBlobData,
     RocksDb(rocksdb::Error),
-}
-
-impl std::convert::From<rocksdb::Error> for Error {
-    fn from(e: rocksdb::Error) -> Error {
-        Error::BlocktreeError(BlocktreeError::RocksDb(e))
-    }
-}
-
-pub trait LedgerColumnFamily {
-    type ValueType: DeserializeOwned + Serialize;
-
-    fn get(&self, key: &[u8]) -> Result<Option<Self::ValueType>> {
-        let db = self.db();
-        let data_bytes = db.get_cf(self.handle(), key)?;
-
-        if let Some(raw) = data_bytes {
-            let result: Self::ValueType = deserialize(&raw)?;
-            Ok(Some(result))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn get_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let db = self.db();
-        let data_bytes = db.get_cf(self.handle(), key)?;
-        Ok(data_bytes.map(|x| x.to_vec()))
-    }
-
-    fn put_bytes(&self, key: &[u8], serialized_value: &[u8]) -> Result<()> {
-        let db = self.db();
-        db.put_cf(self.handle(), &key, &serialized_value)?;
-        Ok(())
-    }
-
-    fn put(&self, key: &[u8], value: &Self::ValueType) -> Result<()> {
-        let db = self.db();
-        let serialized = serialize(value)?;
-        db.put_cf(self.handle(), &key, &serialized)?;
-        Ok(())
-    }
-
-    fn delete(&self, key: &[u8]) -> Result<()> {
-        let db = self.db();
-        db.delete_cf(self.handle(), &key)?;
-        Ok(())
-    }
-
-    fn db(&self) -> &Arc<DB>;
-    fn handle(&self) -> ColumnFamily;
-}
-
-pub trait LedgerColumnFamilyRaw {
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let db = self.db();
-        let data_bytes = db.get_cf(self.handle(), key)?;
-        Ok(data_bytes.map(|x| x.to_vec()))
-    }
-
-    fn put(&self, key: &[u8], serialized_value: &[u8]) -> Result<()> {
-        let db = self.db();
-        db.put_cf(self.handle(), &key, &serialized_value)?;
-        Ok(())
-    }
-
-    fn delete(&self, key: &[u8]) -> Result<()> {
-        let db = self.db();
-        db.delete_cf(self.handle(), &key)?;
-        Ok(())
-    }
-
-    fn raw_iterator(&self) -> BlocktreeRawIterator {
-        let db = self.db();
-        db.raw_iterator_cf(self.handle())
-            .expect("Expected to be able to open database iterator")
-    }
-
-    fn handle(&self) -> ColumnFamily;
-    fn db(&self) -> &Arc<DB>;
+    #[cfg(feature = "kvstore")]
+    KvsDb(kvstore::Error),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -141,8 +101,8 @@ pub struct SlotMeta {
     // from this one.
     pub next_slots: Vec<u64>,
     // True if this slot is full (consumed == last_index + 1) and if every
-    // slot that is a parent of this slot is also rooted.
-    pub is_rooted: bool,
+    // slot that is a parent of this slot is also connected.
+    pub is_connected: bool,
 }
 
 impl SlotMeta {
@@ -165,167 +125,23 @@ impl SlotMeta {
             received: 0,
             parent_slot,
             next_slots: vec![],
-            is_rooted: slot == 0,
+            is_connected: slot == 0,
             last_index: std::u64::MAX,
         }
-    }
-}
-
-pub struct MetaCf {
-    db: Arc<DB>,
-}
-
-impl MetaCf {
-    pub fn new(db: Arc<DB>) -> Self {
-        MetaCf { db }
-    }
-
-    pub fn key(slot: u64) -> Vec<u8> {
-        let mut key = vec![0u8; 8];
-        BigEndian::write_u64(&mut key[0..8], slot);
-        key
-    }
-
-    pub fn get_slot_meta(&self, slot: u64) -> Result<Option<SlotMeta>> {
-        let key = Self::key(slot);
-        self.get(&key)
-    }
-
-    pub fn put_slot_meta(&self, slot: u64, slot_meta: &SlotMeta) -> Result<()> {
-        let key = Self::key(slot);
-        self.put(&key, slot_meta)
-    }
-
-    pub fn index_from_key(key: &[u8]) -> Result<u64> {
-        let mut rdr = io::Cursor::new(&key[..]);
-        let index = rdr.read_u64::<BigEndian>()?;
-        Ok(index)
-    }
-}
-
-impl LedgerColumnFamily for MetaCf {
-    type ValueType = SlotMeta;
-
-    fn db(&self) -> &Arc<DB> {
-        &self.db
-    }
-
-    fn handle(&self) -> ColumnFamily {
-        self.db.cf_handle(META_CF).unwrap()
-    }
-}
-
-// The data column family
-pub struct DataCf {
-    db: Arc<DB>,
-}
-
-impl DataCf {
-    pub fn new(db: Arc<DB>) -> Self {
-        DataCf { db }
-    }
-
-    pub fn get_by_slot_index(&self, slot: u64, index: u64) -> Result<Option<Vec<u8>>> {
-        let key = Self::key(slot, index);
-        self.get(&key)
-    }
-
-    pub fn delete_by_slot_index(&self, slot: u64, index: u64) -> Result<()> {
-        let key = Self::key(slot, index);
-        self.delete(&key)
-    }
-
-    pub fn put_by_slot_index(&self, slot: u64, index: u64, serialized_value: &[u8]) -> Result<()> {
-        let key = Self::key(slot, index);
-        self.put(&key, serialized_value)
-    }
-
-    pub fn key(slot: u64, index: u64) -> Vec<u8> {
-        let mut key = vec![0u8; 16];
-        BigEndian::write_u64(&mut key[0..8], slot);
-        BigEndian::write_u64(&mut key[8..16], index);
-        key
-    }
-
-    pub fn slot_from_key(key: &[u8]) -> Result<u64> {
-        let mut rdr = io::Cursor::new(&key[0..8]);
-        let height = rdr.read_u64::<BigEndian>()?;
-        Ok(height)
-    }
-
-    pub fn index_from_key(key: &[u8]) -> Result<u64> {
-        let mut rdr = io::Cursor::new(&key[8..16]);
-        let index = rdr.read_u64::<BigEndian>()?;
-        Ok(index)
-    }
-}
-
-impl LedgerColumnFamilyRaw for DataCf {
-    fn db(&self) -> &Arc<DB> {
-        &self.db
-    }
-
-    fn handle(&self) -> ColumnFamily {
-        self.db.cf_handle(DATA_CF).unwrap()
-    }
-}
-
-// The erasure column family
-pub struct ErasureCf {
-    db: Arc<DB>,
-}
-
-impl ErasureCf {
-    pub fn new(db: Arc<DB>) -> Self {
-        ErasureCf { db }
-    }
-    pub fn delete_by_slot_index(&self, slot: u64, index: u64) -> Result<()> {
-        let key = Self::key(slot, index);
-        self.delete(&key)
-    }
-
-    pub fn get_by_slot_index(&self, slot: u64, index: u64) -> Result<Option<Vec<u8>>> {
-        let key = Self::key(slot, index);
-        self.get(&key)
-    }
-
-    pub fn put_by_slot_index(&self, slot: u64, index: u64, serialized_value: &[u8]) -> Result<()> {
-        let key = Self::key(slot, index);
-        self.put(&key, serialized_value)
-    }
-
-    pub fn key(slot: u64, index: u64) -> Vec<u8> {
-        DataCf::key(slot, index)
-    }
-
-    pub fn slot_from_key(key: &[u8]) -> Result<u64> {
-        DataCf::slot_from_key(key)
-    }
-
-    pub fn index_from_key(key: &[u8]) -> Result<u64> {
-        DataCf::index_from_key(key)
-    }
-}
-
-impl LedgerColumnFamilyRaw for ErasureCf {
-    fn db(&self) -> &Arc<DB> {
-        &self.db
-    }
-
-    fn handle(&self) -> ColumnFamily {
-        self.db.cf_handle(ERASURE_CF).unwrap()
     }
 }
 
 // ledger window
 pub struct Blocktree {
     // Underlying database is automatically closed in the Drop implementation of DB
-    db: Arc<DB>,
+    #[cfg(not(feature = "kvstore"))]
+    db: Arc<Rocks>,
+    #[cfg(feature = "kvstore")]
+    db: Arc<Kvs>,
     meta_cf: MetaCf,
     data_cf: DataCf,
     erasure_cf: ErasureCf,
-    new_blobs_signals: Vec<SyncSender<bool>>,
-    ticks_per_slot: u64,
+    pub new_blobs_signals: Vec<SyncSender<bool>>,
 }
 
 // Column family for metadata about a leader slot
@@ -336,69 +152,10 @@ pub const DATA_CF: &str = "data";
 pub const ERASURE_CF: &str = "erasure";
 
 impl Blocktree {
-    // Opens a Ledger in directory, provides "infinite" window of blobs
-    pub fn open(ledger_path: &str) -> Result<Self> {
-        fs::create_dir_all(&ledger_path)?;
-        let ledger_path = Path::new(ledger_path).join(BLOCKTREE_DIRECTORY);
-
-        // Use default database options
-        let db_options = Self::get_db_options();
-
-        // Column family names
-        let meta_cf_descriptor = ColumnFamilyDescriptor::new(META_CF, Self::get_cf_options());
-        let data_cf_descriptor = ColumnFamilyDescriptor::new(DATA_CF, Self::get_cf_options());
-        let erasure_cf_descriptor = ColumnFamilyDescriptor::new(ERASURE_CF, Self::get_cf_options());
-        let cfs = vec![
-            meta_cf_descriptor,
-            data_cf_descriptor,
-            erasure_cf_descriptor,
-        ];
-
-        // Open the database
-        let db = Arc::new(DB::open_cf_descriptors(&db_options, ledger_path, cfs)?);
-
-        // Create the metadata column family
-        let meta_cf = MetaCf::new(db.clone());
-
-        // Create the data column family
-        let data_cf = DataCf::new(db.clone());
-
-        // Create the erasure column family
-        let erasure_cf = ErasureCf::new(db.clone());
-
-        let ticks_per_slot = DEFAULT_TICKS_PER_SLOT;
-        Ok(Blocktree {
-            db,
-            meta_cf,
-            data_cf,
-            erasure_cf,
-            new_blobs_signals: vec![],
-            ticks_per_slot,
-        })
-    }
-
     pub fn open_with_signal(ledger_path: &str) -> Result<(Self, Receiver<bool>)> {
         let mut blocktree = Self::open(ledger_path)?;
         let (signal_sender, signal_receiver) = sync_channel(1);
         blocktree.new_blobs_signals = vec![signal_sender];
-
-        Ok((blocktree, signal_receiver))
-    }
-
-    pub fn open_config(ledger_path: &str, ticks_per_slot: u64) -> Result<Self> {
-        let mut blocktree = Self::open(ledger_path)?;
-        blocktree.ticks_per_slot = ticks_per_slot;
-        Ok(blocktree)
-    }
-
-    pub fn open_with_config_signal(
-        ledger_path: &str,
-        ticks_per_slot: u64,
-    ) -> Result<(Self, Receiver<bool>)> {
-        let mut blocktree = Self::open(ledger_path)?;
-        let (signal_sender, signal_receiver) = sync_channel(1);
-        blocktree.new_blobs_signals = vec![signal_sender];
-        blocktree.ticks_per_slot = ticks_per_slot;
 
         Ok((blocktree, signal_receiver))
     }
@@ -419,14 +176,6 @@ impl Blocktree {
             meta.next_slots = vec![];
             self.meta_cf.put(&meta_key, &meta)?;
         }
-        Ok(())
-    }
-
-    pub fn destroy(ledger_path: &str) -> Result<()> {
-        // DB::destroy() fails if `ledger_path` doesn't exist
-        fs::create_dir_all(&ledger_path)?;
-        let ledger_path = Path::new(ledger_path).join(BLOCKTREE_DIRECTORY);
-        DB::destroy(&Options::default(), &ledger_path)?;
         Ok(())
     }
 
@@ -471,14 +220,13 @@ impl Blocktree {
         start_slot: u64,
         num_ticks_in_start_slot: u64,
         start_index: u64,
+        ticks_per_slot: u64,
         entries: I,
     ) -> Result<()>
     where
         I: IntoIterator,
         I::Item: Borrow<Entry>,
     {
-        let ticks_per_slot = self.ticks_per_slot;
-
         assert!(num_ticks_in_start_slot < ticks_per_slot);
         let mut remaining_ticks_in_slot = ticks_per_slot - num_ticks_in_start_slot;
 
@@ -526,7 +274,7 @@ impl Blocktree {
         I: IntoIterator,
         I::Item: Borrow<Blob>,
     {
-        let mut write_batch = WriteBatch::default();
+        let mut write_batch = self.db.batch()?;
         // A map from slot to a 2-tuple of metadata: (working copy, backup copy),
         // so we can detect changes to the slot metadata later
         let mut slot_meta_working_set = HashMap::new();
@@ -672,24 +420,6 @@ impl Blocktree {
         Ok((total_blobs, total_current_size as u64))
     }
 
-    /// Return an iterator for all the entries in the given file.
-    pub fn read_ledger(&self) -> Result<impl Iterator<Item = Entry>> {
-        let mut db_iterator = self.db.raw_iterator_cf(self.data_cf.handle())?;
-
-        db_iterator.seek_to_first();
-        Ok(EntryIterator {
-            db_iterator,
-            blockhash: None,
-        })
-    }
-
-    pub fn read_ledger_blobs(&self) -> impl Iterator<Item = Blob> {
-        self.db
-            .iterator_cf(self.data_cf.handle(), IteratorMode::Start)
-            .unwrap()
-            .map(|(_, blob_data)| Blob::new(&blob_data))
-    }
-
     pub fn get_coding_blob_bytes(&self, slot: u64, index: u64) -> Result<Option<Vec<u8>>> {
         self.erasure_cf.get_by_slot_index(slot, index)
     }
@@ -703,7 +433,7 @@ impl Blocktree {
         self.erasure_cf.put_by_slot_index(slot, index, bytes)
     }
 
-    pub fn put_data_raw(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put_data_raw(&self, key: &KeyRef, value: &[u8]) -> Result<()> {
         self.data_cf.put(key, value)
     }
 
@@ -738,9 +468,9 @@ impl Blocktree {
         slot: u64,
         start_index: u64,
         end_index: u64,
-        key: &dyn Fn(u64, u64) -> Vec<u8>,
-        slot_from_key: &dyn Fn(&[u8]) -> Result<u64>,
-        index_from_key: &dyn Fn(&[u8]) -> Result<u64>,
+        key: &dyn Fn(u64, u64) -> Key,
+        slot_from_key: &dyn Fn(&KeyRef) -> Result<u64>,
+        index_from_key: &dyn Fn(&KeyRef) -> Result<u64>,
         max_missing: usize,
     ) -> Vec<u64> {
         if start_index >= end_index || max_missing == 0 {
@@ -882,40 +612,23 @@ impl Blocktree {
         Ok(result)
     }
 
+    pub fn deserialize_blob_data(data: &[u8]) -> Result<Vec<Entry>> {
+        let entries = deserialize(data)?;
+        Ok(entries)
+    }
+
     fn deserialize_blobs<I>(blob_datas: &[I]) -> Vec<Entry>
     where
         I: Borrow<[u8]>,
     {
         blob_datas
             .iter()
-            .map(|blob_data| {
-                let serialized_entry_data = &blob_data.borrow()[BLOB_HEADER_SIZE..];
-                let entry: Entry = deserialize(serialized_entry_data)
-                    .expect("Ledger should only contain well formed data");
-                entry
+            .flat_map(|blob_data| {
+                let serialized_entries_data = &blob_data.borrow()[BLOB_HEADER_SIZE..];
+                Self::deserialize_blob_data(serialized_entries_data)
+                    .expect("Ledger should only contain well formed data")
             })
             .collect()
-    }
-
-    fn get_cf_options() -> Options {
-        let mut options = Options::default();
-        options.set_max_write_buffer_number(32);
-        options.set_write_buffer_size(MAX_WRITE_BUFFER_SIZE);
-        options.set_max_bytes_for_level_base(MAX_WRITE_BUFFER_SIZE as u64);
-        options
-    }
-
-    fn get_db_options() -> Options {
-        let mut options = Options::default();
-        options.create_if_missing(true);
-        options.create_missing_column_families(true);
-        options.increase_parallelism(TOTAL_THREADS);
-        options.set_max_background_flushes(4);
-        options.set_max_background_compactions(4);
-        options.set_max_write_buffer_number(32);
-        options.set_write_buffer_size(MAX_WRITE_BUFFER_SIZE);
-        options.set_max_bytes_for_level_base(MAX_WRITE_BUFFER_SIZE as u64);
-        options
     }
 
     fn slot_has_updates(slot_meta: &SlotMeta, slot_meta_backup: &Option<SlotMeta>) -> bool {
@@ -923,7 +636,7 @@ impl Blocktree {
         // from block 0, which is true iff:
         // 1) The block with index prev_block_index is itself part of the trunk of consecutive blocks
         // starting from block 0,
-        slot_meta.is_rooted &&
+        slot_meta.is_connected &&
         // AND either:
         // 1) The slot didn't exist in the database before, and now we have a consecutive
         // block for that slot
@@ -983,7 +696,7 @@ impl Blocktree {
 
                     // This is a newly inserted slot so:
                     // 1) Chain to the previous slot, and also
-                    // 2) Determine whether to set the is_rooted flag
+                    // 2) Determine whether to set the is_connected flag
                     self.chain_new_slot_to_prev_slot(
                         &mut prev_slot.borrow_mut(),
                         slot,
@@ -994,15 +707,15 @@ impl Blocktree {
         }
 
         if self.is_newly_completed_slot(&RefCell::borrow(&*meta_copy), meta_backup)
-            && RefCell::borrow(&*meta_copy).is_rooted
+            && RefCell::borrow(&*meta_copy).is_connected
         {
-            // This is a newly inserted slot and slot.is_rooted is true, so go through
-            // and update all child slots with is_rooted if applicable
+            // This is a newly inserted slot and slot.is_connected is true, so go through
+            // and update all child slots with is_connected if applicable
             let mut next_slots: Vec<(u64, Rc<RefCell<(SlotMeta)>>)> =
                 vec![(slot, meta_copy.clone())];
             while !next_slots.is_empty() {
                 let (_, current_slot) = next_slots.pop().unwrap();
-                current_slot.borrow_mut().is_rooted = true;
+                current_slot.borrow_mut().is_connected = true;
 
                 let current_slot = &RefCell::borrow(&*current_slot);
                 if current_slot.is_full() {
@@ -1028,7 +741,7 @@ impl Blocktree {
         current_slot_meta: &mut SlotMeta,
     ) {
         prev_slot_meta.next_slots.push(current_slot);
-        current_slot_meta.is_rooted = prev_slot_meta.is_rooted && prev_slot_meta.is_full();
+        current_slot_meta.is_connected = prev_slot_meta.is_connected && prev_slot_meta.is_full();
     }
 
     fn is_newly_completed_slot(
@@ -1202,9 +915,9 @@ impl Blocktree {
 
         bootstrap_meta.consumed = last.index() + 1;
         bootstrap_meta.received = last.index() + 1;
-        bootstrap_meta.is_rooted = true;
+        bootstrap_meta.is_connected = true;
 
-        let mut batch = WriteBatch::default();
+        let mut batch = self.db.batch()?;
         batch.put_cf(
             self.meta_cf.handle(),
             &meta_key,
@@ -1220,45 +933,6 @@ impl Blocktree {
     }
 }
 
-// TODO: all this goes away with Blocktree
-struct EntryIterator {
-    db_iterator: DBRawIterator,
-
-    // TODO: remove me when replay_stage is iterating by block (Blocktree)
-    //    this verification is duplicating that of replay_stage, which
-    //    can do this in parallel
-    blockhash: Option<Hash>,
-    // https://github.com/rust-rocksdb/rust-rocksdb/issues/234
-    //   rocksdb issue: the _blocktree member must be lower in the struct to prevent a crash
-    //   when the db_iterator member above is dropped.
-    //   _blocktree is unused, but dropping _blocktree results in a broken db_iterator
-    //   you have to hold the database open in order to iterate over it, and in order
-    //   for db_iterator to be able to run Drop
-    //    _blocktree: Blocktree,
-}
-
-impl Iterator for EntryIterator {
-    type Item = Entry;
-
-    fn next(&mut self) -> Option<Entry> {
-        if self.db_iterator.valid() {
-            if let Some(value) = self.db_iterator.value() {
-                if let Ok(entry) = deserialize::<Entry>(&value[BLOB_HEADER_SIZE..]) {
-                    if let Some(blockhash) = self.blockhash {
-                        if !entry.verify(&blockhash) {
-                            return None;
-                        }
-                    }
-                    self.db_iterator.next();
-                    self.blockhash = Some(entry.hash);
-                    return Some(entry);
-                }
-            }
-        }
-        None
-    }
-}
-
 // Creates a new ledger with slot 0 full of ticks (and only ticks).
 //
 // Returns the blockhash that can be used to append entries with.
@@ -1268,9 +942,9 @@ pub fn create_new_ledger(ledger_path: &str, genesis_block: &GenesisBlock) -> Res
     genesis_block.write(&ledger_path)?;
 
     // Fill slot 0 with ticks that link back to the genesis_block to bootstrap the ledger.
-    let blocktree = Blocktree::open_config(ledger_path, ticks_per_slot)?;
+    let blocktree = Blocktree::open(ledger_path)?;
     let entries = crate::entry::create_ticks(ticks_per_slot, genesis_block.hash());
-    blocktree.write_entries(0, 0, 0, &entries)?;
+    blocktree.write_entries(0, 0, 0, ticks_per_slot, &entries)?;
 
     Ok(entries.last().unwrap().hash)
 }
@@ -1371,7 +1045,7 @@ pub mod tests {
     use crate::entry::{
         create_ticks, make_tiny_test_entries, make_tiny_test_entries_from_hash, Entry, EntrySlice,
     };
-    use crate::packet::index_blobs;
+    use crate::packet;
     use rand::seq::SliceRandom;
     use rand::thread_rng;
     use solana_sdk::hash::Hash;
@@ -1389,10 +1063,12 @@ pub mod tests {
             let ticks_per_slot = 10;
             let num_slots = 10;
             let num_ticks = ticks_per_slot * num_slots;
-            let ledger = Blocktree::open_config(&ledger_path, ticks_per_slot).unwrap();
+            let ledger = Blocktree::open(&ledger_path).unwrap();
 
             let ticks = create_ticks(num_ticks, Hash::default());
-            ledger.write_entries(0, 0, 0, ticks.clone()).unwrap();
+            ledger
+                .write_entries(0, 0, 0, ticks_per_slot, ticks.clone())
+                .unwrap();
 
             for i in 0..num_slots {
                 let meta = ledger.meta(i).unwrap().unwrap();
@@ -1422,6 +1098,7 @@ pub mod tests {
                     num_slots,
                     ticks_per_slot - 1,
                     ticks_per_slot - 2,
+                    ticks_per_slot,
                     &ticks[0..2],
                 )
                 .unwrap();
@@ -1469,11 +1146,15 @@ pub mod tests {
         let ticks2 = ticks.split_off(num_ticks as usize);
         assert_eq!(ticks.len(), ticks2.len());
         {
-            let ledger = Blocktree::open_config(&ledger_path, ticks_per_slot).unwrap();
+            let ledger = Blocktree::open(&ledger_path).unwrap();
 
-            ledger.write_entries(0, 0, 0, &ticks).unwrap();
+            ledger
+                .write_entries(0, 0, 0, ticks_per_slot, &ticks)
+                .unwrap();
             ledger.reset_slot_consumed(0).unwrap();
-            ledger.write_entries(0, 0, 0, &ticks2).unwrap();
+            ledger
+                .write_entries(0, 0, 0, ticks_per_slot, &ticks2)
+                .unwrap();
 
             let ledger_ticks = ledger.get_slot_entries(0, 0, None).unwrap();
 
@@ -1533,9 +1214,9 @@ pub mod tests {
 
     #[test]
     fn test_read_blobs_bytes() {
-        let shared_blobs = make_tiny_test_entries(10).to_shared_blobs();
+        let shared_blobs = make_tiny_test_entries(10).to_single_entry_shared_blobs();
         let slot = 0;
-        index_blobs(&shared_blobs, &Keypair::new().pubkey(), &mut 0, slot);
+        packet::index_blobs(&shared_blobs, &Keypair::new().pubkey(), 0, slot, 0);
 
         let blob_locks: Vec<_> = shared_blobs.iter().map(|b| b.read().unwrap()).collect();
         let blobs: Vec<&Blob> = blob_locks.iter().map(|b| &**b).collect();
@@ -1638,7 +1319,7 @@ pub mod tests {
         assert_eq!(meta.parent_slot, 0);
         assert_eq!(meta.last_index, num_entries - 1);
         assert!(meta.next_slots.is_empty());
-        assert!(meta.is_rooted);
+        assert!(meta.is_connected);
 
         // Destroying database without closing it first is undefined behavior
         drop(ledger);
@@ -1695,16 +1376,15 @@ pub mod tests {
             // Write entries
             let num_entries = 8;
             let entries = make_tiny_test_entries(num_entries);
-            let shared_blobs = entries.to_shared_blobs();
+            let mut blobs = entries.to_single_entry_blobs();
 
-            for (i, b) in shared_blobs.iter().enumerate() {
-                let mut w_b = b.write().unwrap();
-                w_b.set_index(1 << (i * 8));
-                w_b.set_slot(0);
+            for (i, b) in blobs.iter_mut().enumerate() {
+                b.set_index(1 << (i * 8));
+                b.set_slot(0);
             }
 
             blocktree
-                .write_shared_blobs(&shared_blobs)
+                .write_blobs(&blobs)
                 .expect("Expected successful write of blobs");
 
             let mut db_iterator = blocktree
@@ -1733,7 +1413,7 @@ pub mod tests {
         {
             let blocktree = Blocktree::open(&blocktree_path).unwrap();
             let entries = make_tiny_test_entries(8);
-            let mut blobs = entries.clone().to_blobs();
+            let mut blobs = entries.clone().to_single_entry_blobs();
             for (i, b) in blobs.iter_mut().enumerate() {
                 b.set_slot(1);
                 if i < 4 {
@@ -1771,7 +1451,7 @@ pub mod tests {
             for slot in 0..num_slots {
                 let entries = make_tiny_test_entries(slot as usize + 1);
                 let last_entry = entries.last().unwrap().clone();
-                let mut blobs = entries.clone().to_blobs();
+                let mut blobs = entries.clone().to_single_entry_blobs();
                 for b in blobs.iter_mut() {
                     b.set_index(index);
                     b.set_slot(slot as u64);
@@ -1790,10 +1470,43 @@ pub mod tests {
     }
 
     #[test]
+    pub fn test_get_slot_entries3() {
+        // Test inserting/fetching blobs which contain multiple entries per blob
+        let blocktree_path = get_tmp_ledger_path("test_get_slot_entries3");
+        {
+            let blocktree = Blocktree::open(&blocktree_path).unwrap();
+            let num_slots = 5 as u64;
+            let blobs_per_slot = 5 as u64;
+            let entry_serialized_size =
+                bincode::serialized_size(&make_tiny_test_entries(1)).unwrap();
+            let entries_per_slot =
+                (blobs_per_slot * packet::BLOB_DATA_SIZE as u64) / entry_serialized_size;
+
+            // Write entries
+            for slot in 0..num_slots {
+                let mut index = 0;
+                let entries = make_tiny_test_entries(entries_per_slot as usize);
+                let mut blobs = entries.clone().to_blobs();
+                assert_eq!(blobs.len() as u64, blobs_per_slot);
+                for b in blobs.iter_mut() {
+                    b.set_index(index);
+                    b.set_slot(slot as u64);
+                    index += 1;
+                }
+                blocktree
+                    .write_blobs(&blobs)
+                    .expect("Expected successful write of blobs");
+                assert_eq!(blocktree.get_slot_entries(slot, 0, None).unwrap(), entries,);
+            }
+        }
+        Blocktree::destroy(&blocktree_path).expect("Expected successful database destruction");
+    }
+
+    #[test]
     pub fn test_insert_data_blobs_consecutive() {
         let blocktree_path = get_tmp_ledger_path("test_insert_data_blobs_consecutive");
         {
-            let blocktree = Blocktree::open_config(&blocktree_path, 32).unwrap();
+            let blocktree = Blocktree::open(&blocktree_path).unwrap();
             let slot = 0;
             let parent_slot = 0;
             // Write entries
@@ -1928,6 +1641,7 @@ pub mod tests {
                     0u64,
                     0,
                     (entries.len() - 1) as u64,
+                    16,
                     &entries[entries.len() - 1..],
                 )
                 .unwrap();
@@ -2041,7 +1755,7 @@ pub mod tests {
             let s1 = blocktree.meta(1).unwrap().unwrap();
             assert!(s1.next_slots.is_empty());
             // Slot 1 is not trunk because slot 0 hasn't been inserted yet
-            assert!(!s1.is_rooted);
+            assert!(!s1.is_connected);
             assert_eq!(s1.parent_slot, 0);
             assert_eq!(s1.last_index, entries_per_slot - 1);
 
@@ -2052,7 +1766,7 @@ pub mod tests {
             let s2 = blocktree.meta(2).unwrap().unwrap();
             assert!(s2.next_slots.is_empty());
             // Slot 2 is not trunk because slot 0 hasn't been inserted yet
-            assert!(!s2.is_rooted);
+            assert!(!s2.is_connected);
             assert_eq!(s2.parent_slot, 1);
             assert_eq!(s2.last_index, entries_per_slot - 1);
 
@@ -2060,7 +1774,7 @@ pub mod tests {
             // but still isn't part of the trunk
             let s1 = blocktree.meta(1).unwrap().unwrap();
             assert_eq!(s1.next_slots, vec![2]);
-            assert!(!s1.is_rooted);
+            assert!(!s1.is_connected);
             assert_eq!(s1.parent_slot, 0);
             assert_eq!(s1.last_index, entries_per_slot - 1);
 
@@ -2081,7 +1795,7 @@ pub mod tests {
                     assert_eq!(s.parent_slot, i - 1);
                 }
                 assert_eq!(s.last_index, entries_per_slot - 1);
-                assert!(s.is_rooted);
+                assert!(s.is_connected);
             }
         }
         Blocktree::destroy(&blocktree_path).expect("Expected successful database destruction");
@@ -2135,9 +1849,9 @@ pub mod tests {
                 }
 
                 if i == 0 {
-                    assert!(s.is_rooted);
+                    assert!(s.is_connected);
                 } else {
-                    assert!(!s.is_rooted);
+                    assert!(!s.is_connected);
                 }
             }
 
@@ -2160,7 +1874,7 @@ pub mod tests {
                     assert_eq!(s.parent_slot, i - 1);
                 }
                 assert_eq!(s.last_index, entries_per_slot - 1);
-                assert!(s.is_rooted);
+                assert!(s.is_connected);
             }
         }
 
@@ -2168,8 +1882,8 @@ pub mod tests {
     }
 
     #[test]
-    pub fn test_forward_chaining_is_rooted() {
-        let blocktree_path = get_tmp_ledger_path("test_forward_chaining_is_rooted");
+    pub fn test_forward_chaining_is_connected() {
+        let blocktree_path = get_tmp_ledger_path("test_forward_chaining_is_connected");
         {
             let blocktree = Blocktree::open(&blocktree_path).unwrap();
             let num_slots = 15;
@@ -2211,9 +1925,9 @@ pub mod tests {
 
                 // Other than slot 0, no slots should be part of the trunk
                 if i != 0 {
-                    assert!(!s.is_rooted);
+                    assert!(!s.is_connected);
                 } else {
-                    assert!(s.is_rooted);
+                    assert!(s.is_connected);
                 }
             }
 
@@ -2231,9 +1945,9 @@ pub mod tests {
                             assert!(s.next_slots.is_empty());
                         }
                         if i <= slot_index as u64 + 3 {
-                            assert!(s.is_rooted);
+                            assert!(s.is_connected);
                         } else {
-                            assert!(!s.is_rooted);
+                            assert!(!s.is_connected);
                         }
 
                         if i == 0 {
@@ -2427,7 +2141,7 @@ pub mod tests {
         parent_slot: u64,
         is_full_slot: bool,
     ) -> Vec<Blob> {
-        let mut blobs = entries.clone().to_blobs();
+        let mut blobs = entries.clone().to_single_entry_blobs();
         for (i, b) in blobs.iter_mut().enumerate() {
             b.set_index(i as u64);
             b.set_slot(slot);

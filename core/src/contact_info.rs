@@ -1,6 +1,6 @@
-use crate::rpc_service::RPC_PORT;
 use bincode::serialize;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::rpc_port;
 use solana_sdk::signature::{Keypair, KeypairUtil, Signable, Signature};
 use solana_sdk::timing::timestamp;
 use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
@@ -18,6 +18,8 @@ pub struct ContactInfo {
     pub tvu: SocketAddr,
     /// transactions address
     pub tpu: SocketAddr,
+    /// address to forward unprocessed transactions to
+    pub tpu_via_blobs: SocketAddr,
     /// storage data address
     pub storage_addr: SocketAddr,
     /// address to which to send JSON-RPC requests
@@ -51,10 +53,10 @@ impl Eq for ContactInfo {}
 #[macro_export]
 macro_rules! socketaddr {
     ($ip:expr, $port:expr) => {
-        SocketAddr::from((Ipv4Addr::from($ip), $port))
+        std::net::SocketAddr::from((Ipv4Addr::from($ip), $port))
     };
     ($str:expr) => {{
-        let a: SocketAddr = $str.parse().unwrap();
+        let a: std::net::SocketAddr = $str.parse().unwrap();
         a
     }};
 }
@@ -72,6 +74,7 @@ impl Default for ContactInfo {
             gossip: socketaddr_any!(),
             tvu: socketaddr_any!(),
             tpu: socketaddr_any!(),
+            tpu_via_blobs: socketaddr_any!(),
             storage_addr: socketaddr_any!(),
             rpc: socketaddr_any!(),
             rpc_pubsub: socketaddr_any!(),
@@ -83,21 +86,23 @@ impl Default for ContactInfo {
 
 impl ContactInfo {
     pub fn new(
-        id: Pubkey,
+        id: &Pubkey,
         gossip: SocketAddr,
         tvu: SocketAddr,
         tpu: SocketAddr,
+        tpu_via_blobs: SocketAddr,
         storage_addr: SocketAddr,
         rpc: SocketAddr,
         rpc_pubsub: SocketAddr,
         now: u64,
     ) -> Self {
-        ContactInfo {
-            id,
+        Self {
+            id: *id,
             signature: Signature::default(),
             gossip,
             tvu,
             tpu,
+            tpu_via_blobs,
             storage_addr,
             rpc,
             rpc_pubsub,
@@ -105,7 +110,7 @@ impl ContactInfo {
         }
     }
 
-    pub fn new_localhost(id: Pubkey, now: u64) -> Self {
+    pub fn new_localhost(id: &Pubkey, now: u64) -> Self {
         Self::new(
             id,
             socketaddr!("127.0.0.1:1234"),
@@ -114,6 +119,7 @@ impl ContactInfo {
             socketaddr!("127.0.0.1:1237"),
             socketaddr!("127.0.0.1:1238"),
             socketaddr!("127.0.0.1:1239"),
+            socketaddr!("127.0.0.1:1240"),
             now,
         )
     }
@@ -124,7 +130,8 @@ impl ContactInfo {
         let addr = socketaddr!("224.0.1.255:1000");
         assert!(addr.ip().is_multicast());
         Self::new(
-            Keypair::new().pubkey(),
+            &Keypair::new().pubkey(),
+            addr,
             addr,
             addr,
             addr,
@@ -139,17 +146,19 @@ impl ContactInfo {
         nxt_addr.set_port(addr.port() + nxt);
         nxt_addr
     }
-    fn new_with_pubkey_socketaddr(pubkey: Pubkey, bind_addr: &SocketAddr) -> Self {
+    fn new_with_pubkey_socketaddr(pubkey: &Pubkey, bind_addr: &SocketAddr) -> Self {
         let tpu_addr = *bind_addr;
         let gossip_addr = Self::next_port(&bind_addr, 1);
         let tvu_addr = Self::next_port(&bind_addr, 2);
-        let rpc_addr = SocketAddr::new(bind_addr.ip(), RPC_PORT);
-        let rpc_pubsub_addr = SocketAddr::new(bind_addr.ip(), RPC_PORT + 1);
-        ContactInfo::new(
+        let tpu_via_blobs_addr = Self::next_port(&bind_addr, 3);
+        let rpc_addr = SocketAddr::new(bind_addr.ip(), rpc_port::DEFAULT_RPC_PORT);
+        let rpc_pubsub_addr = SocketAddr::new(bind_addr.ip(), rpc_port::DEFAULT_RPC_PUBSUB_PORT);
+        Self::new(
             pubkey,
             gossip_addr,
             tvu_addr,
             tpu_addr,
+            tpu_via_blobs_addr,
             "0.0.0.0:0".parse().unwrap(),
             rpc_addr,
             rpc_pubsub_addr,
@@ -158,14 +167,16 @@ impl ContactInfo {
     }
     pub fn new_with_socketaddr(bind_addr: &SocketAddr) -> Self {
         let keypair = Keypair::new();
-        Self::new_with_pubkey_socketaddr(keypair.pubkey(), bind_addr)
+        Self::new_with_pubkey_socketaddr(&keypair.pubkey(), bind_addr)
     }
-    //
-    pub fn new_entry_point(gossip_addr: &SocketAddr) -> Self {
+
+    // Construct a ContactInfo that's only usable for gossip
+    pub fn new_gossip_entry_point(gossip_addr: &SocketAddr) -> Self {
         let daddr: SocketAddr = socketaddr!("0.0.0.0:0");
-        ContactInfo::new(
-            Pubkey::default(),
+        Self::new(
+            &Pubkey::default(),
             *gossip_addr,
+            daddr,
             daddr,
             daddr,
             daddr,
@@ -185,6 +196,10 @@ impl ContactInfo {
     pub fn is_valid_address(addr: &SocketAddr) -> bool {
         (addr.port() != 0) && Self::is_valid_ip(addr.ip())
     }
+
+    pub fn client_facing_addr(&self) -> (SocketAddr, SocketAddr) {
+        (self.rpc, self.tpu)
+    }
 }
 
 impl Signable for ContactInfo {
@@ -199,6 +214,7 @@ impl Signable for ContactInfo {
             gossip: SocketAddr,
             tvu: SocketAddr,
             tpu: SocketAddr,
+            tpu_via_blobs: SocketAddr,
             storage_addr: SocketAddr,
             rpc: SocketAddr,
             rpc_pubsub: SocketAddr,
@@ -212,6 +228,7 @@ impl Signable for ContactInfo {
             tvu: me.tvu,
             tpu: me.tpu,
             storage_addr: me.storage_addr,
+            tpu_via_blobs: me.tpu_via_blobs,
             rpc: me.rpc,
             rpc_pubsub: me.rpc_pubsub,
             wallclock: me.wallclock,
@@ -250,6 +267,7 @@ mod tests {
         let ci = ContactInfo::default();
         assert!(ci.gossip.ip().is_unspecified());
         assert!(ci.tvu.ip().is_unspecified());
+        assert!(ci.tpu_via_blobs.ip().is_unspecified());
         assert!(ci.rpc.ip().is_unspecified());
         assert!(ci.rpc_pubsub.ip().is_unspecified());
         assert!(ci.tpu.ip().is_unspecified());
@@ -260,6 +278,7 @@ mod tests {
         let ci = ContactInfo::new_multicast();
         assert!(ci.gossip.ip().is_multicast());
         assert!(ci.tvu.ip().is_multicast());
+        assert!(ci.tpu_via_blobs.ip().is_multicast());
         assert!(ci.rpc.ip().is_multicast());
         assert!(ci.rpc_pubsub.ip().is_multicast());
         assert!(ci.tpu.ip().is_multicast());
@@ -268,9 +287,10 @@ mod tests {
     #[test]
     fn test_entry_point() {
         let addr = socketaddr!("127.0.0.1:10");
-        let ci = ContactInfo::new_entry_point(&addr);
+        let ci = ContactInfo::new_gossip_entry_point(&addr);
         assert_eq!(ci.gossip, addr);
         assert!(ci.tvu.ip().is_unspecified());
+        assert!(ci.tpu_via_blobs.ip().is_unspecified());
         assert!(ci.rpc.ip().is_unspecified());
         assert!(ci.rpc_pubsub.ip().is_unspecified());
         assert!(ci.tpu.ip().is_unspecified());
@@ -283,6 +303,7 @@ mod tests {
         assert_eq!(ci.tpu, addr);
         assert_eq!(ci.gossip.port(), 11);
         assert_eq!(ci.tvu.port(), 12);
+        assert_eq!(ci.tpu_via_blobs.port(), 13);
         assert_eq!(ci.rpc.port(), 8899);
         assert_eq!(ci.rpc_pubsub.port(), 8900);
         assert!(ci.storage_addr.ip().is_unspecified());
@@ -291,12 +312,13 @@ mod tests {
     fn replayed_data_new_with_socketaddr_with_pubkey() {
         let keypair = Keypair::new();
         let d1 = ContactInfo::new_with_pubkey_socketaddr(
-            keypair.pubkey().clone(),
+            &keypair.pubkey(),
             &socketaddr!("127.0.0.1:1234"),
         );
         assert_eq!(d1.id, keypair.pubkey());
         assert_eq!(d1.gossip, socketaddr!("127.0.0.1:1235"));
         assert_eq!(d1.tvu, socketaddr!("127.0.0.1:1236"));
+        assert_eq!(d1.tpu_via_blobs, socketaddr!("127.0.0.1:1237"));
         assert_eq!(d1.tpu, socketaddr!("127.0.0.1:1234"));
         assert_eq!(d1.rpc, socketaddr!("127.0.0.1:8899"));
         assert_eq!(d1.rpc_pubsub, socketaddr!("127.0.0.1:8900"));

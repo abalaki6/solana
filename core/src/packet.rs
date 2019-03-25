@@ -1,15 +1,18 @@
 //! The `packet` module defines data structures and methods to pull data from the network.
 use crate::recvmmsg::{recv_mmsg, NUM_RCVMMSGS};
 use crate::result::{Error, Result};
-use bincode::{serialize, serialize_into};
+use bincode;
 use byteorder::{ByteOrder, LittleEndian};
 use serde::Serialize;
 use solana_metrics::counter::Counter;
 pub use solana_sdk::packet::PACKET_DATA_SIZE;
 use solana_sdk::pubkey::Pubkey;
+use std::borrow::Borrow;
 use std::cmp;
 use std::fmt;
 use std::io;
+use std::io::Cursor;
+use std::io::Write;
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, RwLock};
@@ -23,7 +26,7 @@ pub const BLOB_SIZE: usize = (64 * 1024 - 128); // wikipedia says there should b
 pub const BLOB_DATA_SIZE: usize = BLOB_SIZE - (BLOB_HEADER_SIZE * 2);
 pub const NUM_BLOBS: usize = (NUM_PACKETS * PACKET_DATA_SIZE) / BLOB_SIZE;
 
-#[derive(Clone, Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 #[repr(C)]
 pub struct Meta {
     pub size: usize,
@@ -38,6 +41,12 @@ pub struct Meta {
 pub struct Packet {
     pub data: [u8; PACKET_DATA_SIZE],
     pub meta: Meta,
+}
+
+impl Packet {
+    pub fn new(data: [u8; PACKET_DATA_SIZE], meta: Meta) -> Self {
+        Self { data, meta }
+    }
 }
 
 impl fmt::Debug for Packet {
@@ -57,6 +66,12 @@ impl Default for Packet {
             data: [0u8; PACKET_DATA_SIZE],
             meta: Meta::default(),
         }
+    }
+}
+
+impl PartialEq for Packet {
+    fn eq(&self, other: &Packet) -> bool {
+        self.data.iter().zip(other.data.iter()).all(|(a, b)| a == b) && self.meta == other.meta
     }
 }
 
@@ -115,6 +130,10 @@ impl Default for Packets {
 }
 
 impl Packets {
+    pub fn new(packets: Vec<Packet>) -> Self {
+        Self { packets }
+    }
+
     pub fn set_addr(&mut self, addr: &SocketAddr) {
         for m in self.packets.iter_mut() {
             m.meta.set_addr(&addr);
@@ -225,7 +244,7 @@ pub fn to_packets_chunked<T: Serialize>(xs: &[T], chunks: usize) -> Vec<SharedPa
             .resize(x.len(), Packet::default());
         for (i, o) in x.iter().zip(p.write().unwrap().packets.iter_mut()) {
             let mut wr = io::Cursor::new(&mut o.data[..]);
-            serialize_into(&mut wr, &i).expect("serialize request");
+            bincode::serialize_into(&mut wr, &i).expect("serialize request");
             let len = wr.position() as usize;
             o.meta.size = len;
         }
@@ -240,7 +259,7 @@ pub fn to_packets<T: Serialize>(xs: &[T]) -> Vec<SharedPackets> {
 
 pub fn to_blob<T: Serialize>(resp: T, rsp_addr: SocketAddr) -> Result<Blob> {
     let mut b = Blob::default();
-    let v = serialize(&resp)?;
+    let v = bincode::serialize(&resp)?;
     let len = v.len();
     assert!(len <= BLOB_SIZE);
     b.data[..len].copy_from_slice(&v);
@@ -268,6 +287,44 @@ pub fn to_shared_blobs<T: Serialize>(rsps: Vec<(T, SocketAddr)>) -> Result<Share
         blobs.push(to_shared_blob(resp, rsp_addr)?);
     }
     Ok(blobs)
+}
+
+pub fn packets_to_blobs<T: Borrow<Packet>>(packets: &[T]) -> Vec<Blob> {
+    let mut current_index = 0;
+    let mut blobs = vec![];
+    while current_index < packets.len() {
+        let mut blob = Blob::default();
+        current_index += blob.store_packets(&packets[current_index..]) as usize;
+        blobs.push(blob);
+    }
+
+    blobs
+}
+
+pub fn deserialize_packets_in_blob(
+    data: &[u8],
+    serialized_packet_size: usize,
+    serialized_meta_size: usize,
+) -> Result<Vec<Packet>> {
+    let mut packets: Vec<Packet> = Vec::with_capacity(data.len() / serialized_packet_size);
+    let mut pos = 0;
+    while pos + serialized_packet_size <= data.len() {
+        let packet = deserialize_single_packet_in_blob(
+            &data[pos..pos + serialized_packet_size],
+            serialized_meta_size,
+        )?;
+        pos += serialized_packet_size;
+        packets.push(packet);
+    }
+    Ok(packets)
+}
+
+fn deserialize_single_packet_in_blob(data: &[u8], serialized_meta_size: usize) -> Result<Packet> {
+    let meta = bincode::deserialize(&data[..serialized_meta_size])?;
+    let mut packet_data = [0; PACKET_DATA_SIZE];
+    packet_data
+        .copy_from_slice(&data[serialized_meta_size..serialized_meta_size + PACKET_DATA_SIZE]);
+    Ok(Packet::new(packet_data, meta))
 }
 
 macro_rules! range {
@@ -303,6 +360,17 @@ impl Blob {
         let bytes = &data[..data_len];
         blob.data[..data_len].copy_from_slice(bytes);
         blob.meta.size = blob.data_size() as usize;
+        blob
+    }
+
+    pub fn from_serializable<T: Serialize + ?Sized>(data: &T) -> Self {
+        let mut blob = Self::default();
+        let pos = {
+            let mut out = Cursor::new(blob.data_mut());
+            bincode::serialize_into(&mut out, data).expect("failed to serialize output");
+            out.position() as usize
+        };
+        blob.set_size(pos);
         blob
     }
 
@@ -401,6 +469,27 @@ impl Blob {
         self.set_data_size(new_size as u64);
     }
 
+    pub fn store_packets<T: Borrow<Packet>>(&mut self, packets: &[T]) -> u64 {
+        let size = self.size();
+        let mut cursor = Cursor::new(&mut self.data_mut()[size..]);
+        let mut written = 0;
+        let mut last_index = 0;
+        for packet in packets {
+            if bincode::serialize_into(&mut cursor, &packet.borrow().meta).is_err() {
+                break;
+            }
+            if cursor.write_all(&packet.borrow().data[..]).is_err() {
+                break;
+            }
+
+            written = cursor.position() as usize;
+            last_index += 1;
+        }
+
+        self.set_size(size + written);
+        last_index
+    }
+
     pub fn recv_blob(socket: &UdpSocket, r: &SharedBlob) -> io::Result<()> {
         let mut p = r.write().unwrap();
         trace!("receiving on {}", socket.local_addr().unwrap());
@@ -463,25 +552,25 @@ impl Blob {
     }
 }
 
-pub fn index_blobs(blobs: &[SharedBlob], id: &Pubkey, blob_index: &mut u64, slot: u64) {
+pub fn index_blobs(blobs: &[SharedBlob], id: &Pubkey, mut blob_index: u64, slot: u64, parent: u64) {
     // enumerate all the blobs, those are the indices
     for blob in blobs.iter() {
         let mut blob = blob.write().unwrap();
 
-        blob.set_index(*blob_index);
+        blob.set_index(blob_index);
         blob.set_slot(slot);
+        blob.set_parent(parent);
         blob.set_id(id);
         blob.forward(true);
-        *blob_index += 1;
+        blob_index += 1;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::packet::{
-        to_packets, Blob, Meta, Packet, Packets, SharedBlob, SharedPackets, NUM_PACKETS,
-        PACKET_DATA_SIZE,
-    };
+    use super::*;
+    use bincode;
+    use rand::Rng;
     use solana_sdk::hash::Hash;
     use solana_sdk::signature::{Keypair, KeypairUtil};
     use solana_sdk::system_transaction::SystemTransaction;
@@ -523,7 +612,7 @@ mod tests {
     fn test_to_packets() {
         let keypair = Keypair::new();
         let hash = Hash::new(&[1; 32]);
-        let tx = SystemTransaction::new_account(&keypair, keypair.pubkey(), 1, hash, 0);
+        let tx = SystemTransaction::new_account(&keypair, &keypair.pubkey(), 1, hash, 0);
         let rv = to_packets(&vec![tx.clone(); 1]);
         assert_eq!(rv.len(), 1);
         assert_eq!(rv[0].read().unwrap().packets.len(), 1);
@@ -597,4 +686,103 @@ mod tests {
         assert!(b.should_forward());
     }
 
+    #[test]
+    fn test_store_blobs_max() {
+        let meta = Meta::default();
+        let serialized_meta_size = bincode::serialized_size(&meta).unwrap() as usize;
+        let serialized_packet_size = serialized_meta_size + PACKET_DATA_SIZE;
+        let num_packets = (BLOB_SIZE - BLOB_HEADER_SIZE) / serialized_packet_size + 1;
+        let mut blob = Blob::default();
+        let packets: Vec<_> = (0..num_packets).map(|_| Packet::default()).collect();
+
+        // Everything except the last packet should have been written
+        assert_eq!(blob.store_packets(&packets[..]), (num_packets - 1) as u64);
+
+        blob = Blob::default();
+        // Store packets such that blob only has room for one more
+        assert_eq!(
+            blob.store_packets(&packets[..num_packets - 2]),
+            (num_packets - 2) as u64
+        );
+
+        // Fill the last packet in the blob
+        assert_eq!(blob.store_packets(&packets[..num_packets - 2]), 1);
+
+        // Blob is now full
+        assert_eq!(blob.store_packets(&packets), 0);
+    }
+
+    #[test]
+    fn test_packets_to_blobs() {
+        let mut rng = rand::thread_rng();
+        let meta = Meta::default();
+        let serialized_meta_size = bincode::serialized_size(&meta).unwrap() as usize;
+        let serialized_packet_size = serialized_meta_size + PACKET_DATA_SIZE;
+
+        let packets_per_blob = (BLOB_SIZE - BLOB_HEADER_SIZE) / serialized_packet_size;
+        assert!(packets_per_blob > 1);
+        let num_packets = packets_per_blob * 10 + packets_per_blob - 1;
+
+        let packets: Vec<_> = (0..num_packets)
+            .map(|_| {
+                let mut packet = Packet::default();
+                for i in 0..packet.meta.addr.len() {
+                    packet.meta.addr[i] = rng.gen_range(1, std::u16::MAX);
+                }
+                for i in 0..packet.data.len() {
+                    packet.data[i] = rng.gen_range(1, std::u8::MAX);
+                }
+                packet
+            })
+            .collect();
+
+        let blobs = packets_to_blobs(&packets[..]);
+        assert_eq!(blobs.len(), 11);
+
+        let reconstructed_packets: Vec<Packet> = blobs
+            .iter()
+            .flat_map(|b| {
+                deserialize_packets_in_blob(
+                    &b.data()[..b.size()],
+                    serialized_packet_size,
+                    serialized_meta_size,
+                )
+                .unwrap()
+            })
+            .collect();
+
+        assert_eq!(reconstructed_packets, packets);
+    }
+
+    #[test]
+    fn test_deserialize_packets_in_blob() {
+        let meta = Meta::default();
+        let serialized_meta_size = bincode::serialized_size(&meta).unwrap() as usize;
+        let serialized_packet_size = serialized_meta_size + PACKET_DATA_SIZE;
+        let num_packets = 10;
+        let mut rng = rand::thread_rng();
+        let packets: Vec<_> = (0..num_packets)
+            .map(|_| {
+                let mut packet = Packet::default();
+                for i in 0..packet.meta.addr.len() {
+                    packet.meta.addr[i] = rng.gen_range(1, std::u16::MAX);
+                }
+                for i in 0..packet.data.len() {
+                    packet.data[i] = rng.gen_range(1, std::u8::MAX);
+                }
+                packet
+            })
+            .collect();
+
+        let mut blob = Blob::default();
+        assert_eq!(blob.store_packets(&packets[..]), num_packets);
+        let result = deserialize_packets_in_blob(
+            &blob.data()[..blob.size()],
+            serialized_packet_size,
+            serialized_meta_size,
+        )
+        .unwrap();
+
+        assert_eq!(result, packets);
+    }
 }
