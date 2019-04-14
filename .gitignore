@@ -21,3 +21,7 @@ log-*.txt
 # intellij files
 /.idea/
 /solana.iml
+
+# python cache files
+**/__pycache__/*
+*.pyc
