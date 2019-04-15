@@ -52,28 +52,38 @@ Datamap.prototype._handleMapReady = function (datamap) {
 datamap = new Datamap();
 
 
-bubbles = new Array(50)
+$.getJSON("d.json", function () {
+})
+    .done(function (data) {
+        create_bubles(data)
+    })
+    .fail(function () {
+        console.log("Failed to load json");
+    });
 
-for (let i = 0; i < bubbles.length; i++) {
-    rad = Math.ceil(30 * Math.random());
-    key = rad / 30;
-    key = datamap.get_fillKey(key);
-    lat = Math.random() * 120 - 60;
-    long = Math.random() * 120 - 60;
-    bubbles[i] = {
-        radius: rad,
-        fillKey: key,
-        latitude: lat,
-        longitude: long,
-        number_of_nodes: rad
-    }
-}
+function create_bubles(d) {
+    features = d.features
+    bubbles = new Array(features.length)
+    for (let i = 0; i < bubbles.length; i++) {
+        xy = features[i].geometry.coordinates
 
-datamap.instance.bubbles(
-    bubbles,
-    {
-        popupTemplate: function (geo, data) {
-            return '<div class="hoverinfo">' + data.number_of_nodes;
+        rad = Math.ceil(20 * Math.random());
+        key = rad / 20;
+        key = datamap.get_fillKey(key);
+        bubbles[i] = {
+            radius: rad,
+            fillKey: key,
+            latitude: xy[1],
+            longitude: xy[0],
+            number_of_nodes: rad
         }
     }
-);
+    datamap.instance.bubbles(
+        bubbles,
+        {
+            popupTemplate: function (geo, data) {
+                return '<div class="hoverinfo"> density:' + data.number_of_nodes;
+            }
+        }
+    );
+}
