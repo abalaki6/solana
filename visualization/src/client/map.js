@@ -51,7 +51,7 @@ Datamap.prototype._handleMapReady = function (datamap) {
     });
 
     this.get_fillKey = function (val) {
-        return 's' + Math.floor(d3.interpolate(0, 9)(val));
+        return 's' + (1 + Math.floor(d3.interpolate(0, 8)(val)));
     }
 }
 
