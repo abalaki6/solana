@@ -4,18 +4,20 @@
 <head>
     <script src="//cdnjs.cloudflare.com/ajax/libs/d3/3.5.3/d3.min.js"></script>
     <script src="//cdnjs.cloudflare.com/ajax/libs/topojson/1.6.9/topojson.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/datamaps/0.5.9/datamaps.world.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/datamaps/0.5.9/datamaps.world.hires.js"></script>
     <script src="https://code.jquery.com/jquery-3.4.0.js"></script>
     <link rel="stylesheet" href="styles.css">
 </head>
 
 <body>
-    <div id="container" style="position: center; width: 1000px; height: 640px;"></div>
+    <div id='center'>
+        <div id="container" style="position: center; width: 1000px; height: 640px;"></div>
 
-    <button class="zoom-button" data-zoom="reset">0</button>
-    <button class="zoom-button" data-zoom="out">-</button>
-    <button class="zoom-button" data-zoom="in">+</button>
-    <div id="zoom-info"></div>
+        <button class="zoom-button" data-zoom="reset">0</button>
+        <button class="zoom-button" data-zoom="out">-</button>
+        <button class="zoom-button" data-zoom="in">+</button>
+        <div id="zoom-info"></div>
+    </div>
 </body>
 
 <script src="Zoom.js"> </script>
