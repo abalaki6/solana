@@ -6,7 +6,8 @@ function Datamap() {
         projection: 'mercator',
         geographyConfig: {
             popupOnHover: false,
-            highlightOnHover: false
+            highlightOnHover: false,
+            borderWidth: 0.1,
         },
         fills: {
             defaultFill: 'grey',
@@ -21,6 +22,11 @@ function Datamap() {
             s9: '#08306b'
         },
         done: this._handleMapReady.bind(this),
+        bubblesConfig: {
+            borderWidth: 1,
+            borderOpacity: 0.5,
+            borderColor: 'black',
+        },
     });
 
     this.instance.bubbles([
@@ -71,11 +77,11 @@ function create_bubles(d) {
         key = rad / 20;
         key = datamap.get_fillKey(key);
         bubbles[i] = {
-            radius: rad,
+            radius: rad + 2,
             fillKey: key,
             latitude: xy[1],
             longitude: xy[0],
-            number_of_nodes: rad
+            number_of_nodes: rad * rad
         }
     }
     datamap.instance.bubbles(
@@ -87,3 +93,5 @@ function create_bubles(d) {
         }
     );
 }
+
+// $("#container").find("svg").find("g.bubbles").empty()
