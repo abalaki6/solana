@@ -1,0 +1,16 @@
+{
+  "name": "solana-visualization",
+  "version": "1.0.0",
+  "description": "project to visualize network powered by Solana",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "author": "Solana",
+  "license": "ISC",
+  "devDependencies": {
+    "express": "^4.16.4",
+    "path": "^0.12.7"
+  }
+}
