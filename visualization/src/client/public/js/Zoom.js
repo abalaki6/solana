@@ -133,6 +133,7 @@ Zoom.prototype._displayPercentage = function (scale) {
     var value;
 
     value = Math.round(Math.log(scale) / Math.log(this.scale.max) * 100);
+    this.datamap.update_level(value)
     this.$info.text(value + "%");
 };
 

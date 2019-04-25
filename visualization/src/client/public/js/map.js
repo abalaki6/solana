@@ -29,26 +29,41 @@ function Datamap() {
         },
     });
 
-    this.instance.bubbles([
-        {
-            radius: 1,
-            fillKey: 'LARGE',
-            latitude: 73.482,
-            longitude: 54.5854,
-            number_of_nodes: 50
-        }
-    ], {
-            popupTemplate: function (geo, data) {
-                return '<div class="hoverinfo">' + data.number_of_nodes;
-            }
-        });
 }
 
+Datamaps.prototype.update_level = function (level) {
+    for (let i = 0; i < this.levels.length; i++) {
+        if (level == this.levels[i]) {
+            if (i == this.current_level) {
+                return;
+            }
+            console.log("update level to " + i);
+            this.current_level = i;
+            return this._set_level(i);
+        }
+    }
+}
+
+Datamaps.prototype._set_level = function (level) {
+    try {
+        json = this.responce.responseJSON;
+        return create_bubles(json.levels[0], 20 / ((level + 1)));
+    }
+    catch{
+
+    }
+}
+
+
 Datamap.prototype._handleMapReady = function (datamap) {
+    datamap.levels = new Array(0, 10, 20, 30, 40, 50, 60, 70);
+    datamap.current_level = -1;
+
     this.zoom = new Zoom({
         $container: this.$container,
         datamap: datamap
     });
+
 
     this.get_fillKey = function (val) {
         return 's' + (1 + Math.floor(d3.interpolate(0, 8)(val)));
@@ -58,22 +73,22 @@ Datamap.prototype._handleMapReady = function (datamap) {
 datamap = new Datamap();
 
 
-$.getJSON("d.json", function () {
+datamap.instance.responce = $.getJSON("d.json", function () {
 })
     .done(function (data) {
-        create_bubles(data)
+        create_bubles(data.levels[0]);
     })
     .fail(function () {
         console.log("Failed to load json");
     });
 
-function create_bubles(d) {
-    features = d.features
-    bubbles = new Array(features.length)
+function create_bubles(d, max_radius = 20) {
+    $("#container").find("svg").find("g.bubbles").empty()
+    features = d.features;
+    bubbles = new Array(features.length);
     for (let i = 0; i < bubbles.length; i++) {
-        xy = features[i].geometry.coordinates
-
-        rad = Math.ceil(20 * Math.random());
+        xy = features[i].geometry.coordinates;
+        rad = Math.ceil(max_radius * Math.random());
         key = rad / 20;
         key = datamap.get_fillKey(key);
         bubbles[i] = {
@@ -82,7 +97,7 @@ function create_bubles(d) {
             latitude: xy[1],
             longitude: xy[0],
             number_of_nodes: rad * rad
-        }
+        };
     }
     datamap.instance.bubbles(
         bubbles,
@@ -93,5 +108,3 @@ function create_bubles(d) {
         }
     );
 }
-
-// $("#container").find("svg").find("g.bubbles").empty()
