@@ -25,3 +25,6 @@ log-*.txt
 # python cache files
 **/__pycache__/*
 *.pyc
+
+# node modules
+**/node_modules/*
