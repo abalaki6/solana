@@ -9,7 +9,7 @@ drop database if exists SOLANA;
 create database SOLANA;
 use SOLANA;
 create table NODES_TEST(
-ip_addr INT(4) unsigned not null default 0,
+ip_addr INT (4) unsigned not null default 0,
 longtitude float(32) not null default -1,
 latitude float(32) not null default -1,
 city varchar(64) not null default 'N/A',
