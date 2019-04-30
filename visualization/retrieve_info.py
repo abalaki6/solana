@@ -1,7 +1,97 @@
-import subprocess
-import nodeClass
+import getopt
 import ipapi
+import nodeClass
+import subprocess
+import sys
+import time
 
+def explore_network(printInfo=False):
+    output = subprocess.check_output("../target/debug/visualizer_rust --timeout 2 --network $(dig +short edge.testnet.solana.com):8001", shell=True)
+
+    output = output.decode("utf-8")
+    outputArray = output.splitlines()
+
+    nodes = []
+    numberOfNodes = int(outputArray[0])
+
+    for node_data_text in outputArray[1:]:
+        nodeInfo = [x.strip() for x in node_data_text.split(',')]
+        currentNode = nodeClass.nodeClass(nodeInfo[0], nodeInfo[1], nodeInfo[2], nodeInfo[3], nodeInfo[4])
+        nodes.append(currentNode)
+
+        if printInfo:
+            currentNode.printNodeInfo()
+
+    return nodes
+
+def get_network_info(nodes):
+    get_location_info(nodes)
+    ping_network(nodes)
+
+def get_location_info(nodes):
+    pass
+
+def ping_network(nodes):
+    pass
+
+def upload_to_database(nodes):
+    pass
+
+def insert_good_name_here(iterations, log_data, sleep_time):
+    run_count = 0
+    while True:
+        nodes = explore_network()
+
+        get_network_info(nodes)
+
+        if log_data:
+            for node in nodes:
+                node.printNodeInfo()
+
+        upload_to_database(nodes)
+
+        run_count += 1
+        if iterations > 0 and run_count >= iterations:
+            print(iterations, run_count)
+            break
+        time.sleep(sleep_time)
+
+if __name__ == "__main__":
+    argv = sys.argv[1:]
+
+    # Code from tutorialspoint, python command line arguments page
+    try:
+        opts, args = getopt.getopt(argv, "hi:lt:", ["help", "iterations=", "log", "time="])
+    except getopt.GetoptError:
+        print("Invalid arguments. Type --help or -h?")
+        sys.exit(2)
+
+    iterations = 0
+    log_data = False
+    sleep_time = 10
+
+    for opt, arg in opts:
+        if opt in ("--help", "-h"):
+            print("retrieve_info.py -i <iterations> -l -time <time>")
+            print("-i   Iterations is how many times the data is collected. 0 (default) is forever.")
+            print("-l   Log data.")
+            print("-t   Time between data collection. Default 10 seconds")
+        elif opt in ("-i", "--iterations"):
+            iterations = int(arg)
+            if iterations < 0:
+                print("Iterations must be a positive integer or 0")
+                sys.exit(2)
+        elif opt in ("-l", "--log"):
+            log_data = True
+        elif opt in ("-t", "--time"):
+            sleep_time = int(arg)
+            if sleep_time <= 0:
+                print("time must be a non-negative integer")
+                sys.exit(2)
+
+    insert_good_name_here(iterations, log_data, sleep_time)
+
+'''
 # gossip_process = subprocess.Popen(["../target/debug/solana-gossip", "--timeout", "5", "--network", "$(dig +short edge.testnet.solana.com):8001"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
 # output = gossip_process.communicate()
 
@@ -39,3 +129,5 @@ for i in range(numberOfNodes):
 for i in range(numberOfNodes):
     nodes[i].printNodeInfo()
     print("\n")
+
+'''

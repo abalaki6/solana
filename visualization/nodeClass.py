@@ -1,5 +1,5 @@
 class nodeClass:
-    def __init__(self, public_key, tvu, tpu, storage_addr, rpc, latitude, longitude, city, region, country):
+    def __init__(self, public_key, tvu, tpu, storage_addr, rpc, latitude=None, longitude=None, city=None, region=None, country=None):
         self.public_key = public_key
         self.tvu = tvu
         self.tpu = tpu
@@ -22,3 +22,6 @@ class nodeClass:
         print("City: ", self.city)
         print("Region: ", self.region)
         print("Country: ", self.country)
+
+    def get_ip_address(self):
+        return self.public_key.split(":")[0]
