@@ -24,7 +24,8 @@ transaction_count INT(64) unsigned not null default 0,
 stake_weight FLOAT(32) not null default 0,
 public_key varchar(256) not null default '',
 socket_status INT(4) unsigned not null default 255,
-map_depth INT(4) unsigned not null default 0);
+map_depth INT(4) unsigned not null default 0,
+node_size INT(16) unsigned not null default 1);
 INSERT INTO NODES_TEST
 (longtitude, latitude, map_depth)
 VALUES
@@ -40,7 +41,7 @@ VALUES
     locs = np.array([np.array([*df.loc[:, ['geometry.coordinates']].values[i]]) for i in range(len(df))]).reshape(-1, 2)
 
     # number of points to put
-    N = 50
+    N = 1000
     # select random locations
     # add reproductivity
     np.random.seed(17121997)
