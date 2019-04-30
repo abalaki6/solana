@@ -12,12 +12,15 @@ use crate::service::Service;
 use bincode::deserialize;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
-use solana_client::thin_client::create_client_with_timeout;
+use solana_client::thin_client::{create_client_with_timeout, ThinClient};
+use solana_sdk::async_client::AsyncClient;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, KeypairUtil, Signature};
+use solana_sdk::sync_client::SyncClient;
+use solana_sdk::system_transaction;
 use solana_sdk::transaction::Transaction;
-use solana_storage_api::storage_instruction::StorageInstruction;
+use solana_storage_api::storage_instruction::{self, StorageInstruction};
 use std::collections::HashSet;
 use std::io;
 use std::mem::size_of;
@@ -141,6 +144,7 @@ impl StorageStage {
         storage_entry_receiver: EntryReceiver,
         blocktree: Option<Arc<Blocktree>>,
         keypair: &Arc<Keypair>,
+        storage_keypair: &Arc<Keypair>,
         exit: &Arc<AtomicBool>,
         entry_height: u64,
         storage_rotate_count: u64,
@@ -150,7 +154,7 @@ impl StorageStage {
         storage_state.state.write().unwrap().entry_height = entry_height;
         let storage_state_inner = storage_state.state.clone();
         let exit0 = exit.clone();
-        let keypair0 = keypair.clone();
+        let keypair0 = storage_keypair.clone();
 
         let (tx_sender, tx_receiver) = channel();
 
@@ -190,13 +194,21 @@ impl StorageStage {
         let cluster_info0 = cluster_info.clone();
         let exit1 = exit.clone();
         let keypair1 = keypair.clone();
+        let storage_keypair1 = storage_keypair.clone();
         let t_storage_create_accounts = Builder::new()
             .name("solana-storage-create-accounts".to_string())
             .spawn(move || loop {
                 match tx_receiver.recv_timeout(Duration::from_secs(1)) {
                     Ok(mut tx) => {
-                        if Self::send_transaction(&cluster_info0, &mut tx, &exit1, &keypair1, None)
-                            .is_ok()
+                        if Self::send_transaction(
+                            &cluster_info0,
+                            &mut tx,
+                            &exit1,
+                            &keypair1,
+                            &storage_keypair1,
+                            Some(storage_keypair1.pubkey()),
+                        )
+                        .is_ok()
                         {
                             debug!("sent transaction: {:?}", tx);
                         }
@@ -220,11 +232,31 @@ impl StorageStage {
         }
     }
 
+    fn check_signature(
+        client: &ThinClient,
+        signature: &Signature,
+        exit: &Arc<AtomicBool>,
+    ) -> io::Result<()> {
+        for _ in 0..10 {
+            if client.check_signature(&signature) {
+                return Ok(());
+            }
+
+            if exit.load(Ordering::Relaxed) {
+                Err(io::Error::new(io::ErrorKind::Other, "exit signaled"))?;
+            }
+
+            sleep(Duration::from_millis(200));
+        }
+        Err(io::Error::new(io::ErrorKind::Other, "other failure"))
+    }
+
     fn send_transaction(
         cluster_info: &Arc<RwLock<ClusterInfo>>,
         transaction: &mut Transaction,
         exit: &Arc<AtomicBool>,
         keypair: &Arc<Keypair>,
+        storage_keypair: &Arc<Keypair>,
         account_to_create: Option<Pubkey>,
     ) -> io::Result<()> {
         let contact_info = cluster_info.read().unwrap().my_data();
@@ -233,12 +265,6 @@ impl StorageStage {
             FULLNODE_PORT_RANGE,
             Duration::from_secs(5),
         );
-
-        if let Some(account) = account_to_create {
-            if client.get_account_data(&account).is_ok() {
-                return Ok(());
-            }
-        }
 
         let mut blockhash = None;
         for _ in 0..10 {
@@ -251,26 +277,32 @@ impl StorageStage {
                 Err(io::Error::new(io::ErrorKind::Other, "exit signaled"))?;
             }
         }
-
         if let Some(blockhash) = blockhash {
-            transaction.sign(&[keypair.as_ref()], blockhash);
+            if let Some(account) = account_to_create {
+                if client.get_account_data(&account).is_err() {
+                    // TODO the account space needs to be well defined somewhere
+                    let tx = system_transaction::create_account(
+                        keypair,
+                        &storage_keypair.pubkey(),
+                        blockhash,
+                        1,
+                        1024 * 4,
+                        &solana_storage_api::id(),
+                        0,
+                    );
+                    let signature = client.async_send_transaction(tx).unwrap();
+                    Self::check_signature(&client, &signature, &exit)?;
+                }
+            }
+            transaction.sign(&[storage_keypair.as_ref()], blockhash);
 
             if exit.load(Ordering::Relaxed) {
                 Err(io::Error::new(io::ErrorKind::Other, "exit signaled"))?;
             }
 
-            if let Ok(signature) = client.transfer_signed(&transaction) {
-                for _ in 0..10 {
-                    if client.check_signature(&signature) {
-                        return Ok(());
-                    }
-
-                    if exit.load(Ordering::Relaxed) {
-                        Err(io::Error::new(io::ErrorKind::Other, "exit signaled"))?;
-                    }
-
-                    sleep(Duration::from_millis(200));
-                }
+            if let Ok(signature) = client.async_send_transaction(transaction.clone()) {
+                Self::check_signature(&client, &signature, &exit)?;
+                return Ok(());
             }
         }
 
@@ -288,12 +320,12 @@ impl StorageStage {
         let mut seed = [0u8; 32];
         let signature = keypair.sign(&entry_id.as_ref());
 
-        let ix = StorageInstruction::new_advertise_recent_blockhash(
+        let ix = storage_instruction::advertise_recent_blockhash(
             &keypair.pubkey(),
             entry_id,
             entry_height,
         );
-        let tx = Transaction::new(vec![ix]);
+        let tx = Transaction::new_unsigned_instructions(vec![ix]);
         tx_sender.send(tx)?;
 
         seed.copy_from_slice(&signature.as_ref()[..32]);
@@ -371,9 +403,11 @@ impl StorageStage {
             // Go through the transactions, find proofs, and use them to update
             // the storage_keys with their signatures
             for tx in entry.transactions {
-                for (i, program_id) in tx.program_ids.iter().enumerate() {
-                    if solana_storage_api::check_id(&program_id) {
-                        match deserialize(&tx.instructions[i].data) {
+                let message = tx.message();
+                for instruction in &message.instructions {
+                    let program_id = instruction.program_id(message.program_ids());
+                    if solana_storage_api::check_id(program_id) {
+                        match deserialize(&instruction.data) {
                             Ok(StorageInstruction::SubmitMiningProof {
                                 entry_height: proof_entry_height,
                                 signature,
@@ -406,7 +440,7 @@ impl StorageStage {
                                         (proof_entry_height / ENTRIES_PER_SEGMENT) as usize;
                                     if proof_segment_index < statew.replicator_map.len() {
                                         statew.replicator_map[proof_segment_index]
-                                            .insert(tx.account_keys[0]);
+                                            .insert(message.account_keys[0]);
                                     }
                                 }
                                 debug!("storage proof: entry_height: {}", entry_height);
@@ -475,6 +509,7 @@ mod tests {
     #[test]
     fn test_storage_stage_none_ledger() {
         let keypair = Arc::new(Keypair::new());
+        let storage_keypair = Arc::new(Keypair::new());
         let exit = Arc::new(AtomicBool::new(false));
 
         let cluster_info = test_cluster_info(&keypair.pubkey());
@@ -486,6 +521,7 @@ mod tests {
             storage_entry_receiver,
             None,
             &keypair,
+            &storage_keypair,
             &exit.clone(),
             0,
             STORAGE_ROTATE_TEST_COUNT,
@@ -505,6 +541,7 @@ mod tests {
     fn test_storage_stage_process_entries() {
         solana_logger::setup();
         let keypair = Arc::new(Keypair::new());
+        let storage_keypair = Arc::new(Keypair::new());
         let exit = Arc::new(AtomicBool::new(false));
 
         let (genesis_block, _mint_keypair) = GenesisBlock::new(1000);
@@ -526,6 +563,7 @@ mod tests {
             storage_entry_receiver,
             Some(Arc::new(blocktree)),
             &keypair,
+            &storage_keypair,
             &exit.clone(),
             0,
             STORAGE_ROTATE_TEST_COUNT,
@@ -569,6 +607,7 @@ mod tests {
     fn test_storage_stage_process_proof_entries() {
         solana_logger::setup();
         let keypair = Arc::new(Keypair::new());
+        let storage_keypair = Arc::new(Keypair::new());
         let exit = Arc::new(AtomicBool::new(false));
 
         let (genesis_block, _mint_keypair) = GenesisBlock::new(1000);
@@ -590,6 +629,7 @@ mod tests {
             storage_entry_receiver,
             Some(Arc::new(blocktree)),
             &keypair,
+            &storage_keypair,
             &exit.clone(),
             0,
             STORAGE_ROTATE_TEST_COUNT,
@@ -605,13 +645,13 @@ mod tests {
         }
 
         let keypair = Keypair::new();
-        let mining_proof_ix = StorageInstruction::new_mining_proof(
+        let mining_proof_ix = storage_instruction::mining_proof(
             &keypair.pubkey(),
             Hash::default(),
             0,
             keypair.sign_message(b"test"),
         );
-        let mining_proof_tx = Transaction::new(vec![mining_proof_ix]);
+        let mining_proof_tx = Transaction::new_unsigned_instructions(vec![mining_proof_ix]);
         let mining_txs = vec![mining_proof_tx];
 
         let proof_entries = vec![Entry::new(&Hash::default(), 1, mining_txs)];

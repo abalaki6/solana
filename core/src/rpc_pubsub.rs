@@ -6,14 +6,14 @@ use jsonrpc_core::{Error, ErrorCode, Result};
 use jsonrpc_derive::rpc;
 use jsonrpc_pubsub::typed::Subscriber;
 use jsonrpc_pubsub::{Session, SubscriptionId};
-use solana_client::rpc_signature_status::RpcSignatureStatus;
 use solana_sdk::account::Account;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
+use solana_sdk::transaction;
 use std::mem;
 use std::sync::{atomic, Arc};
 
-#[rpc]
+#[rpc(server)]
 pub trait RpcSolPubSub {
     type Metadata;
 
@@ -58,7 +58,12 @@ pub trait RpcSolPubSub {
         subscribe,
         name = "signatureSubscribe"
     )]
-    fn signature_subscribe(&self, _: Self::Metadata, _: Subscriber<RpcSignatureStatus>, _: String);
+    fn signature_subscribe(
+        &self,
+        _: Self::Metadata,
+        _: Subscriber<Option<transaction::Result<()>>>,
+        _: String,
+    );
 
     // Unsubscribe from signature notification subscription.
     #[pubsub(
@@ -178,7 +183,7 @@ impl RpcSolPubSub for RpcSolPubSubImpl {
     fn signature_subscribe(
         &self,
         _meta: Self::Metadata,
-        subscriber: Subscriber<RpcSignatureStatus>,
+        subscriber: Subscriber<Option<transaction::Result<()>>>,
         signature_str: String,
     ) {
         info!("signature_subscribe");
@@ -227,13 +232,13 @@ mod tests {
     use jsonrpc_core::Response;
     use jsonrpc_pubsub::{PubSubHandler, Session};
     use solana_budget_api;
-    use solana_budget_api::budget_instruction::BudgetInstruction;
-    use solana_runtime::bank::{self, Bank};
+    use solana_budget_api::budget_instruction;
+    use solana_runtime::bank::Bank;
     use solana_sdk::genesis_block::GenesisBlock;
     use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::{Keypair, KeypairUtil};
-    use solana_sdk::system_transaction::SystemTransaction;
-    use solana_sdk::transaction::Transaction;
+    use solana_sdk::system_transaction;
+    use solana_sdk::transaction::{self, Transaction};
     use std::thread::sleep;
     use std::time::Duration;
     use tokio::prelude::{Async, Stream};
@@ -242,7 +247,7 @@ mod tests {
         bank: &Arc<Bank>,
         tx: &Transaction,
         subscriptions: &RpcSubscriptions,
-    ) -> bank::Result<Arc<Bank>> {
+    ) -> transaction::Result<Arc<Bank>> {
         bank.process_transaction(tx)?;
         subscriptions.notify_subscribers(&bank);
 
@@ -270,7 +275,7 @@ mod tests {
         let rpc = RpcSolPubSubImpl::default();
 
         // Test signature subscriptions
-        let tx = SystemTransaction::new_move(&alice, &bob_pubkey, 20, blockhash, 0);
+        let tx = system_transaction::transfer(&alice, &bob_pubkey, 20, blockhash, 0);
 
         let session = create_session();
         let (subscriber, _id_receiver, mut receiver) =
@@ -283,7 +288,10 @@ mod tests {
         // Test signature confirmation notification
         let string = receiver.poll();
         if let Async::Ready(Some(response)) = string.unwrap() {
-            let expected = format!(r#"{{"jsonrpc":"2.0","method":"signatureNotification","params":{{"result":"Confirmed","subscription":0}}}}"#);
+            let expected_res: Option<transaction::Result<()>> = Some(Ok(()));
+            let expected_res_str =
+                serde_json::to_string(&serde_json::to_value(expected_res).unwrap()).unwrap();
+            let expected = format!(r#"{{"jsonrpc":"2.0","method":"signatureNotification","params":{{"result":{},"subscription":0}}}}"#, expected_res_str);
             assert_eq!(expected, response);
         }
     }
@@ -291,7 +299,7 @@ mod tests {
     #[test]
     fn test_signature_unsubscribe() {
         let (genesis_block, alice) = GenesisBlock::new(10_000);
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let bank = Bank::new(&genesis_block);
         let arc_bank = Arc::new(bank);
         let blockhash = arc_bank.last_blockhash();
@@ -302,7 +310,7 @@ mod tests {
         let rpc = RpcSolPubSubImpl::default();
         io.extend_with(rpc.to_delegate());
 
-        let tx = SystemTransaction::new_move(&alice, &bob_pubkey, 20, blockhash, 0);
+        let tx = system_transaction::transfer(&alice, &bob_pubkey, 20, blockhash, 0);
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"signatureSubscribe","params":["{}"]}}"#,
             tx.signatures[0].to_string()
@@ -336,10 +344,10 @@ mod tests {
 
         // This test depends on the budget program
         genesis_block
-            .native_programs
+            .native_instruction_processors
             .push(("solana_budget_program".to_string(), solana_budget_api::id()));
 
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let witness = Keypair::new();
         let contract_funds = Keypair::new();
         let contract_state = Keypair::new();
@@ -354,10 +362,16 @@ mod tests {
         let (subscriber, _id_receiver, mut receiver) = Subscriber::new_test("accountNotification");
         rpc.account_subscribe(session, subscriber, contract_state.pubkey().to_string());
 
-        let tx = SystemTransaction::new_account(&alice, &contract_funds.pubkey(), 51, blockhash, 0);
+        let tx = system_transaction::create_user_account(
+            &alice,
+            &contract_funds.pubkey(),
+            51,
+            blockhash,
+            0,
+        );
         let arc_bank = process_transaction_and_notify(&arc_bank, &tx, &rpc.subscriptions).unwrap();
 
-        let ixs = BudgetInstruction::new_when_signed(
+        let ixs = budget_instruction::when_signed(
             &contract_funds.pubkey(),
             &bob_pubkey,
             &contract_state.pubkey(),
@@ -365,7 +379,7 @@ mod tests {
             None,
             51,
         );
-        let tx = Transaction::new_signed_instructions(&[&contract_funds], ixs, blockhash, 0);
+        let tx = Transaction::new_signed_instructions(&[&contract_funds], ixs, blockhash);
         let arc_bank = process_transaction_and_notify(&arc_bank, &tx, &rpc.subscriptions).unwrap();
         sleep(Duration::from_millis(200));
 
@@ -390,15 +404,16 @@ mod tests {
             assert_eq!(serde_json::to_string(&expected).unwrap(), response);
         }
 
-        let tx = SystemTransaction::new_account(&alice, &witness.pubkey(), 1, blockhash, 0);
+        let tx =
+            system_transaction::create_user_account(&alice, &witness.pubkey(), 1, blockhash, 0);
         let arc_bank = process_transaction_and_notify(&arc_bank, &tx, &rpc.subscriptions).unwrap();
         sleep(Duration::from_millis(200));
-        let ix = BudgetInstruction::new_apply_signature(
+        let ix = budget_instruction::apply_signature(
             &witness.pubkey(),
             &contract_state.pubkey(),
             &bob_pubkey,
         );
-        let tx = Transaction::new_signed_instructions(&[&witness], vec![ix], blockhash, 0);
+        let tx = Transaction::new_signed_instructions(&[&witness], vec![ix], blockhash);
         let arc_bank = process_transaction_and_notify(&arc_bank, &tx, &rpc.subscriptions).unwrap();
         sleep(Duration::from_millis(200));
 
@@ -407,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_account_unsubscribe() {
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let session = create_session();
 
         let mut io = PubSubHandler::default();

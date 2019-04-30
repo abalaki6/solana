@@ -19,11 +19,12 @@ use rand::Rng;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_request::RpcRequest;
 use solana_client::thin_client::{create_client, ThinClient};
-use solana_drone::drone::{request_airdrop_transaction, DRONE_PORT};
+use solana_sdk::async_client::AsyncClient;
 use solana_sdk::hash::{Hash, Hasher};
 use solana_sdk::signature::{Keypair, KeypairUtil, Signature};
+use solana_sdk::system_transaction;
 use solana_sdk::transaction::Transaction;
-use solana_storage_api::storage_instruction::StorageInstruction;
+use solana_storage_api::storage_instruction;
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
@@ -57,7 +58,7 @@ pub struct Replicator {
     exit: Arc<AtomicBool>,
     slot: u64,
     ledger_path: String,
-    keypair: Arc<Keypair>,
+    storage_keypair: Arc<Keypair>,
     signature: ring::signature::Signature,
     cluster_entrypoint: ContactInfo,
     ledger_data_file_encrypted: PathBuf,
@@ -183,6 +184,7 @@ impl Replicator {
         node: Node,
         cluster_entrypoint: ContactInfo,
         keypair: Arc<Keypair>,
+        storage_keypair: Arc<Keypair>,
         _timeout: Option<Duration>,
     ) -> Result<Self> {
         let exit = Arc::new(AtomicBool::new(false));
@@ -212,13 +214,13 @@ impl Replicator {
         );
 
         info!("Looking for leader at {:?}", cluster_entrypoint);
-        crate::gossip_service::discover(&cluster_entrypoint.gossip, 1)?;
+        crate::gossip_service::discover_nodes(&cluster_entrypoint.gossip, 1)?;
 
         let (storage_blockhash, storage_entry_height) =
             Self::poll_for_blockhash_and_entry_height(&cluster_info)?;
 
         let node_info = node.info.clone();
-        let signature = keypair.sign(storage_blockhash.as_ref());
+        let signature = storage_keypair.sign(storage_blockhash.as_ref());
         let slot = get_entry_heights_from_blockhash(&signature, storage_entry_height);
         info!("replicating slot: {}", slot);
 
@@ -242,8 +244,11 @@ impl Replicator {
             retransmit_sender,
             repair_socket,
             &exit,
-            repair_slot_range,
+            Some(repair_slot_range),
         );
+
+        let client = create_client(cluster_entrypoint.client_facing_addr(), FULLNODE_PORT_RANGE);
+        Self::setup_mining_account(&client, &keypair, &storage_keypair)?;
 
         let mut thread_handles =
             create_request_processor(node.sockets.storage.unwrap(), &exit, slot);
@@ -276,7 +281,7 @@ impl Replicator {
             exit,
             slot,
             ledger_path: ledger_path.to_string(),
-            keypair: keypair.clone(),
+            storage_keypair,
             signature,
             cluster_entrypoint,
             ledger_data_file_encrypted: PathBuf::default(),
@@ -397,22 +402,61 @@ impl Replicator {
         Ok(())
     }
 
+    fn setup_mining_account(
+        client: &ThinClient,
+        keypair: &Keypair,
+        storage_keypair: &Keypair,
+    ) -> io::Result<()> {
+        // make sure replicator has some balance
+        if client.poll_get_balance(&keypair.pubkey())? == 0 {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "No account has been setup",
+            ))?
+        }
+
+        // check if the account exists
+        let bal = client.poll_get_balance(&storage_keypair.pubkey());
+        if bal.is_err() || bal.unwrap() == 0 {
+            let blockhash = client.get_recent_blockhash().expect("blockhash");
+            //TODO the account space needs to be well defined somewhere
+            let tx = system_transaction::create_account(
+                keypair,
+                &storage_keypair.pubkey(),
+                blockhash,
+                1,
+                1024 * 4,
+                &solana_storage_api::id(),
+                0,
+            );
+            let signature = client.async_send_transaction(tx)?;
+            client.poll_for_signature(&signature)?;
+        }
+        Ok(())
+    }
+
     fn submit_mining_proof(&self) {
         let client = create_client(
             self.cluster_entrypoint.client_facing_addr(),
             FULLNODE_PORT_RANGE,
         );
-        Self::get_airdrop_lamports(&client, &self.keypair, &self.cluster_entrypoint);
+        // No point if we've got no storage account
+        assert!(
+            client
+                .poll_get_balance(&self.storage_keypair.pubkey())
+                .unwrap()
+                > 0
+        );
 
-        let ix = StorageInstruction::new_mining_proof(
-            &self.keypair.pubkey(),
+        let ix = storage_instruction::mining_proof(
+            &self.storage_keypair.pubkey(),
             self.hash,
             self.slot,
             Signature::new(self.signature.as_ref()),
         );
-        let mut tx = Transaction::new(vec![ix]);
+        let mut tx = Transaction::new_unsigned_instructions(vec![ix]);
         client
-            .retry_transfer(&self.keypair, &mut tx, 10)
+            .retry_transfer(&self.storage_keypair, &mut tx, 10)
             .expect("transfer didn't work!");
     }
 
@@ -464,38 +508,6 @@ impl Replicator {
             ErrorKind::Other,
             "Couldn't get blockhash or entry_height",
         ))?
-    }
-
-    fn get_airdrop_lamports(
-        client: &ThinClient,
-        keypair: &Keypair,
-        cluster_entrypoint: &ContactInfo,
-    ) {
-        if client.wait_for_balance(&keypair.pubkey(), None).is_none() {
-            let mut drone_addr = cluster_entrypoint.tpu;
-            drone_addr.set_port(DRONE_PORT);
-
-            let airdrop_amount = 1;
-
-            let blockhash = client.get_recent_blockhash().expect("blockhash");
-            match request_airdrop_transaction(
-                &drone_addr,
-                &keypair.pubkey(),
-                airdrop_amount,
-                blockhash,
-            ) {
-                Ok(transaction) => {
-                    let signature = client.transfer_signed(&transaction).unwrap();
-                    client.poll_for_signature(&signature).unwrap();
-                }
-                Err(err) => {
-                    panic!(
-                        "Error requesting airdrop: {:?} to addr: {:?} amount: {}",
-                        err, drone_addr, airdrop_amount
-                    );
-                }
-            };
-        }
     }
 }
 

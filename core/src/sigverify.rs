@@ -8,16 +8,16 @@ use crate::packet::{Packet, SharedPackets};
 use crate::result::Result;
 use solana_metrics::counter::Counter;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::shortvec::decode_len;
+use solana_sdk::short_vec::decode_len;
 use solana_sdk::signature::Signature;
 #[cfg(test)]
 use solana_sdk::transaction::Transaction;
-use std::io::Cursor;
 use std::mem::size_of;
 
-pub const TX_OFFSET: usize = 0;
-
 type TxOffsets = (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<Vec<u32>>);
+
+// The serialized size of Message::num_required_signatures.
+const NUM_REQUIRED_SIGNATURES_SIZE: usize = 1;
 
 #[cfg(feature = "cuda")]
 #[repr(C)]
@@ -124,24 +124,20 @@ pub fn ed25519_verify(batches: &[SharedPackets]) -> Vec<Vec<u8>> {
 }
 
 pub fn get_packet_offsets(packet: &Packet, current_offset: u32) -> (u32, u32, u32, u32) {
-    // Read in the size of signatures array
-    let start_offset = TX_OFFSET + size_of::<u64>();
-    let mut rd = Cursor::new(&packet.data[start_offset..]);
-    let sig_len = decode_len(&mut rd).unwrap();
-    let sig_size = rd.position() as usize;
-    let msg_start_offset = start_offset + sig_size + sig_len * size_of::<Signature>();
-    let mut rd = Cursor::new(&packet.data[msg_start_offset..]);
-    let _ = decode_len(&mut rd).unwrap();
-    let pubkey_size = rd.position() as usize;
-    let pubkey_offset = current_offset as usize + msg_start_offset + pubkey_size;
+    let (sig_len, sig_size) = decode_len(&packet.data);
+    let msg_start_offset = sig_size + sig_len * size_of::<Signature>();
 
-    let sig_start = start_offset + current_offset as usize + sig_size;
+    let (_pubkey_len, pubkey_size) = decode_len(&packet.data[msg_start_offset..]);
+
+    let sig_start = current_offset as usize + sig_size;
+    let msg_start = current_offset as usize + msg_start_offset;
+    let pubkey_start = msg_start + NUM_REQUIRED_SIGNATURES_SIZE + pubkey_size;
 
     (
         sig_len as u32,
         sig_start as u32,
-        current_offset + msg_start_offset as u32,
-        pubkey_offset as u32,
+        msg_start as u32,
+        pubkey_start as u32,
     )
 }
 
@@ -333,17 +329,11 @@ pub fn make_packet_from_transaction(tx: Transaction) -> Packet {
 mod tests {
     use crate::packet::{Packet, SharedPackets};
     use crate::sigverify;
-    use crate::test_tx::test_tx;
+    use crate::test_tx::{test_multisig_tx, test_tx};
     use bincode::{deserialize, serialize};
-    use solana_budget_api;
-    use solana_sdk::hash::Hash;
-    use solana_sdk::instruction::CompiledInstruction;
-    use solana_sdk::signature::{Keypair, KeypairUtil};
-    use solana_sdk::system_instruction::SystemInstruction;
-    use solana_sdk::system_program;
     use solana_sdk::transaction::Transaction;
 
-    const SIG_OFFSET: usize = std::mem::size_of::<u64>() + 1;
+    const SIG_OFFSET: usize = 1;
 
     pub fn memfind<A: Eq>(a: &[A], b: &[A]) -> Option<usize> {
         assert!(a.len() >= b.len());
@@ -361,7 +351,7 @@ mod tests {
         let tx = test_tx();
         let tx_bytes = serialize(&tx).unwrap();
         let packet = serialize(&tx).unwrap();
-        assert_matches!(memfind(&packet, &tx_bytes), Some(sigverify::TX_OFFSET));
+        assert_matches!(memfind(&packet, &tx_bytes), Some(0));
         assert_matches!(memfind(&packet, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), None);
     }
 
@@ -369,7 +359,7 @@ mod tests {
     fn test_system_transaction_layout() {
         let tx = test_tx();
         let tx_bytes = serialize(&tx).unwrap();
-        let message = tx.message();
+        let message_data = tx.message_data();
         let packet = sigverify::make_packet_from_transaction(tx.clone());
 
         let (sig_len, sig_start, msg_start_offset, pubkey_offset) =
@@ -380,11 +370,11 @@ mod tests {
             Some(SIG_OFFSET)
         );
         assert_eq!(
-            memfind(&tx_bytes, &tx.account_keys[0].as_ref()),
+            memfind(&tx_bytes, &tx.message().account_keys[0].as_ref()),
             Some(pubkey_offset as usize)
         );
         assert_eq!(
-            memfind(&tx_bytes, &message),
+            memfind(&tx_bytes, &message_data),
             Some(msg_start_offset as usize)
         );
         assert_eq!(
@@ -392,15 +382,14 @@ mod tests {
             Some(sig_start as usize)
         );
         assert_eq!(sig_len, 1);
-        assert!(tx.verify_signature());
     }
 
     #[test]
     fn test_system_transaction_data_layout() {
         use crate::packet::PACKET_DATA_SIZE;
         let mut tx0 = test_tx();
-        tx0.instructions[0].data = vec![1, 2, 3];
-        let message0a = tx0.message();
+        tx0.message.instructions[0].data = vec![1, 2, 3];
+        let message0a = tx0.message_data();
         let tx_bytes = serialize(&tx0).unwrap();
         assert!(tx_bytes.len() < PACKET_DATA_SIZE);
         assert_eq!(
@@ -409,23 +398,42 @@ mod tests {
         );
         let tx1 = deserialize(&tx_bytes).unwrap();
         assert_eq!(tx0, tx1);
-        assert_eq!(tx1.instructions[0].data, vec![1, 2, 3]);
+        assert_eq!(tx1.message().instructions[0].data, vec![1, 2, 3]);
 
-        tx0.instructions[0].data = vec![1, 2, 4];
-        let message0b = tx0.message();
+        tx0.message.instructions[0].data = vec![1, 2, 4];
+        let message0b = tx0.message_data();
         assert_ne!(message0a, message0b);
+    }
+
+    // Just like get_packet_offsets, but not returning redundant information.
+    fn get_packet_offsets_from_tx(tx: Transaction, current_offset: u32) -> (u32, u32, u32, u32) {
+        let packet = sigverify::make_packet_from_transaction(tx);
+        let (sig_len, sig_start, msg_start_offset, pubkey_offset) =
+            sigverify::get_packet_offsets(&packet, current_offset);
+        (
+            sig_len,
+            sig_start - current_offset,
+            msg_start_offset - sig_start,
+            pubkey_offset - msg_start_offset,
+        )
     }
 
     #[test]
     fn test_get_packet_offsets() {
-        let tx = test_tx();
-        let packet = sigverify::make_packet_from_transaction(tx);
-        let (sig_len, sig_start, msg_start_offset, pubkey_offset) =
-            sigverify::get_packet_offsets(&packet, 0);
-        assert_eq!(sig_len, 1);
-        assert_eq!(sig_start, 9);
-        assert_eq!(msg_start_offset, 73);
-        assert_eq!(pubkey_offset, 74);
+        assert_eq!(get_packet_offsets_from_tx(test_tx(), 0), (1, 1, 64, 2));
+        assert_eq!(get_packet_offsets_from_tx(test_tx(), 100), (1, 1, 64, 2));
+
+        // Ensure we're not indexing packet by the `current_offset` parameter.
+        assert_eq!(
+            get_packet_offsets_from_tx(test_tx(), 1_000_000),
+            (1, 1, 64, 2)
+        );
+
+        // Ensure we're returning sig_len, not sig_size.
+        assert_eq!(
+            get_packet_offsets_from_tx(test_multisig_tx(), 0),
+            (2, 1, 128, 2)
+        );
     }
 
     fn generate_packet_vec(
@@ -489,30 +497,10 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_multi_sig() {
+    fn test_verify_multisig() {
         solana_logger::setup();
-        let keypair0 = Keypair::new();
-        let keypair1 = Keypair::new();
-        let keypairs = vec![&keypair0, &keypair1];
-        let lamports = 5;
-        let fee = 2;
-        let blockhash = Hash::default();
 
-        let system_instruction = SystemInstruction::Move { lamports };
-
-        let program_ids = vec![system_program::id(), solana_budget_api::id()];
-
-        let instructions = vec![CompiledInstruction::new(0, &system_instruction, vec![0, 1])];
-
-        let tx = Transaction::new_with_compiled_instructions(
-            &keypairs,
-            &[],
-            blockhash,
-            fee,
-            program_ids,
-            instructions,
-        );
-
+        let tx = test_multisig_tx();
         let mut packet = sigverify::make_packet_from_transaction(tx);
 
         let n = 4;

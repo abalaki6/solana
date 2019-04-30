@@ -163,6 +163,7 @@ startCommon() {
       mkdir -p ~/.cargo/bin
     "
   fi
+  [[ -z "$externalNodeSshKey" ]] || ssh-copy-id -f -i "$externalNodeSshKey" "${sshOptions[@]}" "solana@$ipAddress"
   rsync -vPrc -e "ssh ${sshOptions[*]}" \
     "$SOLANA_ROOT"/{fetch-perf-libs.sh,scripts,net,multinode-demo} \
     "$ipAddress":~/solana/
@@ -197,7 +198,7 @@ startBootstrapLeader() {
          bootstrap-leader \
          $publicNetwork \
          $entrypointIp \
-         ${#fullnodeIpList[@]} \
+         $((${#fullnodeIpList[@]} + ${#blockstreamerIpList[@]})) \
          \"$RUST_LOG\" \
          $skipSetup \
          $leaderRotation \
@@ -225,7 +226,7 @@ startNode() {
          $nodeType \
          $publicNetwork \
          $entrypointIp \
-         ${#fullnodeIpList[@]} \
+         $((${#fullnodeIpList[@]} + ${#blockstreamerIpList[@]})) \
          \"$RUST_LOG\" \
          $skipSetup \
          $leaderRotation \
@@ -254,21 +255,34 @@ startClient() {
 }
 
 sanity() {
-  declare ok=true
-
-  echo "--- Sanity"
   $metricsWriteDatapoint "testnet-deploy net-sanity-begin=1"
 
-  declare host=${fullnodeIpList[0]}
+  declare ok=true
+  declare bootstrapLeader=${fullnodeIpList[0]}
+  declare blockstreamer=${blockstreamerIpList[0]}
+
+  echo "--- Sanity: $bootstrapLeader"
   (
     set -x
     # shellcheck disable=SC2029 # remote-client.sh args are expanded on client side intentionally
-    ssh "${sshOptions[@]}" "$host" \
+    ssh "${sshOptions[@]}" "$bootstrapLeader" \
       "./solana/net/remote/remote-sanity.sh $sanityExtraArgs \"$RUST_LOG\""
   ) || ok=false
+  $ok || exit 1
+
+  if [[ -n $blockstreamer ]]; then
+    # If there's a blockstreamer node run a reduced sanity check on it as well
+    echo "--- Sanity: $blockstreamer"
+    (
+      set -x
+      # shellcheck disable=SC2029 # remote-client.sh args are expanded on client side intentionally
+      ssh "${sshOptions[@]}" "$blockstreamer" \
+        "./solana/net/remote/remote-sanity.sh $sanityExtraArgs -o noLedgerVerify -o noValidatorSanity \"$RUST_LOG\""
+    ) || ok=false
+    $ok || exit 1
+  fi
 
   $metricsWriteDatapoint "testnet-deploy net-sanity-complete=1"
-  $ok || exit 1
 }
 
 start() {

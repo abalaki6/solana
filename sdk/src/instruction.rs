@@ -1,15 +1,13 @@
 //! Defines a composable Instruction type and a memory-efficient CompiledInstruction.
 
 use crate::pubkey::Pubkey;
-use crate::shortvec::{deserialize_vec_bytes, encode_len, serialize_vec_bytes};
+use crate::short_vec;
 use crate::system_instruction::SystemError;
-use bincode::{serialize, Error};
+use bincode::serialize;
 use serde::Serialize;
-use std::io::{Cursor, Read, Write};
-use std::mem::size_of;
 
 /// Reasons the runtime might have rejected an instruction.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub enum InstructionError {
     /// Deprecated! Use CustomError instead!
     /// The program instruction returned an error
@@ -69,19 +67,22 @@ impl InstructionError {
     }
 }
 
-/// An instruction to execute a program
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
-pub struct GenericInstruction<P, Q> {
-    /// Index into the transaction program ids array indicating the program account that executes this instruction
-    pub program_ids_index: P,
-    /// Ordered indices into the transaction keys array indicating which accounts to pass to the program
-    pub accounts: Vec<Q>,
-    /// The program input data
+#[derive(Debug, PartialEq, Clone)]
+pub struct Instruction {
+    /// Pubkey of the instruction processor that executes this instruction
+    pub program_ids_index: Pubkey,
+    /// Metadata for what accounts should be passed to the instruction processor
+    pub accounts: Vec<AccountMeta>,
+    /// Opaque data passed to the instruction processor
     pub data: Vec<u8>,
 }
 
-impl<P, Q> GenericInstruction<P, Q> {
-    pub fn new<T: Serialize>(program_ids_index: P, data: &T, accounts: Vec<Q>) -> Self {
+impl Instruction {
+    pub fn new<T: Serialize>(
+        program_ids_index: Pubkey,
+        data: &T,
+        accounts: Vec<AccountMeta>,
+    ) -> Self {
         let data = serialize(data).unwrap();
         Self {
             program_ids_index,
@@ -92,7 +93,7 @@ impl<P, Q> GenericInstruction<P, Q> {
 }
 
 /// Account metadata used to define Instructions
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct AccountMeta {
     /// An account's public key
     pub pubkey: Pubkey,
@@ -106,44 +107,30 @@ impl AccountMeta {
     }
 }
 
-pub type Instruction = GenericInstruction<Pubkey, AccountMeta>;
-pub type CompiledInstruction = GenericInstruction<u8, u8>;
+/// An instruction to execute a program
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+pub struct CompiledInstruction {
+    /// Index into the transaction program ids array indicating the program account that executes this instruction
+    pub program_ids_index: u8,
+    /// Ordered indices into the transaction keys array indicating which accounts to pass to the program
+    #[serde(with = "short_vec")]
+    pub accounts: Vec<u8>,
+    /// The program input data
+    #[serde(with = "short_vec")]
+    pub data: Vec<u8>,
+}
 
 impl CompiledInstruction {
-    pub fn serialize_with(mut writer: &mut Cursor<&mut [u8]>, ix: &Self) -> Result<(), Error> {
-        writer.write_all(&[ix.program_ids_index])?;
-        serialize_vec_bytes(&mut writer, &ix.accounts[..])?;
-        serialize_vec_bytes(&mut writer, &ix.data[..])?;
-        Ok(())
-    }
-
-    pub fn deserialize_from(mut reader: &mut Cursor<&[u8]>) -> Result<Self, Error> {
-        let mut buf = [0];
-        reader.read_exact(&mut buf)?;
-        let program_ids_index = buf[0];
-        let accounts = deserialize_vec_bytes(&mut reader)?;
-        let data = deserialize_vec_bytes(&mut reader)?;
-        Ok(CompiledInstruction {
+    pub fn new<T: Serialize>(program_ids_index: u8, data: &T, accounts: Vec<u8>) -> Self {
+        let data = serialize(data).unwrap();
+        Self {
             program_ids_index,
-            accounts,
             data,
-        })
+            accounts,
+        }
     }
 
-    pub fn serialized_size(&self) -> Result<u64, Error> {
-        let mut buf = [0; size_of::<u64>() + 1];
-        let mut wr = Cursor::new(&mut buf[..]);
-        let mut size = size_of::<u8>();
-
-        let len = self.accounts.len();
-        encode_len(&mut wr, len)?;
-        size += wr.position() as usize + (len * size_of::<u8>());
-
-        let len = self.data.len();
-        wr.set_position(0);
-        encode_len(&mut wr, len)?;
-        size += wr.position() as usize + (len * size_of::<u8>());
-
-        Ok(size as u64)
+    pub fn program_id<'a>(&self, program_ids: &'a [Pubkey]) -> &'a Pubkey {
+        &program_ids[self.program_ids_index as usize]
     }
 }

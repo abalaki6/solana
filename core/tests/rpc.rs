@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use solana::fullnode::new_fullnode_for_tests;
 use solana_client::rpc_client::get_rpc_request_str;
 use solana_sdk::hash::Hash;
-use solana_sdk::signature::{Keypair, KeypairUtil};
-use solana_sdk::system_transaction::SystemTransaction;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::system_transaction;
 use std::fs::remove_dir_all;
 use std::thread::sleep;
 use std::time::Duration;
@@ -17,7 +17,7 @@ fn test_rpc_send_tx() {
     solana_logger::setup();
 
     let (server, leader_data, alice, ledger_path) = new_fullnode_for_tests();
-    let bob_pubkey = Keypair::new().pubkey();
+    let bob_pubkey = Pubkey::new_rand();
 
     let client = reqwest::Client::new();
     let request = json!({
@@ -41,7 +41,7 @@ fn test_rpc_send_tx() {
     let blockhash = Hash::new(&blockhash_vec);
 
     info!("blockhash: {:?}", blockhash);
-    let tx = SystemTransaction::new_move(&alice, &bob_pubkey, 20, blockhash, 0);
+    let tx = system_transaction::transfer(&alice, &bob_pubkey, 20, blockhash, 0);
     let serial_tx = serialize(&tx).unwrap();
 
     let client = reqwest::Client::new();

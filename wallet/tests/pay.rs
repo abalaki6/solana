@@ -3,7 +3,7 @@ use serde_json::Value;
 use solana_client::rpc_client::RpcClient;
 use solana_drone::drone::run_local_drone;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, KeypairUtil};
+use solana_sdk::signature::KeypairUtil;
 use solana_wallet::wallet::{
     process_command, request_and_confirm_airdrop, WalletCommand, WalletConfig,
 };
@@ -21,10 +21,10 @@ fn check_balance(expected_balance: u64, client: &RpcClient, pubkey: &Pubkey) {
 #[test]
 fn test_wallet_timestamp_tx() {
     let (server, leader_data, alice, ledger_path) = new_fullnode_for_tests();
-    let bob_pubkey = Keypair::new().pubkey();
+    let bob_pubkey = Pubkey::new_rand();
 
     let (sender, receiver) = channel();
-    run_local_drone(alice, sender);
+    run_local_drone(alice, sender, None);
     let drone_addr = receiver.recv().unwrap();
 
     let rpc_client = RpcClient::new_socket(leader_data.rpc);
@@ -37,10 +37,14 @@ fn test_wallet_timestamp_tx() {
     config_witness.drone_port = drone_addr.port();
     config_witness.rpc_port = leader_data.rpc.port();
 
-    assert_ne!(config_payer.id.pubkey(), config_witness.id.pubkey());
+    assert_ne!(
+        config_payer.keypair.pubkey(),
+        config_witness.keypair.pubkey()
+    );
 
-    request_and_confirm_airdrop(&rpc_client, &drone_addr, &config_payer.id.pubkey(), 50).unwrap();
-    check_balance(50, &rpc_client, &config_payer.id.pubkey());
+    request_and_confirm_airdrop(&rpc_client, &drone_addr, &config_payer.keypair.pubkey(), 50)
+        .unwrap();
+    check_balance(50, &rpc_client, &config_payer.keypair.pubkey());
 
     // Make transaction (from config_payer to bob_pubkey) requiring timestamp from config_witness
     let date_string = "\"2018-09-19T17:30:59Z\"";
@@ -49,7 +53,7 @@ fn test_wallet_timestamp_tx() {
         10,
         bob_pubkey,
         Some(dt),
-        Some(config_witness.id.pubkey()),
+        Some(config_witness.keypair.pubkey()),
         None,
         None,
     );
@@ -62,7 +66,7 @@ fn test_wallet_timestamp_tx() {
         .expect("base58-encoded public key");
     let process_id = Pubkey::new(&process_id_vec);
 
-    check_balance(40, &rpc_client, &config_payer.id.pubkey()); // config_payer balance
+    check_balance(40, &rpc_client, &config_payer.keypair.pubkey()); // config_payer balance
     check_balance(10, &rpc_client, &process_id); // contract balance
     check_balance(0, &rpc_client, &bob_pubkey); // recipient balance
 
@@ -70,7 +74,7 @@ fn test_wallet_timestamp_tx() {
     config_witness.command = WalletCommand::TimeElapsed(bob_pubkey, process_id, dt);
     process_command(&config_witness).unwrap();
 
-    check_balance(40, &rpc_client, &config_payer.id.pubkey()); // config_payer balance
+    check_balance(40, &rpc_client, &config_payer.keypair.pubkey()); // config_payer balance
     check_balance(0, &rpc_client, &process_id); // contract balance
     check_balance(10, &rpc_client, &bob_pubkey); // recipient balance
 
@@ -81,10 +85,10 @@ fn test_wallet_timestamp_tx() {
 #[test]
 fn test_wallet_witness_tx() {
     let (server, leader_data, alice, ledger_path) = new_fullnode_for_tests();
-    let bob_pubkey = Keypair::new().pubkey();
+    let bob_pubkey = Pubkey::new_rand();
 
     let (sender, receiver) = channel();
-    run_local_drone(alice, sender);
+    run_local_drone(alice, sender, None);
     let drone_addr = receiver.recv().unwrap();
 
     let rpc_client = RpcClient::new_socket(leader_data.rpc);
@@ -97,9 +101,13 @@ fn test_wallet_witness_tx() {
     config_witness.drone_port = drone_addr.port();
     config_witness.rpc_port = leader_data.rpc.port();
 
-    assert_ne!(config_payer.id.pubkey(), config_witness.id.pubkey());
+    assert_ne!(
+        config_payer.keypair.pubkey(),
+        config_witness.keypair.pubkey()
+    );
 
-    request_and_confirm_airdrop(&rpc_client, &drone_addr, &config_payer.id.pubkey(), 50).unwrap();
+    request_and_confirm_airdrop(&rpc_client, &drone_addr, &config_payer.keypair.pubkey(), 50)
+        .unwrap();
 
     // Make transaction (from config_payer to bob_pubkey) requiring witness signature from config_witness
     config_payer.command = WalletCommand::Pay(
@@ -107,7 +115,7 @@ fn test_wallet_witness_tx() {
         bob_pubkey,
         None,
         None,
-        Some(vec![config_witness.id.pubkey()]),
+        Some(vec![config_witness.keypair.pubkey()]),
         None,
     );
     let sig_response = process_command(&config_payer);
@@ -119,7 +127,7 @@ fn test_wallet_witness_tx() {
         .expect("base58-encoded public key");
     let process_id = Pubkey::new(&process_id_vec);
 
-    check_balance(40, &rpc_client, &config_payer.id.pubkey()); // config_payer balance
+    check_balance(40, &rpc_client, &config_payer.keypair.pubkey()); // config_payer balance
     check_balance(10, &rpc_client, &process_id); // contract balance
     check_balance(0, &rpc_client, &bob_pubkey); // recipient balance
 
@@ -127,7 +135,7 @@ fn test_wallet_witness_tx() {
     config_witness.command = WalletCommand::Witness(bob_pubkey, process_id);
     process_command(&config_witness).unwrap();
 
-    check_balance(40, &rpc_client, &config_payer.id.pubkey()); // config_payer balance
+    check_balance(40, &rpc_client, &config_payer.keypair.pubkey()); // config_payer balance
     check_balance(0, &rpc_client, &process_id); // contract balance
     check_balance(10, &rpc_client, &bob_pubkey); // recipient balance
 
@@ -138,10 +146,10 @@ fn test_wallet_witness_tx() {
 #[test]
 fn test_wallet_cancel_tx() {
     let (server, leader_data, alice, ledger_path) = new_fullnode_for_tests();
-    let bob_pubkey = Keypair::new().pubkey();
+    let bob_pubkey = Pubkey::new_rand();
 
     let (sender, receiver) = channel();
-    run_local_drone(alice, sender);
+    run_local_drone(alice, sender, None);
     let drone_addr = receiver.recv().unwrap();
 
     let rpc_client = RpcClient::new_socket(leader_data.rpc);
@@ -154,9 +162,13 @@ fn test_wallet_cancel_tx() {
     config_witness.drone_port = drone_addr.port();
     config_witness.rpc_port = leader_data.rpc.port();
 
-    assert_ne!(config_payer.id.pubkey(), config_witness.id.pubkey());
+    assert_ne!(
+        config_payer.keypair.pubkey(),
+        config_witness.keypair.pubkey()
+    );
 
-    request_and_confirm_airdrop(&rpc_client, &drone_addr, &config_payer.id.pubkey(), 50).unwrap();
+    request_and_confirm_airdrop(&rpc_client, &drone_addr, &config_payer.keypair.pubkey(), 50)
+        .unwrap();
 
     // Make transaction (from config_payer to bob_pubkey) requiring witness signature from config_witness
     config_payer.command = WalletCommand::Pay(
@@ -164,8 +176,8 @@ fn test_wallet_cancel_tx() {
         bob_pubkey,
         None,
         None,
-        Some(vec![config_witness.id.pubkey()]),
-        Some(config_payer.id.pubkey()),
+        Some(vec![config_witness.keypair.pubkey()]),
+        Some(config_payer.keypair.pubkey()),
     );
     let sig_response = process_command(&config_payer).unwrap();
 
@@ -176,7 +188,7 @@ fn test_wallet_cancel_tx() {
         .expect("base58-encoded public key");
     let process_id = Pubkey::new(&process_id_vec);
 
-    check_balance(40, &rpc_client, &config_payer.id.pubkey()); // config_payer balance
+    check_balance(40, &rpc_client, &config_payer.keypair.pubkey()); // config_payer balance
     check_balance(10, &rpc_client, &process_id); // contract balance
     check_balance(0, &rpc_client, &bob_pubkey); // recipient balance
 
@@ -184,7 +196,7 @@ fn test_wallet_cancel_tx() {
     config_payer.command = WalletCommand::Cancel(process_id);
     process_command(&config_payer).unwrap();
 
-    check_balance(50, &rpc_client, &config_payer.id.pubkey()); // config_payer balance
+    check_balance(50, &rpc_client, &config_payer.keypair.pubkey()); // config_payer balance
     check_balance(0, &rpc_client, &process_id); // contract balance
     check_balance(0, &rpc_client, &bob_pubkey); // recipient balance
 

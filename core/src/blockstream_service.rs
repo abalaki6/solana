@@ -109,18 +109,19 @@ mod test {
     use super::*;
     use crate::blocktree::create_new_tmp_ledger;
     use crate::entry::{create_ticks, Entry};
+    use bincode::{deserialize, serialize};
     use chrono::{DateTime, FixedOffset};
     use serde_json::Value;
     use solana_sdk::genesis_block::GenesisBlock;
     use solana_sdk::hash::Hash;
     use solana_sdk::signature::{Keypair, KeypairUtil};
-    use solana_sdk::system_transaction::SystemTransaction;
+    use solana_sdk::system_transaction;
     use std::sync::mpsc::channel;
 
     #[test]
     fn test_blockstream_service_process_entries() {
         let ticks_per_slot = 5;
-        let leader_id = Keypair::new().pubkey();
+        let leader_id = Pubkey::new_rand();
 
         // Set up genesis block and blocktree
         let (mut genesis_block, _mint_keypair) = GenesisBlock::new(1000);
@@ -140,7 +141,13 @@ mod test {
 
         let keypair = Keypair::new();
         let mut blockhash = entries[3].hash;
-        let tx = SystemTransaction::new_account(&keypair, &keypair.pubkey(), 1, Hash::default(), 0);
+        let tx = system_transaction::create_user_account(
+            &keypair,
+            &keypair.pubkey(),
+            1,
+            Hash::default(),
+            0,
+        );
         let entry = Entry::new(&mut blockhash, 1, vec![tx]);
         blockhash = entry.hash;
         entries.push(entry);
@@ -182,13 +189,34 @@ mod test {
             assert_eq!(height, expected_tick_heights[i]);
             let entry_obj = json["entry"].clone();
             let tx = entry_obj["transactions"].as_array().unwrap();
+            let entry: Entry;
             if tx.len() == 0 {
-                // TODO: There is a bug in Transaction deserialize methods such that
-                // `serde_json::from_str` does not work for populated Entries.
-                // Remove this `if` when fixed.
-                let entry: Entry = serde_json::from_value(entry_obj).unwrap();
-                assert_eq!(entry, expected_entries[i]);
+                entry = serde_json::from_value(entry_obj).unwrap();
+            } else {
+                let entry_json = entry_obj.as_object().unwrap();
+                entry = Entry {
+                    num_hashes: entry_json.get("num_hashes").unwrap().as_u64().unwrap(),
+                    hash: serde_json::from_value(entry_json.get("hash").unwrap().clone()).unwrap(),
+                    transactions: entry_json
+                        .get("transactions")
+                        .unwrap()
+                        .as_array()
+                        .unwrap()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(j, tx)| {
+                            let tx_vec: Vec<u8> = serde_json::from_value(tx.clone()).unwrap();
+                            // Check explicitly that transaction matches bincode-serialized format
+                            assert_eq!(
+                                tx_vec,
+                                serialize(&expected_entries[i].transactions[j]).unwrap()
+                            );
+                            deserialize(&tx_vec).unwrap()
+                        })
+                        .collect(),
+                };
             }
+            assert_eq!(entry, expected_entries[i]);
         }
         for json in block_events {
             let slot = json["s"].as_u64().unwrap();

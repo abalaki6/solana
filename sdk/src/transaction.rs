@@ -1,21 +1,16 @@
 //! Defines a Transaction type to package an atomic sequence of instructions.
 
-use crate::hash::{Hash, Hasher};
-use crate::instruction::{AccountMeta, CompiledInstruction, Instruction, InstructionError};
-use crate::instruction_compiler::InstructionCompiler;
-use crate::packet::PACKET_DATA_SIZE;
+use crate::hash::Hash;
+use crate::instruction::{CompiledInstruction, Instruction, InstructionError};
+use crate::message::Message;
 use crate::pubkey::Pubkey;
-use crate::shortvec::{deserialize_vec_with, encode_len, serialize_vec_with};
+use crate::short_vec;
 use crate::signature::{KeypairUtil, Signature};
-use bincode::Error;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use serde::{Deserialize, Serialize, Serializer};
-use std::fmt;
-use std::io::{Cursor, Read, Write};
-use std::mem::size_of;
+use bincode::serialize;
+use std::result;
 
 /// Reasons a transaction might be rejected.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub enum TransactionError {
     /// This Pubkey is being processed in another transaction
     AccountInUse,
@@ -52,94 +47,63 @@ pub enum TransactionError {
     InvalidAccountIndex,
 }
 
+pub type Result<T> = result::Result<T, TransactionError>;
+
 /// An atomic transaction
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub struct Transaction {
-    /// A set of digital signatures of `account_keys`, `program_ids`, `recent_blockhash`, `fee` and `instructions`, signed by the first
+    /// A set of digital signatures of `account_keys`, `program_ids`, `recent_blockhash`, and `instructions`, signed by the first
     /// signatures.len() keys of account_keys
+    #[serde(with = "short_vec")]
     pub signatures: Vec<Signature>,
-    /// All the account keys used by this transaction
-    pub account_keys: Vec<Pubkey>,
-    /// The id of a recent ledger entry.
-    pub recent_blockhash: Hash,
-    /// The number of lamports paid for processing and storing of this transaction.
-    pub fee: u64,
-    /// All the program id keys used to execute this transaction's instructions
-    pub program_ids: Vec<Pubkey>,
-    /// Programs that will be executed in sequence and committed in one atomic transaction if all
-    /// succeed.
-    pub instructions: Vec<CompiledInstruction>,
+
+    /// The message to sign.
+    pub message: Message,
 }
 
 impl Transaction {
-    pub fn new(instructions: Vec<Instruction>) -> Self {
-        InstructionCompiler::new(instructions).compile()
+    pub fn new_unsigned(message: Message) -> Self {
+        Self {
+            signatures: Vec::with_capacity(message.num_required_signatures as usize),
+            message,
+        }
+    }
+
+    pub fn new_unsigned_instructions(instructions: Vec<Instruction>) -> Self {
+        let message = Message::new(instructions);
+        Self::new_unsigned(message)
+    }
+
+    pub fn new<T: KeypairUtil>(
+        from_keypairs: &[&T],
+        message: Message,
+        recent_blockhash: Hash,
+    ) -> Transaction {
+        let mut tx = Self::new_unsigned(message);
+        tx.sign(from_keypairs, recent_blockhash);
+        tx
     }
 
     pub fn new_signed_instructions<T: KeypairUtil>(
         from_keypairs: &[&T],
         instructions: Vec<Instruction>,
         recent_blockhash: Hash,
-        fee: u64,
     ) -> Transaction {
-        let mut tx = Self::new(instructions);
-        tx.fee = fee;
-        tx.sign(from_keypairs, recent_blockhash);
-        tx
-    }
-
-    pub fn new_with_blockhash_and_fee<T: Serialize>(
-        from_pubkey: &Pubkey,
-        transaction_keys: &[Pubkey],
-        program_id: &Pubkey,
-        data: &T,
-        recent_blockhash: Hash,
-        fee: u64,
-    ) -> Self {
-        let mut account_metas = vec![AccountMeta::new(*from_pubkey, true)];
-        for pubkey in transaction_keys {
-            account_metas.push(AccountMeta::new(*pubkey, false));
-        }
-        let instruction = Instruction::new(*program_id, data, account_metas);
-        let mut transaction = Self::new(vec![instruction]);
-        transaction.fee = fee;
-        transaction.recent_blockhash = recent_blockhash;
-        transaction
-    }
-
-    pub fn new_signed<S: Serialize, T: KeypairUtil>(
-        from_keypair: &T,
-        transaction_keys: &[Pubkey],
-        program_id: &Pubkey,
-        data: &S,
-        recent_blockhash: Hash,
-        fee: u64,
-    ) -> Self {
-        let mut transaction = Self::new_with_blockhash_and_fee(
-            &from_keypair.pubkey(),
-            transaction_keys,
-            program_id,
-            data,
-            Hash::default(),
-            fee,
-        );
-        transaction.sign(&[from_keypair], recent_blockhash);
-        transaction
+        let message = Message::new(instructions);
+        Self::new(from_keypairs, message, recent_blockhash)
     }
 
     /// Create a signed transaction
     /// * `from_keypairs` - The keys used to sign the transaction.
-    /// * `account_keys` - The keys for the transaction.  These are the program state
+    /// * `keys` - The keys for the transaction.  These are the program state
     ///    instances or lamport recipient keys.
     /// * `recent_blockhash` - The PoH hash.
-    /// * `fee` - The transaction fee.
     /// * `program_ids` - The keys that identify programs used in the `instruction` vector.
     /// * `instructions` - Instructions that will be executed atomically.
     pub fn new_with_compiled_instructions<T: KeypairUtil>(
         from_keypairs: &[&T],
         keys: &[Pubkey],
         recent_blockhash: Hash,
-        fee: u64,
         program_ids: Vec<Pubkey>,
         instructions: Vec<CompiledInstruction>,
     ) -> Self {
@@ -148,31 +112,30 @@ impl Transaction {
             .map(|keypair| keypair.pubkey())
             .collect();
         account_keys.extend_from_slice(keys);
-        let mut tx = Transaction {
-            signatures: Vec::with_capacity(from_keypairs.len()),
+        let message = Message::new_with_compiled_instructions(
+            from_keypairs.len() as u8,
             account_keys,
-            recent_blockhash: Hash::default(),
-            fee,
+            Hash::default(),
             program_ids,
             instructions,
-        };
-        tx.sign(from_keypairs, recent_blockhash);
-        tx
+        );
+        Transaction::new(from_keypairs, message, recent_blockhash)
     }
 
     pub fn data(&self, instruction_index: usize) -> &[u8] {
-        &self.instructions[instruction_index].data
+        &self.message.instructions[instruction_index].data
     }
 
     fn key_index(&self, instruction_index: usize, accounts_index: usize) -> Option<usize> {
-        self.instructions
+        self.message
+            .instructions
             .get(instruction_index)
             .and_then(|instruction| instruction.accounts.get(accounts_index))
             .map(|&account_keys_index| account_keys_index as usize)
     }
     pub fn key(&self, instruction_index: usize, accounts_index: usize) -> Option<&Pubkey> {
         self.key_index(instruction_index, accounts_index)
-            .and_then(|account_keys_index| self.account_keys.get(account_keys_index))
+            .and_then(|account_keys_index| self.message.account_keys.get(account_keys_index))
     }
     pub fn signer_key(&self, instruction_index: usize, accounts_index: usize) -> Option<&Pubkey> {
         match self.key_index(instruction_index, accounts_index) {
@@ -181,50 +144,35 @@ impl Transaction {
                 if signature_index >= self.signatures.len() {
                     return None;
                 }
-                self.account_keys.get(signature_index)
+                self.message.account_keys.get(signature_index)
             }
         }
     }
-    pub fn program_id(&self, instruction_index: usize) -> &Pubkey {
-        let program_ids_index = self.instructions[instruction_index].program_ids_index;
-        &self.program_ids[program_ids_index as usize]
+
+    /// Return a message containing all data that should be signed.
+    pub fn message(&self) -> &Message {
+        &self.message
     }
-    /// Get the transaction data to sign.
-    pub fn message(&self) -> Vec<u8> {
-        let mut buf = vec![0u8; PACKET_DATA_SIZE];
-        let mut wr = Cursor::new(&mut buf[..]);
-        serialize_vec_with(&mut wr, &self.account_keys, Transaction::serialize_pubkey)
-            .expect("serialize account_keys");
-        wr.write_all(self.recent_blockhash.as_ref())
-            .expect("serialize recent_blockhash");
-        wr.write_u64::<LittleEndian>(self.fee)
-            .expect("serialize fee");
-        serialize_vec_with(&mut wr, &self.program_ids, Transaction::serialize_pubkey)
-            .expect("serialize program_ids");
-        serialize_vec_with(
-            &mut wr,
-            &self.instructions,
-            CompiledInstruction::serialize_with,
-        )
-        .expect("serialize instructions");
-        let len = wr.position() as usize;
-        wr.into_inner()[..len].to_vec()
+
+    /// Return the serialized message data to sign.
+    pub fn message_data(&self) -> Vec<u8> {
+        serialize(&self.message()).unwrap()
     }
 
     /// Sign this transaction.
     pub fn sign_unchecked<T: KeypairUtil>(&mut self, keypairs: &[&T], recent_blockhash: Hash) {
-        self.recent_blockhash = recent_blockhash;
-        let message = self.message();
+        self.message.recent_blockhash = recent_blockhash;
+        let message_data = self.message_data();
         self.signatures = keypairs
             .iter()
-            .map(|keypair| keypair.sign_message(&message))
+            .map(|keypair| keypair.sign_message(&message_data))
             .collect();
     }
 
     /// Check keys and keypair lengths, then sign this transaction.
-    /// Note: this presumes signatures.capacity() was set to the number of required signatures.
     pub fn sign<T: KeypairUtil>(&mut self, keypairs: &[&T], recent_blockhash: Hash) {
-        let signed_keys = &self.account_keys[0..self.signatures.capacity()];
+        let signed_keys =
+            &self.message.account_keys[0..self.message.num_required_signatures as usize];
         for (i, keypair) in keypairs.iter().enumerate() {
             assert_eq!(keypair.pubkey(), signed_keys[i], "keypair-pubkey mismatch");
         }
@@ -233,192 +181,45 @@ impl Transaction {
         self.sign_unchecked(keypairs, recent_blockhash);
     }
 
-    /// Verify only the transaction signature.
-    pub fn verify_signature(&self) -> bool {
-        self.signatures
-            .iter()
-            .all(|s| s.verify(&self.from().as_ref(), &self.message()))
-    }
-
     /// Verify that references in the instructions are valid
     pub fn verify_refs(&self) -> bool {
-        for instruction in &self.instructions {
-            if (instruction.program_ids_index as usize) >= self.program_ids.len() {
+        let message = self.message();
+        for instruction in &message.instructions {
+            if (instruction.program_ids_index as usize) >= message.program_ids().len() {
                 return false;
             }
             for account_index in &instruction.accounts {
-                if (*account_index as usize) >= self.account_keys.len() {
+                if (*account_index as usize) >= message.account_keys.len() {
                     return false;
                 }
             }
         }
         true
     }
-
-    pub fn from(&self) -> &Pubkey {
-        &self.account_keys[0]
-    }
-
-    // a hash of a slice of transactions only needs to hash the signatures
-    pub fn hash(transactions: &[Transaction]) -> Hash {
-        let mut hasher = Hasher::default();
-        transactions.iter().for_each(|tx| {
-            if !tx.signatures.is_empty() {
-                hasher.hash(&tx.signatures[0].as_ref());
-            }
-        });
-        hasher.result()
-    }
-
-    pub fn serialized_size(&self) -> Result<u64, Error> {
-        let mut buf = [0u8; size_of::<u64>() + 1];
-        let mut wr = Cursor::new(&mut buf[..]);
-        let mut size = size_of::<u64>();
-
-        let len = self.signatures.len();
-        encode_len(&mut wr, len)?;
-        size += wr.position() as usize + (len * size_of::<Signature>());
-
-        let len = self.account_keys.len();
-        wr.set_position(0);
-        encode_len(&mut wr, len)?;
-        size += wr.position() as usize + (len * size_of::<Pubkey>());
-
-        size += size_of::<Hash>();
-
-        size += size_of::<u64>();
-
-        let len = self.program_ids.len();
-        wr.set_position(0);
-        encode_len(&mut wr, len)?;
-        size += wr.position() as usize + (len * size_of::<Pubkey>());
-
-        let len = self.instructions.len();
-        wr.set_position(0);
-        encode_len(&mut wr, len)?;
-        size += wr.position() as usize;
-        let inst_size: u64 = self
-            .instructions
-            .iter()
-            .map(|ix| ix.serialized_size().unwrap())
-            .sum();
-        Ok(size as u64 + inst_size)
-    }
-
-    fn serialize_signature(writer: &mut Cursor<&mut [u8]>, sig: &Signature) -> Result<(), Error> {
-        writer.write_all(sig.as_ref())?;
-        Ok(())
-    }
-
-    fn serialize_pubkey(writer: &mut Cursor<&mut [u8]>, key: &Pubkey) -> Result<(), Error> {
-        writer.write_all(key.as_ref())?;
-        Ok(())
-    }
-
-    fn deserialize_signature(reader: &mut Cursor<&[u8]>) -> Result<Signature, Error> {
-        let mut buf = [0; size_of::<Signature>()];
-        reader.read_exact(&mut buf)?;
-        Ok(Signature::new(&buf))
-    }
-
-    fn deserialize_pubkey(reader: &mut Cursor<&[u8]>) -> Result<Pubkey, Error> {
-        let mut buf = [0; size_of::<Pubkey>()];
-        reader.read_exact(&mut buf)?;
-        Ok(Pubkey::new(&buf))
-    }
-}
-
-impl Serialize for Transaction {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use serde::ser::Error;
-        let mut buf = vec![0u8; self.serialized_size().unwrap() as usize];
-        let mut wr = Cursor::new(&mut buf[..]);
-        serialize_vec_with(&mut wr, &self.signatures, Transaction::serialize_signature)
-            .map_err(Error::custom)?;
-        serialize_vec_with(&mut wr, &self.account_keys, Transaction::serialize_pubkey)
-            .map_err(Error::custom)?;
-        wr.write_all(self.recent_blockhash.as_ref())
-            .map_err(Error::custom)?;
-        wr.write_u64::<LittleEndian>(self.fee)
-            .map_err(Error::custom)?;
-        serialize_vec_with(&mut wr, &self.program_ids, Transaction::serialize_pubkey)
-            .map_err(Error::custom)?;
-        serialize_vec_with(
-            &mut wr,
-            &self.instructions,
-            CompiledInstruction::serialize_with,
-        )
-        .map_err(Error::custom)?;
-        let size = wr.position() as usize;
-        serializer.serialize_bytes(&wr.into_inner()[..size])
-    }
-}
-
-struct TransactionVisitor;
-impl<'a> serde::de::Visitor<'a> for TransactionVisitor {
-    type Value = Transaction;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("Expecting Instruction")
-    }
-    fn visit_bytes<E>(self, data: &[u8]) -> Result<Transaction, E>
-    where
-        E: serde::de::Error,
-    {
-        use serde::de::Error;
-        let mut rd = Cursor::new(&data[..]);
-        let signatures: Vec<Signature> =
-            deserialize_vec_with(&mut rd, Transaction::deserialize_signature)
-                .map_err(Error::custom)?;
-        let account_keys: Vec<Pubkey> =
-            deserialize_vec_with(&mut rd, Transaction::deserialize_pubkey)
-                .map_err(Error::custom)?;
-        let mut buf = [0; size_of::<Hash>()];
-        rd.read_exact(&mut buf).map_err(Error::custom)?;
-        let recent_blockhash: Hash = Hash::new(&buf);
-        let fee = rd.read_u64::<LittleEndian>().map_err(Error::custom)?;
-        let program_ids: Vec<Pubkey> =
-            deserialize_vec_with(&mut rd, Transaction::deserialize_pubkey)
-                .map_err(Error::custom)?;
-        let instructions: Vec<CompiledInstruction> =
-            deserialize_vec_with(&mut rd, CompiledInstruction::deserialize_from)
-                .map_err(Error::custom)?;
-        Ok(Transaction {
-            signatures,
-            account_keys,
-            recent_blockhash,
-            fee,
-            program_ids,
-            instructions,
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for Transaction {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: ::serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_bytes(TransactionVisitor)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instruction::AccountMeta;
     use crate::signature::Keypair;
-    use bincode::{deserialize, serialize};
+    use crate::system_instruction;
+    use bincode::{deserialize, serialize, serialized_size};
+    use std::mem::size_of;
+
+    fn get_program_id(tx: &Transaction, instruction_index: usize) -> &Pubkey {
+        let message = tx.message();
+        let instruction = &message.instructions[instruction_index];
+        instruction.program_id(message.program_ids())
+    }
 
     #[test]
     fn test_refs() {
         let key = Keypair::new();
-        let key1 = Keypair::new().pubkey();
-        let key2 = Keypair::new().pubkey();
-        let prog1 = Keypair::new().pubkey();
-        let prog2 = Keypair::new().pubkey();
+        let key1 = Pubkey::new_rand();
+        let key2 = Pubkey::new_rand();
+        let prog1 = Pubkey::new_rand();
+        let prog2 = Pubkey::new_rand();
         let instructions = vec![
             CompiledInstruction::new(0, &(), vec![0, 1]),
             CompiledInstruction::new(1, &(), vec![0, 2]),
@@ -427,7 +228,6 @@ mod tests {
             &[&key],
             &[key1, key2],
             Hash::default(),
-            0,
             vec![prog1, prog2],
             instructions,
         );
@@ -451,8 +251,8 @@ mod tests {
         assert_eq!(tx.key(0, 2), None);
         assert_eq!(tx.signer_key(0, 2), None);
 
-        assert_eq!(*tx.program_id(0), prog1);
-        assert_eq!(*tx.program_id(1), prog2);
+        assert_eq!(*get_program_id(&tx, 0), prog1);
+        assert_eq!(*get_program_id(&tx, 1), prog2);
     }
     #[test]
     fn test_refs_invalid_program_id() {
@@ -462,7 +262,6 @@ mod tests {
             &[&key],
             &[],
             Hash::default(),
-            0,
             vec![],
             instructions,
         );
@@ -476,65 +275,14 @@ mod tests {
             &[&key],
             &[],
             Hash::default(),
-            0,
             vec![Pubkey::default()],
             instructions,
         );
-        assert_eq!(*tx.program_id(0), Pubkey::default());
+        assert_eq!(*get_program_id(&tx, 0), Pubkey::default());
         assert!(!tx.verify_refs());
     }
 
-    #[test]
-    fn test_transaction_serialize() {
-        let keypair = Keypair::new();
-        let program_id = Pubkey::new(&[4; 32]);
-        let to = Pubkey::new(&[5; 32]);
-        let tx = Transaction::new_signed(
-            &keypair,
-            &[keypair.pubkey(), to],
-            &program_id,
-            &(1u8, 2u8, 3u8),
-            Hash::default(),
-            99,
-        );
-
-        let ser = serialize(&tx).unwrap();
-        let deser = deserialize(&ser).unwrap();
-        assert_eq!(tx, deser);
-    }
-
-    #[test]
-    fn test_transaction_serialized_size() {
-        let keypair = Keypair::new();
-        let program_id = Pubkey::new(&[4; 32]);
-        let to = Pubkey::new(&[5; 32]);
-        let tx = Transaction::new_signed(
-            &keypair,
-            &[keypair.pubkey(), to],
-            &program_id,
-            &(1u8, 2u8, 3u8),
-            Hash::default(),
-            99,
-        );
-        let req_size = size_of::<u64>()
-            + 1
-            + (tx.signatures.len() * size_of::<Signature>())
-            + 1
-            + (tx.account_keys.len() * size_of::<Pubkey>())
-            + size_of::<Hash>()
-            + size_of::<u64>()
-            + 1
-            + (tx.program_ids.len() * size_of::<Pubkey>())
-            + 1
-            + tx.instructions[0].serialized_size().unwrap() as usize;
-        let size = tx.serialized_size().unwrap() as usize;
-        assert_eq!(req_size, size);
-    }
-
-    /// Detect binary changes in the serialized transaction data, which could have a downstream
-    /// affect on SDKs and DApps
-    #[test]
-    fn test_sdk_serialize() {
+    fn create_sample_transaction() -> Transaction {
         use untrusted::Input;
         let keypair = Keypair::from_pkcs8(Input::from(&[
             48, 83, 2, 1, 1, 48, 5, 6, 3, 43, 101, 112, 4, 34, 4, 32, 255, 101, 36, 24, 124, 23,
@@ -553,28 +301,90 @@ mod tests {
             2, 2, 2, 4, 5, 6, 7, 8, 9, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 9, 8, 7, 6, 5, 4,
             2, 2, 2,
         ]);
+        let account_metas = vec![
+            AccountMeta::new(keypair.pubkey(), true),
+            AccountMeta::new(to, false),
+        ];
+        let instruction = Instruction::new(program_id, &(1u8, 2u8, 3u8), account_metas);
+        let message = Message::new(vec![instruction]);
+        Transaction::new(&[&keypair], message, Hash::default())
+    }
 
-        let tx = Transaction::new_signed(
-            &keypair,
-            &[to],
-            &program_id,
-            &(1u8, 2u8, 3u8),
-            Hash::default(),
-            99,
-        );
+    #[test]
+    fn test_transaction_serialize() {
+        let tx = create_sample_transaction();
+        let ser = serialize(&tx).unwrap();
+        let deser = deserialize(&ser).unwrap();
+        assert_eq!(tx, deser);
+    }
+
+    /// Detect changes to the serialized size of payment transactions, which affects TPS.
+    #[test]
+    fn test_transaction_minimum_serialized_size() {
+        let alice_keypair = Keypair::new();
+        let alice_pubkey = alice_keypair.pubkey();
+        let bob_pubkey = Pubkey::new_rand();
+        let ix = system_instruction::transfer(&alice_pubkey, &bob_pubkey, 42);
+
+        let expected_data_size = size_of::<u32>() + size_of::<u64>();
+        assert_eq!(expected_data_size, 12);
         assert_eq!(
-            serialize(&tx).unwrap(),
+            ix.data.len(),
+            expected_data_size,
+            "unexpected system instruction size"
+        );
+
+        let expected_instruction_size = 1 + 1 + ix.accounts.len() + 1 + expected_data_size;
+        assert_eq!(expected_instruction_size, 17);
+
+        let message = Message::new(vec![ix]);
+        assert_eq!(
+            serialized_size(&message.instructions[0]).unwrap() as usize,
+            expected_instruction_size,
+            "unexpected Instruction::serialized_size"
+        );
+
+        let tx = Transaction::new(&[&alice_keypair], message, Hash::default());
+
+        let len_size = 1;
+        let num_required_sigs_size = 1;
+        let blockhash_size = size_of::<Hash>();
+        let expected_transaction_size = len_size
+            + (tx.signatures.len() * size_of::<Signature>())
+            + num_required_sigs_size
+            + len_size
+            + (tx.message.account_keys.len() * size_of::<Pubkey>())
+            + blockhash_size
+            + len_size
+            + (tx.message.program_ids().len() * size_of::<Pubkey>())
+            + len_size
+            + expected_instruction_size;
+        assert_eq!(expected_transaction_size, 214);
+
+        assert_eq!(
+            serialized_size(&tx).unwrap() as usize,
+            expected_transaction_size,
+            "unexpected serialized transaction size"
+        );
+    }
+
+    /// Detect binary changes in the serialized transaction data, which could have a downstream
+    /// affect on SDKs and DApps
+    #[test]
+    fn test_sdk_serialize() {
+        assert_eq!(
+            serialize(&create_sample_transaction()).unwrap(),
             vec![
-                212, 0, 0, 0, 0, 0, 0, 0, 1, 107, 231, 179, 42, 11, 220, 153, 173, 229, 29, 51,
-                218, 98, 26, 46, 164, 248, 228, 118, 244, 191, 192, 198, 228, 190, 119, 21, 52, 66,
-                25, 124, 247, 192, 73, 48, 231, 2, 70, 34, 82, 133, 137, 148, 66, 73, 231, 72, 195,
-                100, 133, 214, 2, 168, 108, 252, 200, 83, 99, 105, 51, 216, 145, 30, 14, 2, 36,
-                100, 158, 252, 33, 161, 97, 185, 62, 89, 99, 195, 250, 249, 187, 189, 171, 118,
-                241, 90, 248, 14, 68, 219, 231, 62, 157, 5, 142, 27, 210, 117, 1, 1, 1, 4, 5, 6, 7,
-                8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 8, 7, 6, 5, 4, 1, 1, 1, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 99, 0, 0, 0, 0, 0, 0, 0, 1, 2, 2, 2, 4, 5, 6, 7, 8, 9, 1, 1, 1, 1, 1, 1, 1, 1,
-                1, 1, 1, 1, 1, 1, 9, 8, 7, 6, 5, 4, 2, 2, 2, 1, 0, 2, 0, 1, 3, 1, 2, 3
+                1, 0, 30, 236, 164, 222, 77, 89, 244, 36, 92, 35, 192, 25, 100, 18, 61, 155, 111,
+                89, 189, 154, 90, 255, 217, 203, 105, 50, 243, 208, 179, 89, 146, 122, 222, 91, 34,
+                106, 93, 82, 147, 213, 223, 184, 32, 204, 61, 227, 227, 41, 211, 67, 5, 156, 236,
+                251, 178, 235, 234, 174, 123, 15, 26, 145, 3, 1, 2, 36, 100, 158, 252, 33, 161, 97,
+                185, 62, 89, 99, 195, 250, 249, 187, 189, 171, 118, 241, 90, 248, 14, 68, 219, 231,
+                62, 157, 5, 142, 27, 210, 117, 1, 1, 1, 4, 5, 6, 7, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+                9, 9, 9, 9, 9, 9, 9, 8, 7, 6, 5, 4, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 2, 2, 4, 5, 6, 7, 8,
+                9, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 9, 8, 7, 6, 5, 4, 2, 2, 2, 1, 0, 2, 0,
+                1, 3, 1, 2, 3
             ]
         );
     }
@@ -583,7 +393,7 @@ mod tests {
     #[should_panic]
     fn test_transaction_missing_key() {
         let keypair = Keypair::new();
-        Transaction::new(vec![]).sign(&[&keypair], Hash::default());
+        Transaction::new_unsigned_instructions(vec![]).sign(&[&keypair], Hash::default());
     }
 
     #[test]
@@ -593,7 +403,8 @@ mod tests {
         let keypair0 = Keypair::new();
         let id0 = keypair0.pubkey();
         let ix = Instruction::new(program_id, &0, vec![AccountMeta::new(id0, true)]);
-        Transaction::new(vec![ix]).sign(&Vec::<&Keypair>::new(), Hash::default());
+        Transaction::new_unsigned_instructions(vec![ix])
+            .sign(&Vec::<&Keypair>::new(), Hash::default());
     }
 
     #[test]
@@ -603,7 +414,7 @@ mod tests {
         let keypair0 = Keypair::new();
         let wrong_id = Pubkey::default();
         let ix = Instruction::new(program_id, &0, vec![AccountMeta::new(wrong_id, true)]);
-        Transaction::new(vec![ix]).sign(&[&keypair0], Hash::default());
+        Transaction::new_unsigned_instructions(vec![ix]).sign(&[&keypair0], Hash::default());
     }
 
     #[test]
@@ -612,8 +423,11 @@ mod tests {
         let keypair0 = Keypair::new();
         let id0 = keypair0.pubkey();
         let ix = Instruction::new(program_id, &0, vec![AccountMeta::new(id0, true)]);
-        let mut tx = Transaction::new(vec![ix]);
+        let mut tx = Transaction::new_unsigned_instructions(vec![ix]);
         tx.sign(&[&keypair0], Hash::default());
-        assert_eq!(tx.instructions[0], CompiledInstruction::new(0, &0, vec![0]));
+        assert_eq!(
+            tx.message.instructions[0],
+            CompiledInstruction::new(0, &0, vec![0])
+        );
     }
 }

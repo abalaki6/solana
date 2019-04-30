@@ -42,7 +42,8 @@ else
     if [[ -n $NDEBUG ]]; then
       maybe_release=--release
     fi
-    printf "cargo run $maybe_release $maybe_package --bin solana-%s %s -- " "$program" "$features"
+    declare manifest_path="--manifest-path=$program/Cargo.toml"
+    printf "cargo run $manifest_path $maybe_release $maybe_package --bin solana-%s %s -- " "$program" "$features"
   }
   if [[ -n $SOLANA_CUDA ]]; then
     # shellcheck disable=2154 # 'here' is referenced but not assigned
@@ -58,13 +59,14 @@ else
 fi
 
 solana_bench_tps=$(solana_program bench-tps)
-solana_wallet=$(solana_program wallet)
 solana_drone=$(solana_program drone)
 solana_fullnode=$(solana_program fullnode)
 solana_fullnode_cuda=$(solana_program fullnode-cuda)
 solana_genesis=$(solana_program genesis)
+solana_gossip=$(solana_program gossip)
 solana_keygen=$(solana_program keygen)
 solana_ledger_tool=$(solana_program ledger-tool)
+solana_wallet=$(solana_program wallet)
 
 export RUST_LOG=${RUST_LOG:-solana=info} # if RUST_LOG is unset, default to info
 export RUST_BACKTRACE=1
@@ -86,16 +88,16 @@ tune_system() {
       # test the existence of the sysctls before trying to set them
       # go ahead and return true and don't exit if these calls fail
       sysctl net.core.rmem_max 2>/dev/null 1>/dev/null &&
-          sudo sysctl -w net.core.rmem_max=1610612736 1>/dev/null 2>/dev/null
+          sudo sysctl -w net.core.rmem_max=161061273 1>/dev/null 2>/dev/null
 
       sysctl net.core.rmem_default 2>/dev/null 1>/dev/null &&
-          sudo sysctl -w net.core.rmem_default=1610612736 1>/dev/null 2>/dev/null
+          sudo sysctl -w net.core.rmem_default=161061273 1>/dev/null 2>/dev/null
 
       sysctl net.core.wmem_max 2>/dev/null 1>/dev/null &&
-          sudo sysctl -w net.core.wmem_max=1610612736 1>/dev/null 2>/dev/null
+          sudo sysctl -w net.core.wmem_max=161061273 1>/dev/null 2>/dev/null
 
       sysctl net.core.wmem_default 2>/dev/null 1>/dev/null &&
-          sudo sysctl -w net.core.wmem_default=1610612736 1>/dev/null 2>/dev/null
+          sudo sysctl -w net.core.wmem_default=161061273 1>/dev/null 2>/dev/null
     ) || true
   fi
 

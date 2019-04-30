@@ -8,13 +8,12 @@ use bincode::{deserialize, serialize};
 use bs58;
 use jsonrpc_core::{Error, Metadata, Result};
 use jsonrpc_derive::rpc;
-use solana_client::rpc_signature_status::RpcSignatureStatus;
 use solana_drone::drone::request_airdrop_transaction;
-use solana_runtime::bank;
+use solana_runtime::bank::Bank;
 use solana_sdk::account::Account;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_sdk::transaction::{Transaction, TransactionError};
+use solana_sdk::transaction::{self, Transaction};
 use std::mem;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,7 +45,7 @@ pub struct JsonRpcRequestProcessor {
 }
 
 impl JsonRpcRequestProcessor {
-    fn bank(&self) -> Arc<bank::Bank> {
+    fn bank(&self) -> Arc<Bank> {
         self.bank_forks.read().unwrap().working_bank()
     }
 
@@ -79,7 +78,7 @@ impl JsonRpcRequestProcessor {
         bs58::encode(id).into_string()
     }
 
-    pub fn get_signature_status(&self, signature: Signature) -> Option<bank::Result<()>> {
+    pub fn get_signature_status(&self, signature: Signature) -> Option<transaction::Result<()>> {
         self.get_signature_confirmation_status(signature)
             .map(|x| x.1)
     }
@@ -92,7 +91,7 @@ impl JsonRpcRequestProcessor {
     pub fn get_signature_confirmation_status(
         &self,
         signature: Signature,
-    ) -> Option<(usize, bank::Result<()>)> {
+    ) -> Option<(usize, transaction::Result<()>)> {
         self.bank().get_signature_confirmation_status(&signature)
     }
 
@@ -172,7 +171,7 @@ pub struct Meta {
 }
 impl Metadata for Meta {}
 
-#[rpc]
+#[rpc(server)]
 pub trait RpcSol {
     type Metadata;
 
@@ -189,7 +188,11 @@ pub trait RpcSol {
     fn get_recent_blockhash(&self, _: Self::Metadata) -> Result<String>;
 
     #[rpc(meta, name = "getSignatureStatus")]
-    fn get_signature_status(&self, _: Self::Metadata, _: String) -> Result<RpcSignatureStatus>;
+    fn get_signature_status(
+        &self,
+        _: Self::Metadata,
+        _: String,
+    ) -> Result<Option<transaction::Result<()>>>;
 
     #[rpc(meta, name = "getTransactionCount")]
     fn get_transaction_count(&self, _: Self::Metadata) -> Result<u64>;
@@ -221,14 +224,14 @@ pub trait RpcSol {
         &self,
         _: Self::Metadata,
         _: String,
-    ) -> Result<usize>;
+    ) -> Result<Option<usize>>;
 
     #[rpc(meta, name = "getSignatureConfirmation")]
     fn get_signature_confirmation(
         &self,
         _: Self::Metadata,
         _: String,
-    ) -> Result<(usize, RpcSignatureStatus)>;
+    ) -> Result<Option<(usize, transaction::Result<()>)>>;
 }
 
 pub struct RpcSolImpl;
@@ -236,13 +239,17 @@ impl RpcSol for RpcSolImpl {
     type Metadata = Meta;
 
     fn confirm_transaction(&self, meta: Self::Metadata, id: String) -> Result<bool> {
-        info!("confirm_transaction rpc request received: {:?}", id);
-        self.get_signature_status(meta, id)
-            .map(|status| status == RpcSignatureStatus::Confirmed)
+        debug!("confirm_transaction rpc request received: {:?}", id);
+        self.get_signature_status(meta, id).map(|status_option| {
+            if status_option.is_none() {
+                return false;
+            }
+            status_option.unwrap().is_ok()
+        })
     }
 
     fn get_account_info(&self, meta: Self::Metadata, id: String) -> Result<Account> {
-        info!("get_account_info rpc request received: {:?}", id);
+        debug!("get_account_info rpc request received: {:?}", id);
         let pubkey = verify_pubkey(id)?;
         meta.request_processor
             .read()
@@ -251,13 +258,13 @@ impl RpcSol for RpcSolImpl {
     }
 
     fn get_balance(&self, meta: Self::Metadata, id: String) -> Result<u64> {
-        info!("get_balance rpc request received: {:?}", id);
+        debug!("get_balance rpc request received: {:?}", id);
         let pubkey = verify_pubkey(id)?;
         Ok(meta.request_processor.read().unwrap().get_balance(&pubkey))
     }
 
     fn get_recent_blockhash(&self, meta: Self::Metadata) -> Result<String> {
-        info!("get_recent_blockhash rpc request received");
+        debug!("get_recent_blockhash rpc request received");
         Ok(meta
             .request_processor
             .read()
@@ -265,61 +272,40 @@ impl RpcSol for RpcSolImpl {
             .get_recent_blockhash())
     }
 
-    fn get_signature_status(&self, meta: Self::Metadata, id: String) -> Result<RpcSignatureStatus> {
-        self.get_signature_confirmation(meta, id).map(|x| x.1)
+    fn get_signature_status(
+        &self,
+        meta: Self::Metadata,
+        id: String,
+    ) -> Result<Option<transaction::Result<()>>> {
+        self.get_signature_confirmation(meta, id)
+            .map(|res| res.map(|x| x.1))
     }
 
     fn get_num_blocks_since_signature_confirmation(
         &self,
         meta: Self::Metadata,
         id: String,
-    ) -> Result<usize> {
-        self.get_signature_confirmation(meta, id).map(|x| x.0)
+    ) -> Result<Option<usize>> {
+        self.get_signature_confirmation(meta, id)
+            .map(|res| res.map(|x| x.0))
     }
 
     fn get_signature_confirmation(
         &self,
         meta: Self::Metadata,
         id: String,
-    ) -> Result<(usize, RpcSignatureStatus)> {
-        info!("get_signature_confirmation rpc request received: {:?}", id);
+    ) -> Result<Option<(usize, transaction::Result<()>)>> {
+        debug!("get_signature_confirmation rpc request received: {:?}", id);
         let signature = verify_signature(&id)?;
-        let res = meta
+        Ok(meta
             .request_processor
             .read()
             .unwrap()
-            .get_signature_confirmation_status(signature);
-
-        let status = {
-            if let Some((count, res)) = res {
-                let res = match res {
-                    Ok(_) => RpcSignatureStatus::Confirmed,
-                    Err(TransactionError::AccountInUse) => RpcSignatureStatus::AccountInUse,
-                    Err(TransactionError::AccountLoadedTwice) => {
-                        RpcSignatureStatus::AccountLoadedTwice
-                    }
-                    Err(TransactionError::InstructionError(_, _)) => {
-                        RpcSignatureStatus::ProgramRuntimeError
-                    }
-                    Err(err) => {
-                        trace!("mapping {:?} to GenericFailure", err);
-                        RpcSignatureStatus::GenericFailure
-                    }
-                };
-                (count, res)
-            } else {
-                (0, RpcSignatureStatus::SignatureNotFound)
-            }
-        };
-        info!(
-            "get_signature_confirmation rpc request status: {:?}",
-            status
-        );
-        Ok(status)
+            .get_signature_confirmation_status(signature))
     }
 
     fn get_transaction_count(&self, meta: Self::Metadata) -> Result<u64> {
-        info!("get_transaction_count rpc request received");
+        debug!("get_transaction_count rpc request received");
         meta.request_processor
             .read()
             .unwrap()
@@ -453,8 +439,10 @@ mod tests {
     use jsonrpc_core::{MetaIoHandler, Response};
     use solana_sdk::genesis_block::GenesisBlock;
     use solana_sdk::hash::{hash, Hash};
+    use solana_sdk::instruction::InstructionError;
     use solana_sdk::signature::{Keypair, KeypairUtil};
-    use solana_sdk::system_transaction::SystemTransaction;
+    use solana_sdk::system_transaction;
+    use solana_sdk::transaction::TransactionError;
     use std::thread;
 
     fn start_rpc_handler_with_tx(pubkey: &Pubkey) -> (MetaIoHandler<Meta>, Meta, Hash, Keypair) {
@@ -463,8 +451,11 @@ mod tests {
         let exit = Arc::new(AtomicBool::new(false));
 
         let blockhash = bank.last_blockhash();
-        let tx = SystemTransaction::new_move(&alice, pubkey, 20, blockhash, 0);
+        let tx = system_transaction::transfer(&alice, pubkey, 20, blockhash, 0);
         bank.process_transaction(&tx).expect("process transaction");
+
+        let tx = system_transaction::transfer(&alice, &alice.pubkey(), 20, blockhash, 0);
+        let _ = bank.process_transaction(&tx);
 
         let request_processor = Arc::new(RwLock::new(JsonRpcRequestProcessor::new(
             StorageState::default(),
@@ -491,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_rpc_request_processor_new() {
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let exit = Arc::new(AtomicBool::new(false));
         let (bank_forks, alice) = new_bank_forks();
         let bank = bank_forks.read().unwrap().working_bank();
@@ -503,7 +494,7 @@ mod tests {
         );
         thread::spawn(move || {
             let blockhash = bank.last_blockhash();
-            let tx = SystemTransaction::new_move(&alice, &bob_pubkey, 20, blockhash, 0);
+            let tx = system_transaction::transfer(&alice, &bob_pubkey, 20, blockhash, 0);
             bank.process_transaction(&tx).expect("process transaction");
         })
         .join()
@@ -513,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_rpc_get_balance() {
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let (io, meta, _blockhash, _alice) = start_rpc_handler_with_tx(&bob_pubkey);
 
         let req = format!(
@@ -531,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_rpc_get_tx_count() {
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let (io, meta, _blockhash, _alice) = start_rpc_handler_with_tx(&bob_pubkey);
 
         let req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"getTransactionCount"}}"#);
@@ -546,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_rpc_get_account_info() {
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let (io, meta, _blockhash, _alice) = start_rpc_handler_with_tx(&bob_pubkey);
 
         let req = format!(
@@ -573,9 +564,9 @@ mod tests {
 
     #[test]
     fn test_rpc_confirm_tx() {
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let (io, meta, blockhash, alice) = start_rpc_handler_with_tx(&bob_pubkey);
-        let tx = SystemTransaction::new_move(&alice, &bob_pubkey, 20, blockhash, 0);
+        let tx = system_transaction::transfer(&alice, &bob_pubkey, 20, blockhash, 0);
 
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"confirmTransaction","params":["{}"]}}"#,
@@ -592,32 +583,63 @@ mod tests {
 
     #[test]
     fn test_rpc_get_signature_status() {
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let (io, meta, blockhash, alice) = start_rpc_handler_with_tx(&bob_pubkey);
-        let tx = SystemTransaction::new_move(&alice, &bob_pubkey, 20, blockhash, 0);
+        let tx = system_transaction::transfer(&alice, &bob_pubkey, 20, blockhash, 0);
 
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"getSignatureStatus","params":["{}"]}}"#,
             tx.signatures[0]
         );
         let res = io.handle_request_sync(&req, meta.clone());
-        let expected = format!(r#"{{"jsonrpc":"2.0","result":"Confirmed","id":1}}"#);
+        let expected_res: Option<transaction::Result<()>> = Some(Ok(()));
+        let expected = json!({
+            "jsonrpc": "2.0",
+            "result": expected_res,
+            "id": 1
+        });
         let expected: Response =
-            serde_json::from_str(&expected).expect("expected response deserialization");
+            serde_json::from_value(expected).expect("expected response deserialization");
         let result: Response = serde_json::from_str(&res.expect("actual response"))
             .expect("actual response deserialization");
         assert_eq!(expected, result);
 
         // Test getSignatureStatus request on unprocessed tx
-        let tx = SystemTransaction::new_move(&alice, &bob_pubkey, 10, blockhash, 0);
+        let tx = system_transaction::transfer(&alice, &bob_pubkey, 10, blockhash, 0);
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"getSignatureStatus","params":["{}"]}}"#,
+            tx.signatures[0]
+        );
+        let res = io.handle_request_sync(&req, meta.clone());
+        let expected_res: Option<String> = None;
+        let expected = json!({
+            "jsonrpc": "2.0",
+            "result": expected_res,
+            "id": 1
+        });
+        let expected: Response =
+            serde_json::from_value(expected).expect("expected response deserialization");
+        let result: Response = serde_json::from_str(&res.expect("actual response"))
+            .expect("actual response deserialization");
+        assert_eq!(expected, result);
+
+        // Test getSignatureStatus request on a TransactionError
+        let tx = system_transaction::transfer(&alice, &alice.pubkey(), 20, blockhash, 0);
         let req = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"getSignatureStatus","params":["{}"]}}"#,
             tx.signatures[0]
         );
         let res = io.handle_request_sync(&req, meta);
-        let expected = format!(r#"{{"jsonrpc":"2.0","result":"SignatureNotFound","id":1}}"#);
+        let expected_res: Option<transaction::Result<()>> = Some(Err(
+            TransactionError::InstructionError(0, InstructionError::DuplicateAccountIndex),
+        ));
+        let expected = json!({
+            "jsonrpc": "2.0",
+            "result": expected_res,
+            "id": 1
+        });
         let expected: Response =
-            serde_json::from_str(&expected).expect("expected response deserialization");
+            serde_json::from_value(expected).expect("expected response deserialization");
         let result: Response = serde_json::from_str(&res.expect("actual response"))
             .expect("actual response deserialization");
         assert_eq!(expected, result);
@@ -625,7 +647,7 @@ mod tests {
 
     #[test]
     fn test_rpc_get_recent_blockhash() {
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let (io, meta, blockhash, _alice) = start_rpc_handler_with_tx(&bob_pubkey);
 
         let req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"getRecentBlockhash"}}"#);
@@ -640,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_rpc_fail_request_airdrop() {
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         let (io, meta, _blockhash, _alice) = start_rpc_handler_with_tx(&bob_pubkey);
 
         // Expect internal error because no drone is available
@@ -705,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_rpc_verify_pubkey() {
-        let pubkey = Keypair::new().pubkey();
+        let pubkey = Pubkey::new_rand();
         assert_eq!(verify_pubkey(pubkey.to_string()).unwrap(), pubkey);
         let bad_pubkey = "a1b2c3d4";
         assert_eq!(
@@ -716,13 +738,8 @@ mod tests {
 
     #[test]
     fn test_rpc_verify_signature() {
-        let tx = SystemTransaction::new_move(
-            &Keypair::new(),
-            &Keypair::new().pubkey(),
-            20,
-            hash(&[0]),
-            0,
-        );
+        let tx =
+            system_transaction::transfer(&Keypair::new(), &Pubkey::new_rand(), 20, hash(&[0]), 0);
         assert_eq!(
             verify_signature(&tx.signatures[0].to_string()).unwrap(),
             tx.signatures[0]
@@ -736,7 +753,7 @@ mod tests {
 
     fn new_bank_forks() -> (Arc<RwLock<BankForks>>, Keypair) {
         let (genesis_block, alice) = GenesisBlock::new(10_000);
-        let bank = bank::Bank::new(&genesis_block);
+        let bank = Bank::new(&genesis_block);
         (
             Arc::new(RwLock::new(BankForks::new(bank.slot(), bank))),
             alice,

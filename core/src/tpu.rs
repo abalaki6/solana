@@ -6,6 +6,7 @@ use crate::blocktree::Blocktree;
 use crate::broadcast_stage::BroadcastStage;
 use crate::cluster_info::ClusterInfo;
 use crate::cluster_info_vote_listener::ClusterInfoVoteListener;
+use crate::entry::EntrySender;
 use crate::fetch_stage::FetchStage;
 use crate::poh_recorder::{PohRecorder, WorkingBankEntries};
 use crate::service::Service;
@@ -37,6 +38,7 @@ impl Tpu {
         broadcast_socket: UdpSocket,
         sigverify_disabled: bool,
         blocktree: &Arc<Blocktree>,
+        storage_entry_sender: EntrySender,
         exit: &Arc<AtomicBool>,
     ) -> Self {
         cluster_info.write().unwrap().set_leader(id);
@@ -46,13 +48,20 @@ impl Tpu {
             transactions_sockets,
             tpu_via_blobs_sockets,
             &exit,
-            &packet_sender.clone(),
+            &packet_sender,
         );
-        let cluster_info_vote_listener =
-            ClusterInfoVoteListener::new(&exit, cluster_info.clone(), packet_sender);
+        let (verified_sender, verified_receiver) = channel();
 
-        let (sigverify_stage, verified_receiver) =
-            SigVerifyStage::new(packet_receiver, sigverify_disabled);
+        let sigverify_stage =
+            SigVerifyStage::new(packet_receiver, sigverify_disabled, verified_sender.clone());
+
+        let cluster_info_vote_listener = ClusterInfoVoteListener::new(
+            &exit,
+            cluster_info.clone(),
+            sigverify_disabled,
+            verified_sender,
+            &poh_recorder,
+        );
 
         let banking_stage = BankingStage::new(&cluster_info, poh_recorder, verified_receiver);
 
@@ -62,6 +71,7 @@ impl Tpu {
             entry_receiver,
             &exit,
             blocktree,
+            storage_entry_sender,
         );
 
         Self {

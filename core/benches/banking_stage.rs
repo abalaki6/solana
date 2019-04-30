@@ -1,10 +1,13 @@
 #![feature(test)]
 
 extern crate test;
+#[macro_use]
+extern crate solana;
 
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
 use solana::banking_stage::{create_test_recorder, BankingStage};
+use solana::blocktree::{get_tmp_ledger_path, Blocktree};
 use solana::cluster_info::ClusterInfo;
 use solana::cluster_info::Node;
 use solana::packet::to_packets_chunked;
@@ -15,7 +18,7 @@ use solana_sdk::genesis_block::GenesisBlock;
 use solana_sdk::hash::hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{KeypairUtil, Signature};
-use solana_sdk::system_transaction::SystemTransaction;
+use solana_sdk::system_transaction;
 use solana_sdk::timing::{DEFAULT_TICKS_PER_SLOT, MAX_RECENT_BLOCKHASHES};
 use std::iter;
 use std::sync::atomic::Ordering;
@@ -53,7 +56,7 @@ fn bench_banking_stage_multi_accounts(bencher: &mut Bencher) {
 
     let (verified_sender, verified_receiver) = channel();
     let bank = Arc::new(Bank::new(&genesis_block));
-    let dummy = SystemTransaction::new_move(
+    let dummy = system_transaction::transfer(
         &mint_keypair,
         &mint_keypair.pubkey(),
         1,
@@ -67,17 +70,17 @@ fn bench_banking_stage_multi_accounts(bencher: &mut Bencher) {
             let from: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
             let to: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
             let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
-            new.account_keys[0] = Pubkey::new(&from[0..32]);
-            new.account_keys[1] = Pubkey::new(&to[0..32]);
+            new.message.account_keys[0] = Pubkey::new(&from[0..32]);
+            new.message.account_keys[1] = Pubkey::new(&to[0..32]);
             new.signatures = vec![Signature::new(&sig[0..64])];
             new
         })
         .collect();
     // fund all the accounts
     transactions.iter().for_each(|tx| {
-        let fund = SystemTransaction::new_move(
+        let fund = system_transaction::transfer(
             &mint_keypair,
-            &tx.account_keys[0],
+            &tx.message.account_keys[0],
             mint_total / txes as u64,
             genesis_block.hash(),
             0,
@@ -104,33 +107,41 @@ fn bench_banking_stage_multi_accounts(bencher: &mut Bencher) {
             (x, iter::repeat(1).take(len).collect())
         })
         .collect();
-    let (exit, poh_recorder, poh_service, signal_receiver) = create_test_recorder(&bank);
-    let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
-    let cluster_info = Arc::new(RwLock::new(cluster_info));
-    let _banking_stage = BankingStage::new(&cluster_info, &poh_recorder, verified_receiver);
-    poh_recorder.lock().unwrap().set_bank(&bank);
+    let ledger_path = get_tmp_ledger_path!();
+    {
+        let blocktree = Arc::new(
+            Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger"),
+        );
+        let (exit, poh_recorder, poh_service, signal_receiver) =
+            create_test_recorder(&bank, &blocktree);
+        let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
+        let cluster_info = Arc::new(RwLock::new(cluster_info));
+        let _banking_stage = BankingStage::new(&cluster_info, &poh_recorder, verified_receiver);
+        poh_recorder.lock().unwrap().set_bank(&bank);
 
-    let mut id = genesis_block.hash();
-    for _ in 0..(MAX_RECENT_BLOCKHASHES * DEFAULT_TICKS_PER_SLOT as usize) {
-        id = hash(&id.as_ref());
-        bank.register_tick(&id);
-    }
-
-    let half_len = verified.len() / 2;
-    let mut start = 0;
-    bencher.iter(move || {
-        // make sure the transactions are still valid
-        bank.register_tick(&genesis_block.hash());
-        for v in verified[start..start + half_len].chunks(verified.len() / num_threads) {
-            verified_sender.send(v.to_vec()).unwrap();
+        let mut id = genesis_block.hash();
+        for _ in 0..(MAX_RECENT_BLOCKHASHES * DEFAULT_TICKS_PER_SLOT as usize) {
+            id = hash(&id.as_ref());
+            bank.register_tick(&id);
         }
-        check_txs(&signal_receiver, txes / 2);
-        bank.clear_signatures();
-        start += half_len;
-        start %= verified.len();
-    });
-    exit.store(true, Ordering::Relaxed);
-    poh_service.join().unwrap();
+
+        let half_len = verified.len() / 2;
+        let mut start = 0;
+        bencher.iter(move || {
+            // make sure the transactions are still valid
+            bank.register_tick(&genesis_block.hash());
+            for v in verified[start..start + half_len].chunks(verified.len() / num_threads) {
+                verified_sender.send(v.to_vec()).unwrap();
+            }
+            check_txs(&signal_receiver, txes / 2);
+            bank.clear_signatures();
+            start += half_len;
+            start %= verified.len();
+        });
+        exit.store(true, Ordering::Relaxed);
+        poh_service.join().unwrap();
+    }
+    Blocktree::destroy(&ledger_path).unwrap();
 }
 
 #[bench]
@@ -145,7 +156,7 @@ fn bench_banking_stage_multi_programs(bencher: &mut Bencher) {
 
     let (verified_sender, verified_receiver) = channel();
     let bank = Arc::new(Bank::new(&genesis_block));
-    let dummy = SystemTransaction::new_move(
+    let dummy = system_transaction::transfer(
         &mint_keypair,
         &mint_keypair.pubkey(),
         1,
@@ -159,33 +170,33 @@ fn bench_banking_stage_multi_programs(bencher: &mut Bencher) {
             let from: Vec<u8> = (0..32).map(|_| thread_rng().gen()).collect();
             let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
             let to: Vec<u8> = (0..32).map(|_| thread_rng().gen()).collect();
-            new.account_keys[0] = Pubkey::new(&from[0..32]);
-            new.account_keys[1] = Pubkey::new(&to[0..32]);
-            let prog = new.instructions[0].clone();
+            new.message.account_keys[0] = Pubkey::new(&from[0..32]);
+            new.message.account_keys[1] = Pubkey::new(&to[0..32]);
+            let prog = new.message.instructions[0].clone();
             for i in 1..progs {
                 //generate programs that spend to random keys
                 let to: Vec<u8> = (0..32).map(|_| thread_rng().gen()).collect();
                 let to_key = Pubkey::new(&to[0..32]);
-                new.account_keys.push(to_key);
-                assert_eq!(new.account_keys.len(), i + 2);
-                new.instructions.push(prog.clone());
-                assert_eq!(new.instructions.len(), i + 1);
-                new.instructions[i].accounts[1] = 1 + i as u8;
+                new.message.account_keys.push(to_key);
+                assert_eq!(new.message.account_keys.len(), i + 2);
+                new.message.instructions.push(prog.clone());
+                assert_eq!(new.message.instructions.len(), i + 1);
+                new.message.instructions[i].accounts[1] = 1 + i as u8;
                 assert_eq!(new.key(i, 1), Some(&to_key));
                 assert_eq!(
-                    new.account_keys[new.instructions[i].accounts[1] as usize],
+                    new.message.account_keys[new.message.instructions[i].accounts[1] as usize],
                     to_key
                 );
             }
-            assert_eq!(new.instructions.len(), progs);
+            assert_eq!(new.message.instructions.len(), progs);
             new.signatures = vec![Signature::new(&sig[0..64])];
             new
         })
         .collect();
     transactions.iter().for_each(|tx| {
-        let fund = SystemTransaction::new_move(
+        let fund = system_transaction::transfer(
             &mint_keypair,
-            &tx.account_keys[0],
+            &tx.message.account_keys[0],
             mint_total / txes as u64,
             genesis_block.hash(),
             0,
@@ -211,31 +222,40 @@ fn bench_banking_stage_multi_programs(bencher: &mut Bencher) {
             (x, iter::repeat(1).take(len).collect())
         })
         .collect();
-    let (exit, poh_recorder, poh_service, signal_receiver) = create_test_recorder(&bank);
-    let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
-    let cluster_info = Arc::new(RwLock::new(cluster_info));
-    let _banking_stage = BankingStage::new(&cluster_info, &poh_recorder, verified_receiver);
-    poh_recorder.lock().unwrap().set_bank(&bank);
 
-    let mut id = genesis_block.hash();
-    for _ in 0..(MAX_RECENT_BLOCKHASHES * DEFAULT_TICKS_PER_SLOT as usize) {
-        id = hash(&id.as_ref());
-        bank.register_tick(&id);
-    }
+    let ledger_path = get_tmp_ledger_path!();
+    {
+        let blocktree = Arc::new(
+            Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger"),
+        );
+        let (exit, poh_recorder, poh_service, signal_receiver) =
+            create_test_recorder(&bank, &blocktree);
+        let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
+        let cluster_info = Arc::new(RwLock::new(cluster_info));
+        let _banking_stage = BankingStage::new(&cluster_info, &poh_recorder, verified_receiver);
+        poh_recorder.lock().unwrap().set_bank(&bank);
 
-    let half_len = verified.len() / 2;
-    let mut start = 0;
-    bencher.iter(move || {
-        // make sure the transactions are still valid
-        bank.register_tick(&genesis_block.hash());
-        for v in verified[start..start + half_len].chunks(verified.len() / num_threads) {
-            verified_sender.send(v.to_vec()).unwrap();
+        let mut id = genesis_block.hash();
+        for _ in 0..(MAX_RECENT_BLOCKHASHES * DEFAULT_TICKS_PER_SLOT as usize) {
+            id = hash(&id.as_ref());
+            bank.register_tick(&id);
         }
-        check_txs(&signal_receiver, txes / 2);
-        bank.clear_signatures();
-        start += half_len;
-        start %= verified.len();
-    });
-    exit.store(true, Ordering::Relaxed);
-    poh_service.join().unwrap();
+
+        let half_len = verified.len() / 2;
+        let mut start = 0;
+        bencher.iter(move || {
+            // make sure the transactions are still valid
+            bank.register_tick(&genesis_block.hash());
+            for v in verified[start..start + half_len].chunks(verified.len() / num_threads) {
+                verified_sender.send(v.to_vec()).unwrap();
+            }
+            check_txs(&signal_receiver, txes / 2);
+            bank.clear_signatures();
+            start += half_len;
+            start %= verified.len();
+        });
+        exit.store(true, Ordering::Relaxed);
+        poh_service.join().unwrap();
+    }
+    Blocktree::destroy(&ledger_path).unwrap();
 }

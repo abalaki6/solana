@@ -1,14 +1,16 @@
 use crate::native_loader;
+use crate::system_instruction_processor;
 use solana_sdk::account::{create_keyed_accounts, Account, KeyedAccount};
-use solana_sdk::instruction::InstructionError;
+use solana_sdk::instruction::{CompiledInstruction, InstructionError};
+use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::system_program;
-use solana_sdk::transaction::{Transaction, TransactionError};
+use solana_sdk::transaction::TransactionError;
 
 /// Return true if the slice has any duplicate elements
 pub fn has_duplicates<T: PartialEq>(xs: &[T]) -> bool {
     // Note: This is an O(n^2) algorithm, but requires no heap allocations. The benchmark
-    // `bench_has_duplicates` in benches/runtime.rs shows that this implementation is
+    // `bench_has_duplicates` in benches/message_processor.rs shows that this implementation is
     // ~50 times faster than using HashSet for very short slices.
     for i in 1..xs.len() {
         if xs[i..].contains(&xs[i - 1]) {
@@ -83,14 +85,16 @@ fn verify_error(err: InstructionError) -> InstructionError {
 pub type ProcessInstruction =
     fn(&Pubkey, &mut [KeyedAccount], &[u8], u64) -> Result<(), InstructionError>;
 
-pub struct Runtime {
+pub struct MessageProcessor {
     instruction_processors: Vec<(Pubkey, ProcessInstruction)>,
 }
 
-impl Default for Runtime {
+impl Default for MessageProcessor {
     fn default() -> Self {
-        let instruction_processors: Vec<(Pubkey, ProcessInstruction)> =
-            vec![(system_program::id(), crate::system_program::entrypoint)];
+        let instruction_processors: Vec<(Pubkey, ProcessInstruction)> = vec![(
+            system_program::id(),
+            system_instruction_processor::process_instruction,
+        )];
 
         Self {
             instruction_processors,
@@ -98,7 +102,7 @@ impl Default for Runtime {
     }
 }
 
-impl Runtime {
+impl MessageProcessor {
     /// Add a static entrypoint to intercept intructions before the dynamic loader.
     pub fn add_instruction_processor(
         &mut self,
@@ -113,22 +117,22 @@ impl Runtime {
     /// This method calls the instruction's program entrypoint method
     fn process_instruction(
         &self,
-        tx: &Transaction,
-        instruction_index: usize,
+        message: &Message,
+        instruction: &CompiledInstruction,
         executable_accounts: &mut [(Pubkey, Account)],
         program_accounts: &mut [&mut Account],
         tick_height: u64,
     ) -> Result<(), InstructionError> {
-        let program_id = tx.program_id(instruction_index);
+        let program_id = instruction.program_id(message.program_ids());
 
         let mut keyed_accounts = create_keyed_accounts(executable_accounts);
-        let mut keyed_accounts2: Vec<_> = tx.instructions[instruction_index]
+        let mut keyed_accounts2: Vec<_> = instruction
             .accounts
             .iter()
             .map(|&index| {
                 let index = index as usize;
-                let key = &tx.account_keys[index];
-                (key, index < tx.signatures.len())
+                let key = &message.account_keys[index];
+                (key, index < message.num_required_signatures as usize)
             })
             .zip(program_accounts.iter_mut())
             .map(|((key, is_signer), account)| KeyedAccount::new(key, is_signer, account))
@@ -140,7 +144,7 @@ impl Runtime {
                 return process_instruction(
                     &program_id,
                     &mut keyed_accounts[1..],
-                    &tx.instructions[instruction_index].data,
+                    &instruction.data,
                     tick_height,
                 );
             }
@@ -149,7 +153,7 @@ impl Runtime {
         native_loader::entrypoint(
             &program_id,
             &mut keyed_accounts,
-            &tx.instructions[instruction_index].data,
+            &instruction.data,
             tick_height,
         )
     }
@@ -160,13 +164,13 @@ impl Runtime {
     /// The accounts are committed back to the bank only if this function returns Ok(_).
     fn execute_instruction(
         &self,
-        tx: &Transaction,
-        instruction_index: usize,
+        message: &Message,
+        instruction: &CompiledInstruction,
         executable_accounts: &mut [(Pubkey, Account)],
         program_accounts: &mut [&mut Account],
         tick_height: u64,
     ) -> Result<(), InstructionError> {
-        let program_id = tx.program_id(instruction_index);
+        let program_id = instruction.program_id(message.program_ids());
         // TODO: the runtime should be checking read/write access to memory
         // we are trusting the hard-coded programs not to clobber or allocate
         let pre_total: u64 = program_accounts.iter().map(|a| a.lamports).sum();
@@ -176,8 +180,8 @@ impl Runtime {
             .collect();
 
         self.process_instruction(
-            tx,
-            instruction_index,
+            message,
+            instruction,
             executable_accounts,
             program_accounts,
             tick_height,
@@ -204,23 +208,23 @@ impl Runtime {
         Ok(())
     }
 
-    /// Execute a transaction.
-    /// This method calls each instruction in the transaction over the set of loaded Accounts
+    /// Process a message.
+    /// This method calls each instruction in the message over the set of loaded Accounts
     /// The accounts are committed back to the bank only if every instruction succeeds
-    pub fn execute_transaction(
+    pub fn process_message(
         &self,
-        tx: &Transaction,
+        message: &Message,
         loaders: &mut [Vec<(Pubkey, Account)>],
-        tx_accounts: &mut [Account],
+        accounts: &mut [Account],
         tick_height: u64,
     ) -> Result<(), TransactionError> {
-        for (instruction_index, instruction) in tx.instructions.iter().enumerate() {
+        for (instruction_index, instruction) in message.instructions.iter().enumerate() {
             let executable_accounts = &mut loaders[instruction.program_ids_index as usize];
-            let mut program_accounts = get_subset_unchecked_mut(tx_accounts, &instruction.accounts)
+            let mut program_accounts = get_subset_unchecked_mut(accounts, &instruction.accounts)
                 .map_err(|err| TransactionError::InstructionError(instruction_index as u8, err))?;
             self.execute_instruction(
-                tx,
-                instruction_index,
+                message,
+                instruction,
                 executable_accounts,
                 &mut program_accounts,
                 tick_height,
@@ -234,7 +238,6 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::signature::{Keypair, KeypairUtil};
 
     #[test]
     fn test_has_duplicates() {
@@ -281,8 +284,8 @@ mod tests {
         }
 
         let system_program_id = system_program::id();
-        let alice_program_id = Keypair::new().pubkey();
-        let mallory_program_id = Keypair::new().pubkey();
+        let alice_program_id = Pubkey::new_rand();
+        let mallory_program_id = Pubkey::new_rand();
 
         assert_eq!(
             change_program_id(&system_program_id, &system_program_id, &alice_program_id),
@@ -299,13 +302,13 @@ mod tests {
     #[test]
     fn test_verify_instruction_change_data() {
         fn change_data(program_id: &Pubkey) -> Result<(), InstructionError> {
-            let alice_program_id = Keypair::new().pubkey();
+            let alice_program_id = Pubkey::new_rand();
             let account = Account::new(0, 0, &alice_program_id);
             verify_instruction(&program_id, &alice_program_id, 0, &[42], &account)
         }
 
         let system_program_id = system_program::id();
-        let mallory_program_id = Keypair::new().pubkey();
+        let mallory_program_id = Pubkey::new_rand();
 
         assert_eq!(
             change_data(&system_program_id),

@@ -6,13 +6,13 @@ use crate::blocktree::Blocktree;
 use crate::cluster_info::FULLNODE_PORT_RANGE;
 use crate::contact_info::ContactInfo;
 use crate::entry::{Entry, EntrySlice};
-use crate::gossip_service::discover;
+use crate::gossip_service::discover_nodes;
 use crate::locktower::VOTE_THRESHOLD_DEPTH;
 use crate::poh_service::PohServiceConfig;
 use solana_client::thin_client::create_client;
 use solana_sdk::hash::Hash;
 use solana_sdk::signature::{Keypair, KeypairUtil, Signature};
-use solana_sdk::system_transaction::SystemTransaction;
+use solana_sdk::system_transaction;
 use solana_sdk::timing::{
     duration_as_ms, DEFAULT_TICKS_PER_SLOT, NUM_CONSECUTIVE_LEADER_SLOTS, NUM_TICKS_PER_SECOND,
 };
@@ -28,7 +28,7 @@ pub fn spend_and_verify_all_nodes(
     funding_keypair: &Keypair,
     nodes: usize,
 ) {
-    let cluster_nodes = discover(&entry_point_info.gossip, nodes).unwrap();
+    let cluster_nodes = discover_nodes(&entry_point_info.gossip, nodes).unwrap();
     assert!(cluster_nodes.len() >= nodes);
     for ingress_node in &cluster_nodes {
         let random_keypair = Keypair::new();
@@ -37,7 +37,7 @@ pub fn spend_and_verify_all_nodes(
             .poll_get_balance(&funding_keypair.pubkey())
             .expect("balance in source");
         assert!(bal > 0);
-        let mut transaction = SystemTransaction::new_move(
+        let mut transaction = system_transaction::transfer(
             &funding_keypair,
             &random_keypair.pubkey(),
             1,
@@ -63,7 +63,7 @@ pub fn send_many_transactions(node: &ContactInfo, funding_keypair: &Keypair, num
             .poll_get_balance(&funding_keypair.pubkey())
             .expect("balance in source");
         assert!(bal > 0);
-        let mut transaction = SystemTransaction::new_move(
+        let mut transaction = system_transaction::transfer(
             &funding_keypair,
             &random_keypair.pubkey(),
             1,
@@ -77,7 +77,7 @@ pub fn send_many_transactions(node: &ContactInfo, funding_keypair: &Keypair, num
 }
 
 pub fn fullnode_exit(entry_point_info: &ContactInfo, nodes: usize) {
-    let cluster_nodes = discover(&entry_point_info.gossip, nodes).unwrap();
+    let cluster_nodes = discover_nodes(&entry_point_info.gossip, nodes).unwrap();
     assert!(cluster_nodes.len() >= nodes);
     for node in &cluster_nodes {
         let client = create_client(node.client_facing_addr(), FULLNODE_PORT_RANGE);
@@ -148,7 +148,7 @@ pub fn kill_entry_and_spend_and_verify_rest(
     nodes: usize,
 ) {
     solana_logger::setup();
-    let cluster_nodes = discover(&entry_point_info.gossip, nodes).unwrap();
+    let cluster_nodes = discover_nodes(&entry_point_info.gossip, nodes).unwrap();
     assert!(cluster_nodes.len() >= nodes);
     let client = create_client(entry_point_info.client_facing_addr(), FULLNODE_PORT_RANGE);
     info!("sleeping for 2 leader fortnights");
@@ -183,7 +183,7 @@ pub fn kill_entry_and_spend_and_verify_rest(
             }
 
             let random_keypair = Keypair::new();
-            let mut transaction = SystemTransaction::new_move(
+            let mut transaction = system_transaction::transfer(
                 &funding_keypair,
                 &random_keypair.pubkey(),
                 1,

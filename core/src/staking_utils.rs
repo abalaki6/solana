@@ -53,9 +53,11 @@ pub fn delegated_stakes_at_epoch(bank: &Bank, epoch_height: u64) -> Option<HashM
 /// Collect the node account balance and vote states for nodes have non-zero balance in
 /// their corresponding staking accounts
 fn node_staked_accounts(bank: &Bank) -> impl Iterator<Item = (Pubkey, u64, Account)> {
-    bank.vote_accounts().filter_map(|(account_id, account)| {
-        filter_zero_balances(&account).map(|stake| (account_id, stake, account))
-    })
+    bank.vote_accounts()
+        .into_iter()
+        .filter_map(|(account_id, account)| {
+            filter_zero_balances(&account).map(|stake| (account_id, stake, account))
+        })
 }
 
 pub fn node_staked_accounts_at_epoch(
@@ -160,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_bank_staked_nodes_at_epoch() {
-        let pubkey = Keypair::new().pubkey();
+        let pubkey = Pubkey::new_rand();
         let bootstrap_lamports = 2;
         let (genesis_block, _) =
             GenesisBlock::new_with_leader(bootstrap_lamports, &pubkey, bootstrap_lamports);
@@ -193,7 +195,7 @@ mod tests {
         // Give the validator some stake but don't setup a staking account
         // Validator has no lamports staked, so they get filtered out. Only the bootstrap leader
         // created by the genesis block will get included
-        bank.transfer(1, &mint_keypair, &validator.pubkey(), genesis_block.hash())
+        bank.transfer(1, &mint_keypair, &validator.pubkey())
             .unwrap();
 
         // Make a mint vote account. Because the mint has nonzero stake, this
@@ -276,8 +278,8 @@ mod tests {
     #[test]
     fn test_to_delegated_stakes() {
         let mut stakes = Vec::new();
-        let delegate1 = Keypair::new().pubkey();
-        let delegate2 = Keypair::new().pubkey();
+        let delegate1 = Pubkey::new_rand();
+        let delegate2 = Pubkey::new_rand();
 
         // Delegate 1 has stake of 3
         for i in 0..3 {

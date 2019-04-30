@@ -2,7 +2,6 @@ use crate::generic_rpc_client_request::GenericRpcClientRequest;
 use crate::mock_rpc_client_request::MockRpcClientRequest;
 use crate::rpc_client_request::RpcClientRequest;
 use crate::rpc_request::RpcRequest;
-use crate::rpc_signature_status::RpcSignatureStatus;
 use bincode::serialize;
 use bs58;
 use log::*;
@@ -12,11 +11,10 @@ use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, KeypairUtil, Signature};
 use solana_sdk::timing::{DEFAULT_TICKS_PER_SLOT, NUM_TICKS_PER_SECOND};
-use solana_sdk::transaction::Transaction;
+use solana_sdk::transaction::{self, Transaction, TransactionError};
 use std::error;
 use std::io;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -69,25 +67,14 @@ impl RpcClient {
     pub fn get_signature_status(
         &self,
         signature: &str,
-    ) -> Result<RpcSignatureStatus, Box<dyn error::Error>> {
+    ) -> Result<Option<transaction::Result<()>>, Box<dyn error::Error>> {
         let params = json!([signature.to_string()]);
         let signature_status =
             self.client
                 .send(&RpcRequest::GetSignatureStatus, Some(params), 5)?;
-        if let Some(status) = signature_status.as_str() {
-            let rpc_status = RpcSignatureStatus::from_str(status).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Unable to parse signature status: {:?}", err),
-                )
-            })?;
-            Ok(rpc_status)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "Received result of an unexpected type",
-            ))?
-        }
+        let result: Option<transaction::Result<()>> =
+            serde_json::from_value(signature_status).unwrap();
+        Ok(result)
     }
 
     pub fn send_and_confirm_transaction<T: KeypairUtil>(
@@ -101,7 +88,7 @@ impl RpcClient {
             let signature_str = self.send_transaction(transaction)?;
             let status = loop {
                 let status = self.get_signature_status(&signature_str)?;
-                if status == RpcSignatureStatus::SignatureNotFound {
+                if status.is_none() {
                     status_retries -= 1;
                     if status_retries == 0 {
                         break status;
@@ -116,19 +103,19 @@ impl RpcClient {
                     ));
                 }
             };
-            match status {
-                RpcSignatureStatus::AccountInUse | RpcSignatureStatus::SignatureNotFound => {
-                    // Fetch a new blockhash and re-sign the transaction before sending it again
-                    self.resign_transaction(transaction, signer)?;
-                    send_retries -= 1;
+            send_retries = if let Some(result) = status.clone() {
+                match result {
+                    Ok(_) => return Ok(signature_str),
+                    Err(TransactionError::AccountInUse) => {
+                        // Fetch a new blockhash and re-sign the transaction before sending it again
+                        self.resign_transaction(transaction, signer)?;
+                        send_retries - 1
+                    }
+                    Err(_) => 0,
                 }
-                RpcSignatureStatus::Confirmed => {
-                    return Ok(signature_str);
-                }
-                _ => {
-                    send_retries = 0;
-                }
-            }
+            } else {
+                send_retries - 1
+            };
             if send_retries == 0 {
                 Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -177,7 +164,10 @@ impl RpcClient {
                     .filter(|(_transaction, signature)| {
                         if let Some(signature) = signature {
                             if let Ok(status) = self.get_signature_status(&signature) {
-                                return status != RpcSignatureStatus::Confirmed;
+                                if status.is_none() {
+                                    return false;
+                                }
+                                return status.unwrap().is_err();
                             }
                         }
                         true
@@ -196,7 +186,7 @@ impl RpcClient {
 
             // Re-sign any failed transactions with a new blockhash and retry
             let blockhash =
-                self.get_new_blockhash(&transactions_signatures[0].0.recent_blockhash)?;
+                self.get_new_blockhash(&transactions_signatures[0].0.message().recent_blockhash)?;
             transactions = transactions_signatures
                 .into_iter()
                 .map(|(mut transaction, _)| {
@@ -212,7 +202,7 @@ impl RpcClient {
         tx: &mut Transaction,
         signer_key: &T,
     ) -> Result<(), Box<dyn error::Error>> {
-        let blockhash = self.get_new_blockhash(&tx.recent_blockhash)?;
+        let blockhash = self.get_new_blockhash(&tx.message().recent_blockhash)?;
         tx.sign(&[signer_key], blockhash);
         Ok(())
     }
@@ -410,13 +400,12 @@ impl RpcClient {
         Ok(())
     }
 
-    /// Check a signature in the bank. This method blocks
-    /// until the server sends a response.
+    /// Check a signature in the bank.
     pub fn check_signature(&self, signature: &Signature) -> bool {
         trace!("check_signature: {:?}", signature);
         let params = json!([format!("{}", signature)]);
 
-        loop {
+        for _ in 0..30 {
             let response =
                 self.client
                     .send(&RpcRequest::ConfirmTransaction, Some(params.clone()), 0);
@@ -436,7 +425,10 @@ impl RpcClient {
                     debug!("check_signature request failed: {:?}", err);
                 }
             };
+            sleep(Duration::from_millis(250));
         }
+
+        panic!("Couldn't check signature of {}", signature);
     }
 
     /// Poll the server to confirm a transaction.
@@ -556,7 +548,8 @@ mod tests {
     use serde_json::Number;
     use solana_logger;
     use solana_sdk::signature::{Keypair, KeypairUtil};
-    use solana_sdk::system_transaction::SystemTransaction;
+    use solana_sdk::system_transaction;
+    use solana_sdk::transaction::TransactionError;
     use std::sync::mpsc::channel;
     use std::thread;
 
@@ -660,9 +653,9 @@ mod tests {
         let rpc_client = RpcClient::new_mock("succeeds".to_string());
 
         let key = Keypair::new();
-        let to = Keypair::new().pubkey();
+        let to = Pubkey::new_rand();
         let blockhash = Hash::default();
-        let tx = SystemTransaction::new_account(&key, &to, 50, blockhash, 0);
+        let tx = system_transaction::create_user_account(&key, &to, 50, blockhash, 0);
 
         let signature = rpc_client.send_transaction(&tx);
         assert_eq!(signature.unwrap(), SIGNATURE.to_string());
@@ -692,18 +685,18 @@ mod tests {
     fn test_get_signature_status() {
         let rpc_client = RpcClient::new_mock("succeeds".to_string());
         let signature = "good_signature";
-        let status = rpc_client.get_signature_status(&signature);
-        assert_eq!(status.unwrap(), RpcSignatureStatus::Confirmed);
+        let status = rpc_client.get_signature_status(&signature).unwrap();
+        assert_eq!(status, Some(Ok(())));
 
-        let rpc_client = RpcClient::new_mock("bad_sig_status".to_string());
-        let signature = "bad_status";
-        let status = dbg!(rpc_client.get_signature_status(&signature));
-        assert_eq!(status.unwrap(), RpcSignatureStatus::SignatureNotFound);
+        let rpc_client = RpcClient::new_mock("sig_not_found".to_string());
+        let signature = "sig_not_found";
+        let status = rpc_client.get_signature_status(&signature).unwrap();
+        assert_eq!(status, None);
 
-        let rpc_client = RpcClient::new_mock("fails".to_string());
-        let signature = "bad_status_fmt";
-        let status = rpc_client.get_signature_status(&signature);
-        assert!(status.is_err());
+        let rpc_client = RpcClient::new_mock("account_in_use".to_string());
+        let signature = "account_in_use";
+        let status = rpc_client.get_signature_status(&signature).unwrap();
+        assert_eq!(status, Some(Err(TransactionError::AccountInUse)));
     }
 
     #[test]
@@ -711,9 +704,9 @@ mod tests {
         let rpc_client = RpcClient::new_mock("succeeds".to_string());
 
         let key = Keypair::new();
-        let to = Keypair::new().pubkey();
+        let to = Pubkey::new_rand();
         let blockhash = Hash::default();
-        let mut tx = SystemTransaction::new_account(&key, &to, 50, blockhash, 0);
+        let mut tx = system_transaction::create_user_account(&key, &to, 50, blockhash, 0);
 
         let result = rpc_client.send_and_confirm_transaction(&mut tx, &key);
         result.unwrap();
@@ -732,22 +725,22 @@ mod tests {
         let rpc_client = RpcClient::new_mock("succeeds".to_string());
 
         let key = Keypair::new();
-        let to = Keypair::new().pubkey();
+        let to = Pubkey::new_rand();
         let vec = bs58::decode("HUu3LwEzGRsUkuJS121jzkPJW39Kq62pXCTmTa1F9jDL")
             .into_vec()
             .unwrap();
         let blockhash = Hash::new(&vec);
-        let prev_tx = SystemTransaction::new_account(&key, &to, 50, blockhash, 0);
-        let mut tx = SystemTransaction::new_account(&key, &to, 50, blockhash, 0);
+        let prev_tx = system_transaction::create_user_account(&key, &to, 50, blockhash, 0);
+        let mut tx = system_transaction::create_user_account(&key, &to, 50, blockhash, 0);
 
         rpc_client.resign_transaction(&mut tx, &key).unwrap();
 
         assert_ne!(prev_tx, tx);
         assert_ne!(prev_tx.signatures, tx.signatures);
-        assert_ne!(prev_tx.recent_blockhash, tx.recent_blockhash);
-        assert_eq!(prev_tx.fee, tx.fee);
-        assert_eq!(prev_tx.account_keys, tx.account_keys);
-        assert_eq!(prev_tx.instructions, tx.instructions);
+        assert_ne!(
+            prev_tx.message().recent_blockhash,
+            tx.message().recent_blockhash
+        );
     }
 
 }

@@ -4,7 +4,9 @@
 
 use crate::entry::Entry;
 use crate::result::Result;
+use bincode::serialize;
 use chrono::{SecondsFormat, Utc};
+use serde_json::json;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use std::cell::RefCell;
@@ -91,7 +93,13 @@ where
         leader_id: &Pubkey,
         entry: &Entry,
     ) -> Result<()> {
-        let json_entry = serde_json::to_string(&entry)?;
+        let transactions: Vec<Vec<u8>> = serialize_transactions(entry);
+        let stream_entry = json!({
+            "num_hashes": entry.num_hashes,
+            "hash": entry.hash,
+            "transactions": transactions
+        });
+        let json_entry = serde_json::to_string(&stream_entry)?;
         let payload = format!(
             r#"{{"dt":"{}","t":"entry","s":{},"h":{},"l":"{:?}","entry":{}}}"#,
             Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
@@ -148,6 +156,14 @@ impl MockBlockstream {
     }
 }
 
+fn serialize_transactions(entry: &Entry) -> Vec<Vec<u8>> {
+    entry
+        .transactions
+        .iter()
+        .map(|tx| serialize(&tx).unwrap())
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -156,7 +172,29 @@ mod test {
     use serde_json::Value;
     use solana_sdk::hash::Hash;
     use solana_sdk::signature::{Keypair, KeypairUtil};
+    use solana_sdk::system_transaction;
     use std::collections::HashSet;
+
+    #[test]
+    fn test_serialize_transactions() {
+        let entry = Entry::new(&Hash::default(), 1, vec![]);
+        let empty_vec: Vec<Vec<u8>> = vec![];
+        assert_eq!(serialize_transactions(&entry), empty_vec);
+
+        let keypair0 = Keypair::new();
+        let keypair1 = Keypair::new();
+        let tx0 =
+            system_transaction::transfer(&keypair0, &keypair1.pubkey(), 1, Hash::default(), 0);
+        let tx1 =
+            system_transaction::transfer(&keypair1, &keypair0.pubkey(), 2, Hash::default(), 0);
+        let serialized_tx0 = serialize(&tx0).unwrap();
+        let serialized_tx1 = serialize(&tx1).unwrap();
+        let entry = Entry::new(&Hash::default(), 1, vec![tx0, tx1]);
+        assert_eq!(
+            serialize_transactions(&entry),
+            vec![serialized_tx0, serialized_tx1]
+        );
+    }
 
     #[test]
     fn test_blockstream() -> () {
@@ -170,7 +208,7 @@ mod test {
         let tick_height_initial = 0;
         let tick_height_final = tick_height_initial + ticks_per_slot + 2;
         let mut curr_slot = 0;
-        let leader_id = Keypair::new().pubkey();
+        let leader_id = Pubkey::new_rand();
 
         for tick_height in tick_height_initial..=tick_height_final {
             if tick_height == 5 {

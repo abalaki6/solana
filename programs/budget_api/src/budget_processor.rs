@@ -143,14 +143,16 @@ pub fn process_instruction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budget_instruction::BudgetInstruction;
+    use crate::budget_instruction;
     use crate::id;
     use solana_runtime::bank::Bank;
     use solana_runtime::bank_client::BankClient;
     use solana_sdk::genesis_block::GenesisBlock;
     use solana_sdk::instruction::InstructionError;
+    use solana_sdk::message::Message;
     use solana_sdk::signature::{Keypair, KeypairUtil};
-    use solana_sdk::transaction::{Transaction, TransactionError};
+    use solana_sdk::sync_client::SyncClient;
+    use solana_sdk::transaction::TransactionError;
 
     fn create_bank(lamports: u64) -> (Bank, Keypair) {
         let (genesis_block, mint_keypair) = GenesisBlock::new(lamports);
@@ -161,26 +163,29 @@ mod tests {
 
     #[test]
     fn test_budget_payment() {
-        let (bank, mint_keypair) = create_bank(10_000);
-        let alice_client = BankClient::new(&bank, mint_keypair);
-        let alice_pubkey = alice_client.pubkey();
-        let bob_pubkey = Keypair::new().pubkey();
-        let instructions = BudgetInstruction::new_payment(&alice_pubkey, &bob_pubkey, 100);
-        alice_client.process_instructions(instructions).unwrap();
-        assert_eq!(bank.get_balance(&bob_pubkey), 100);
+        let (bank, alice_keypair) = create_bank(10_000);
+        let bank_client = BankClient::new(&bank);
+        let alice_pubkey = alice_keypair.pubkey();
+        let bob_pubkey = Pubkey::new_rand();
+        let instructions = budget_instruction::payment(&alice_pubkey, &bob_pubkey, 100);
+        let message = Message::new(instructions);
+        bank_client
+            .send_message(&[&alice_keypair], message)
+            .unwrap();
+        assert_eq!(bank_client.get_balance(&bob_pubkey).unwrap(), 100);
     }
 
     #[test]
     fn test_unsigned_witness_key() {
-        let (bank, mint_keypair) = create_bank(10_000);
-        let alice_client = BankClient::new(&bank, mint_keypair);
-        let alice_pubkey = alice_client.pubkey();
+        let (bank, alice_keypair) = create_bank(10_000);
+        let bank_client = BankClient::new(&bank);
+        let alice_pubkey = alice_keypair.pubkey();
 
         // Initialize BudgetState
-        let budget_pubkey = Keypair::new().pubkey();
-        let bob_pubkey = Keypair::new().pubkey();
-        let witness = Keypair::new().pubkey();
-        let instructions = BudgetInstruction::new_when_signed(
+        let budget_pubkey = Pubkey::new_rand();
+        let bob_pubkey = Pubkey::new_rand();
+        let witness = Pubkey::new_rand();
+        let instructions = budget_instruction::when_signed(
             &alice_pubkey,
             &bob_pubkey,
             &budget_pubkey,
@@ -188,41 +193,46 @@ mod tests {
             None,
             1,
         );
-        alice_client.process_instructions(instructions).unwrap();
+        let message = Message::new(instructions);
+        bank_client
+            .send_message(&[&alice_keypair], message)
+            .unwrap();
 
         // Attack! Part 1: Sign a witness transaction with a random key.
-        let mallory_client = BankClient::new(&bank, Keypair::new());
-        let mallory_pubkey = mallory_client.pubkey();
-        alice_client.transfer(1, &mallory_pubkey).unwrap();
+        let mallory_keypair = Keypair::new();
+        let mallory_pubkey = mallory_keypair.pubkey();
+        bank_client
+            .transfer(1, &alice_keypair, &mallory_pubkey)
+            .unwrap();
         let instruction =
-            BudgetInstruction::new_apply_signature(&mallory_pubkey, &budget_pubkey, &bob_pubkey);
-        let mut transaction = Transaction::new(vec![instruction]);
+            budget_instruction::apply_signature(&mallory_pubkey, &budget_pubkey, &bob_pubkey);
+        let mut message = Message::new(vec![instruction]);
 
         // Attack! Part 2: Point the instruction to the expected, but unsigned, key.
-        transaction.account_keys.push(alice_pubkey);
-        transaction.instructions[0].accounts[0] = 3;
+        message.account_keys.push(alice_pubkey);
+        message.instructions[0].accounts[0] = 3;
 
         // Ensure the transaction fails because of the unsigned key.
         assert_eq!(
-            mallory_client.process_transaction(transaction),
-            Err(TransactionError::InstructionError(
-                0,
-                InstructionError::MissingRequiredSignature
-            ))
+            bank_client
+                .send_message(&[&mallory_keypair], message)
+                .unwrap_err()
+                .unwrap(),
+            TransactionError::InstructionError(0, InstructionError::MissingRequiredSignature)
         );
     }
 
     #[test]
     fn test_unsigned_timestamp() {
-        let (bank, mint_keypair) = create_bank(10_000);
-        let alice_client = BankClient::new(&bank, mint_keypair);
-        let alice_pubkey = alice_client.pubkey();
+        let (bank, alice_keypair) = create_bank(10_000);
+        let bank_client = BankClient::new(&bank);
+        let alice_pubkey = alice_keypair.pubkey();
 
         // Initialize BudgetState
-        let budget_pubkey = Keypair::new().pubkey();
-        let bob_pubkey = Keypair::new().pubkey();
+        let budget_pubkey = Pubkey::new_rand();
+        let bob_pubkey = Pubkey::new_rand();
         let dt = Utc::now();
-        let instructions = BudgetInstruction::new_on_date(
+        let instructions = budget_instruction::on_date(
             &alice_pubkey,
             &bob_pubkey,
             &budget_pubkey,
@@ -231,44 +241,45 @@ mod tests {
             None,
             1,
         );
-        alice_client.process_instructions(instructions).unwrap();
+        let message = Message::new(instructions);
+        bank_client
+            .send_message(&[&alice_keypair], message)
+            .unwrap();
 
         // Attack! Part 1: Sign a timestamp transaction with a random key.
-        let mallory_client = BankClient::new(&bank, Keypair::new());
-        let mallory_pubkey = mallory_client.pubkey();
-        alice_client.transfer(1, &mallory_pubkey).unwrap();
-        let instruction = BudgetInstruction::new_apply_timestamp(
-            &mallory_pubkey,
-            &budget_pubkey,
-            &bob_pubkey,
-            dt,
-        );
-        let mut transaction = Transaction::new(vec![instruction]);
+        let mallory_keypair = Keypair::new();
+        let mallory_pubkey = mallory_keypair.pubkey();
+        bank_client
+            .transfer(1, &alice_keypair, &mallory_pubkey)
+            .unwrap();
+        let instruction =
+            budget_instruction::apply_timestamp(&mallory_pubkey, &budget_pubkey, &bob_pubkey, dt);
+        let mut message = Message::new(vec![instruction]);
 
         // Attack! Part 2: Point the instruction to the expected, but unsigned, key.
-        transaction.account_keys.push(alice_pubkey);
-        transaction.instructions[0].accounts[0] = 3;
+        message.account_keys.push(alice_pubkey);
+        message.instructions[0].accounts[0] = 3;
 
         // Ensure the transaction fails because of the unsigned key.
         assert_eq!(
-            mallory_client.process_transaction(transaction),
-            Err(TransactionError::InstructionError(
-                0,
-                InstructionError::MissingRequiredSignature
-            ))
+            bank_client
+                .send_message(&[&mallory_keypair], message)
+                .unwrap_err()
+                .unwrap(),
+            TransactionError::InstructionError(0, InstructionError::MissingRequiredSignature)
         );
     }
 
     #[test]
     fn test_pay_on_date() {
-        let (bank, mint_keypair) = create_bank(2);
-        let alice_client = BankClient::new(&bank, mint_keypair);
-        let alice_pubkey = alice_client.pubkey();
-        let budget_pubkey = Keypair::new().pubkey();
-        let bob_pubkey = Keypair::new().pubkey();
-        let mallory_pubkey = Keypair::new().pubkey();
+        let (bank, alice_keypair) = create_bank(2);
+        let bank_client = BankClient::new(&bank);
+        let alice_pubkey = alice_keypair.pubkey();
+        let budget_pubkey = Pubkey::new_rand();
+        let bob_pubkey = Pubkey::new_rand();
+        let mallory_pubkey = Pubkey::new_rand();
         let dt = Utc::now();
-        let instructions = BudgetInstruction::new_on_date(
+        let instructions = budget_instruction::on_date(
             &alice_pubkey,
             &bob_pubkey,
             &budget_pubkey,
@@ -277,57 +288,67 @@ mod tests {
             None,
             1,
         );
-        alice_client.process_instructions(instructions).unwrap();
-        assert_eq!(bank.get_balance(&alice_pubkey), 1);
-        assert_eq!(bank.get_balance(&budget_pubkey), 1);
+        let message = Message::new(instructions);
+        bank_client
+            .send_message(&[&alice_keypair], message)
+            .unwrap();
+        assert_eq!(bank_client.get_balance(&alice_pubkey).unwrap(), 1);
+        assert_eq!(bank_client.get_balance(&budget_pubkey).unwrap(), 1);
 
-        let contract_account = bank.get_account(&budget_pubkey).unwrap();
-        let budget_state = BudgetState::deserialize(&contract_account.data).unwrap();
+        let contract_account = bank_client
+            .get_account_data(&budget_pubkey)
+            .unwrap()
+            .unwrap();
+        let budget_state = BudgetState::deserialize(&contract_account).unwrap();
         assert!(budget_state.is_pending());
 
         // Attack! Try to payout to mallory_pubkey
-        let instruction = BudgetInstruction::new_apply_timestamp(
-            &alice_pubkey,
-            &budget_pubkey,
-            &mallory_pubkey,
-            dt,
-        );
+        let instruction =
+            budget_instruction::apply_timestamp(&alice_pubkey, &budget_pubkey, &mallory_pubkey, dt);
         assert_eq!(
-            alice_client.process_instruction(instruction).unwrap_err(),
+            bank_client
+                .send_instruction(&alice_keypair, instruction)
+                .unwrap_err()
+                .unwrap(),
             TransactionError::InstructionError(
                 0,
                 InstructionError::CustomError(serialize(&BudgetError::DestinationMissing).unwrap())
             )
         );
-        assert_eq!(bank.get_balance(&alice_pubkey), 1);
-        assert_eq!(bank.get_balance(&budget_pubkey), 1);
-        assert_eq!(bank.get_balance(&bob_pubkey), 0);
+        assert_eq!(bank_client.get_balance(&alice_pubkey).unwrap(), 1);
+        assert_eq!(bank_client.get_balance(&budget_pubkey).unwrap(), 1);
+        assert_eq!(bank_client.get_balance(&bob_pubkey).unwrap(), 0);
 
-        let contract_account = bank.get_account(&budget_pubkey).unwrap();
-        let budget_state = BudgetState::deserialize(&contract_account.data).unwrap();
+        let contract_account = bank_client
+            .get_account_data(&budget_pubkey)
+            .unwrap()
+            .unwrap();
+        let budget_state = BudgetState::deserialize(&contract_account).unwrap();
         assert!(budget_state.is_pending());
 
         // Now, acknowledge the time in the condition occurred and
         // that pubkey's funds are now available.
         let instruction =
-            BudgetInstruction::new_apply_timestamp(&alice_pubkey, &budget_pubkey, &bob_pubkey, dt);
-        alice_client.process_instruction(instruction).unwrap();
-        assert_eq!(bank.get_balance(&alice_pubkey), 1);
-        assert_eq!(bank.get_balance(&budget_pubkey), 0);
-        assert_eq!(bank.get_balance(&bob_pubkey), 1);
-        assert_eq!(bank.get_account(&budget_pubkey), None);
+            budget_instruction::apply_timestamp(&alice_pubkey, &budget_pubkey, &bob_pubkey, dt);
+        bank_client
+            .send_instruction(&alice_keypair, instruction)
+            .unwrap();
+        assert_eq!(bank_client.get_balance(&alice_pubkey).unwrap(), 1);
+        assert_eq!(bank_client.get_balance(&budget_pubkey).unwrap(), 0);
+        assert_eq!(bank_client.get_balance(&bob_pubkey).unwrap(), 1);
+        assert_eq!(bank_client.get_account_data(&budget_pubkey).unwrap(), None);
     }
 
     #[test]
     fn test_cancel_payment() {
-        let (bank, mint_keypair) = create_bank(3);
-        let alice_client = BankClient::new(&bank, mint_keypair);
-        let alice_pubkey = alice_client.pubkey();
-        let budget_pubkey = Keypair::new().pubkey();
-        let bob_pubkey = Keypair::new().pubkey();
+        let (bank, alice_keypair) = create_bank(3);
+        let bank_client = BankClient::new(&bank);
+        let alice_pubkey = alice_keypair.pubkey();
+        let budget_pubkey = Pubkey::new_rand();
+        let bob_pubkey = Pubkey::new_rand();
         let dt = Utc::now();
 
-        let instructions = BudgetInstruction::new_on_date(
+        let instructions = budget_instruction::on_date(
             &alice_pubkey,
             &bob_pubkey,
             &budget_pubkey,
@@ -336,34 +357,46 @@ mod tests {
             Some(alice_pubkey),
             1,
         );
-        alice_client.process_instructions(instructions).unwrap();
-        assert_eq!(bank.get_balance(&alice_pubkey), 2);
-        assert_eq!(bank.get_balance(&budget_pubkey), 1);
+        let message = Message::new(instructions);
+        bank_client
+            .send_message(&[&alice_keypair], message)
+            .unwrap();
+        assert_eq!(bank_client.get_balance(&alice_pubkey).unwrap(), 2);
+        assert_eq!(bank_client.get_balance(&budget_pubkey).unwrap(), 1);
 
-        let contract_account = bank.get_account(&budget_pubkey).unwrap();
-        let budget_state = BudgetState::deserialize(&contract_account.data).unwrap();
+        let contract_account = bank_client
+            .get_account_data(&budget_pubkey)
+            .unwrap()
+            .unwrap();
+        let budget_state = BudgetState::deserialize(&contract_account).unwrap();
         assert!(budget_state.is_pending());
 
         // Attack! try to put the lamports into the wrong account with cancel
-        let mallory_client = BankClient::new(&bank, Keypair::new());
-        let mallory_pubkey = mallory_client.pubkey();
-        alice_client.transfer(1, &mallory_pubkey).unwrap();
-        assert_eq!(bank.get_balance(&alice_pubkey), 1);
+        let mallory_keypair = Keypair::new();
+        let mallory_pubkey = mallory_keypair.pubkey();
+        bank_client
+            .transfer(1, &alice_keypair, &mallory_pubkey)
+            .unwrap();
+        assert_eq!(bank_client.get_balance(&alice_pubkey).unwrap(), 1);
 
         let instruction =
-            BudgetInstruction::new_apply_signature(&mallory_pubkey, &budget_pubkey, &bob_pubkey);
-        mallory_client.process_instruction(instruction).unwrap();
+            budget_instruction::apply_signature(&mallory_pubkey, &budget_pubkey, &bob_pubkey);
+        bank_client
+            .send_instruction(&mallory_keypair, instruction)
+            .unwrap();
         // nothing should be changed because apply witness didn't finalize a payment
-        assert_eq!(bank.get_balance(&alice_pubkey), 1);
-        assert_eq!(bank.get_balance(&budget_pubkey), 1);
-        assert_eq!(bank.get_account(&bob_pubkey), None);
+        assert_eq!(bank_client.get_balance(&alice_pubkey).unwrap(), 1);
+        assert_eq!(bank_client.get_balance(&budget_pubkey).unwrap(), 1);
+        assert_eq!(bank_client.get_account_data(&bob_pubkey).unwrap(), None);
 
         // Now, cancel the transaction. mint gets her funds back
         let instruction =
-            BudgetInstruction::new_apply_signature(&alice_pubkey, &budget_pubkey, &alice_pubkey);
-        alice_client.process_instruction(instruction).unwrap();
-        assert_eq!(bank.get_balance(&alice_pubkey), 2);
-        assert_eq!(bank.get_account(&budget_pubkey), None);
-        assert_eq!(bank.get_account(&bob_pubkey), None);
+            budget_instruction::apply_signature(&alice_pubkey, &budget_pubkey, &alice_pubkey);
+        bank_client
+            .send_instruction(&alice_keypair, instruction)
+            .unwrap();
+        assert_eq!(bank_client.get_balance(&alice_pubkey).unwrap(), 2);
+        assert_eq!(bank_client.get_account_data(&budget_pubkey).unwrap(), None);
+        assert_eq!(bank_client.get_account_data(&bob_pubkey).unwrap(), None);
     }
 }

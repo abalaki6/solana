@@ -11,6 +11,8 @@ clientNodeCount=0
 additionalFullNodeCount=10
 publicNetwork=false
 skipSetup=false
+skipStart=false
+externalNode=false
 tarChannelOrTag=edge
 delete=false
 enableGpu=false
@@ -25,13 +27,14 @@ usage() {
     echo "Error: $*"
   fi
   cat <<EOF
-usage: $0 [name] [cloud] [zone] [options...]
+usage: $0 -p network-name -C cloud -z zone1 [-z zone2] ... [-z zoneN] [options...]
 
 Deploys a CD testnet
 
-  name  - name of the network
-  cloud - cloud provider to use (gce, ec2)
-  zone  - cloud provider zone to deploy the network into
+  mandatory arguments:
+  -p [network-name]  - name of the network
+  -C [cloud] - cloud provider to use (gce, ec2)
+  -z [zone]  - cloud provider zone to deploy the network into.  Must specify at least one zone
 
   options:
    -t edge|beta|stable|vX.Y.Z  - Deploy the latest tarball release for the
@@ -57,18 +60,21 @@ EOF
   exit $exitcode
 }
 
-netName=$1
-cloudProvider=$2
-zone=$3
-[[ -n $netName ]] || usage
-[[ -n $cloudProvider ]] || usage "Cloud provider not specified"
-[[ -n $zone ]] || usage "Zone not specified"
-shift 3
+zone=()
 
-while getopts "h?p:Pn:c:t:gG:a:Dbd:ru" opt; do
+while getopts "h?p:Pn:c:t:gG:a:Dbd:rusxz:p:C:" opt; do
   case $opt in
   h | \?)
     usage
+    ;;
+  p)
+    netName=$OPTARG
+    ;;
+  C)
+    cloudProvider=$OPTARG
+    ;;
+  z)
+    zone+=("$OPTARG")
     ;;
   P)
     publicNetwork=true
@@ -111,6 +117,12 @@ while getopts "h?p:Pn:c:t:gG:a:Dbd:ru" opt; do
   r)
     skipSetup=true
     ;;
+  s)
+    skipStart=true
+    ;;
+  x)
+    externalNode=true
+    ;;
   u)
     blockstreamer=true
     ;;
@@ -119,6 +131,10 @@ while getopts "h?p:Pn:c:t:gG:a:Dbd:ru" opt; do
     ;;
   esac
 done
+
+[[ -n $netName ]] || usage
+[[ -n $cloudProvider ]] || usage "Cloud provider not specified"
+[[ -n ${zone[*]} ]] || usage "At least one zone must be specified"
 
 shutdown() {
   exitcode=$?
@@ -140,9 +156,16 @@ trap shutdown EXIT INT
 
 set -x
 
+# Build a string to pass zone opts to $cloudProvider.sh: "-z zone1 -z zone2 ..."
+zone_args=()
+for val in "${zone[@]}"; do
+  zone_args+=("-z $val")
+done
+
 if ! $skipSetup; then
   echo "--- $cloudProvider.sh delete"
-  time net/"$cloudProvider".sh delete -z "$zone" -p "$netName"
+  # shellcheck disable=SC2068
+  time net/"$cloudProvider".sh delete ${zone_args[@]} -p "$netName" ${externalNode:+-x}
   if $delete; then
     exit 0
   fi
@@ -150,11 +173,12 @@ if ! $skipSetup; then
   echo "--- $cloudProvider.sh create"
   create_args=(
     -p "$netName"
-    -z "$zone"
     -a "$bootstrapFullNodeAddress"
     -c "$clientNodeCount"
     -n "$additionalFullNodeCount"
   )
+  # shellcheck disable=SC2206
+  create_args+=(${zone_args[@]})
 
   if $blockstreamer; then
     create_args+=(-u)
@@ -180,13 +204,18 @@ if ! $skipSetup; then
     create_args+=(-P)
   fi
 
+  if $externalNode; then
+    create_args+=(-x)
+  fi
+
   time net/"$cloudProvider".sh create "${create_args[@]}"
 else
   echo "--- $cloudProvider.sh config"
   config_args=(
     -p "$netName"
-    -z "$zone"
   )
+  # shellcheck disable=SC2206
+  config_args+=(${zone_args[@]})
   if $publicNetwork; then
     config_args+=(-P)
   fi
@@ -218,19 +247,22 @@ if $skipSetup; then
 fi
 
 ok=true
-(
-  if $skipSetup; then
-    # TODO: Enable rolling updates
-    #op=update
-    op=restart
-  else
-    op=start
-  fi
+if ! $skipStart; then
+  (
+    if $skipSetup; then
+      # TODO: Enable rolling updates
+      #op=update
+      op=restart
+    else
+      op=start
+    fi
 
-  # shellcheck disable=SC2086 # Don't want to double quote maybeRejectExtraNodes
-  time net/net.sh $op -t "$tarChannelOrTag" \
-    $maybeSkipSetup $maybeRejectExtraNodes $maybeNoValidatorSanity $maybeNoLedgerVerify
-) || ok=false
+    # shellcheck disable=SC2086 # Don't want to double quote maybeRejectExtraNodes
+    time net/net.sh $op -t "$tarChannelOrTag" \
+      $maybeSkipSetup $maybeRejectExtraNodes $maybeNoValidatorSanity $maybeNoLedgerVerify
+  ) || ok=false
 
-net/net.sh logs
+  net/net.sh logs
+fi
+
 $ok

@@ -1,18 +1,18 @@
 use crate::append_vec::AppendVec;
-use crate::bank::Result;
-use crate::runtime::has_duplicates;
+use crate::message_processor::has_duplicates;
 use bincode::serialize;
 use hashbrown::{HashMap, HashSet};
 use log::*;
 use rand::{thread_rng, Rng};
 use solana_metrics::counter::Counter;
 use solana_sdk::account::Account;
+use solana_sdk::fee_calculator::FeeCalculator;
 use solana_sdk::hash::{hash, Hash};
 use solana_sdk::native_loader;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, KeypairUtil};
+use solana_sdk::transaction::Result;
 use solana_sdk::transaction::{Transaction, TransactionError};
-use solana_vote_api;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{create_dir_all, remove_dir_all};
@@ -106,10 +106,6 @@ struct AccountInfo {
     /// lamports in the account used when squashing kept for optimization
     /// purposes to remove accounts with zero balance.
     lamports: u64,
-
-    /// keep track if this is a vote account for performance reasons to avoid
-    /// having to read the accounts from the storage
-    is_vote_account: bool,
 }
 
 // in a given a Fork, which AppendVecId and offset
@@ -184,15 +180,6 @@ impl AccountStorageEntry {
 
 type AccountStorage = Vec<AccountStorageEntry>;
 
-#[derive(Default, Debug)]
-struct ForkInfo {
-    /// The number of transactions processed without error
-    transaction_count: u64,
-
-    /// List of all parents of this fork
-    parents: Vec<Fork>,
-}
-
 // This structure handles the load/store of the accounts
 #[derive(Default)]
 pub struct AccountsDB {
@@ -206,7 +193,7 @@ pub struct AccountsDB {
     next_id: AtomicUsize,
 
     /// Information related to the fork
-    fork_infos: RwLock<HashMap<Fork, ForkInfo>>,
+    parents_map: RwLock<HashMap<Fork, Vec<Fork>>>,
 
     /// Set of storage paths to pick from
     paths: Vec<String>,
@@ -263,7 +250,7 @@ impl AccountsDB {
             account_index,
             storage: RwLock::new(vec![]),
             next_id: AtomicUsize::new(0),
-            fork_infos: RwLock::new(HashMap::new()),
+            parents_map: RwLock::new(HashMap::new()),
             paths,
             file_size,
             inc_size,
@@ -279,19 +266,16 @@ impl AccountsDB {
 
     pub fn add_fork(&self, fork: Fork, parent: Option<Fork>) {
         {
-            let mut fork_infos = self.fork_infos.write().unwrap();
-            let mut fork_info = ForkInfo::default();
+            let mut parents_map = self.parents_map.write().unwrap();
+            let mut parents = Vec::new();
             if let Some(parent) = parent {
-                fork_info.parents.push(parent);
-                if let Some(parent_fork_info) = fork_infos.get(&parent) {
-                    fork_info.transaction_count = parent_fork_info.transaction_count;
-                    fork_info
-                        .parents
-                        .extend_from_slice(&parent_fork_info.parents);
+                parents.push(parent);
+                if let Some(grandparents) = parents_map.get(&parent) {
+                    parents.extend_from_slice(&grandparents);
                 }
             }
-            if let Some(old_fork_info) = fork_infos.insert(fork, fork_info) {
-                panic!("duplicate forks! {} {:?}", fork, old_fork_info);
+            if let Some(old_parents) = parents_map.insert(fork, parents) {
+                panic!("duplicate forks! {} {:?}", fork, old_parents);
             }
         }
         let mut account_maps = self.account_index.account_maps.write().unwrap();
@@ -311,48 +295,6 @@ impl AccountsDB {
         let mut stores = paths.iter().map(|p| self.new_storage_entry(&p)).collect();
         let mut storage = self.storage.write().unwrap();
         storage.append(&mut stores);
-    }
-
-    fn get_vote_accounts_by_fork(
-        &self,
-        fork: Fork,
-        account_maps: &HashMap<Fork, AccountMap>,
-        vote_accounts: &HashMap<Pubkey, Account>,
-    ) -> HashMap<Pubkey, Account> {
-        account_maps
-            .get(&fork)
-            .unwrap()
-            .read()
-            .unwrap()
-            .iter()
-            .filter_map(|(pubkey, account_info)| {
-                if account_info.is_vote_account && !vote_accounts.contains_key(pubkey) {
-                    Some((
-                        *pubkey,
-                        self.get_account(account_info.id, account_info.offset),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn get_vote_accounts(&self, fork: Fork) -> HashMap<Pubkey, Account> {
-        let account_maps = self.account_index.account_maps.read().unwrap();
-        let mut vote_accounts = HashMap::new();
-        vote_accounts = self.get_vote_accounts_by_fork(fork, &account_maps, &vote_accounts);
-        let fork_infos = self.fork_infos.read().unwrap();
-        if let Some(fork_info) = fork_infos.get(&fork) {
-            for parent_fork in fork_info.parents.iter() {
-                for (pubkey, account_info) in
-                    self.get_vote_accounts_by_fork(*parent_fork, &account_maps, &vote_accounts)
-                {
-                    vote_accounts.insert(pubkey, account_info);
-                }
-            }
-        }
-        vote_accounts
     }
 
     pub fn has_accounts(&self, fork: Fork) -> bool {
@@ -407,10 +349,10 @@ impl AccountsDB {
             return None;
         }
         // find most recent fork that is an ancestor of current_fork
-        let fork_infos = self.fork_infos.read().unwrap();
-        if let Some(fork_info) = fork_infos.get(&fork) {
-            for parent_fork in fork_info.parents.iter() {
-                if let Some(account_map) = account_maps.get(&parent_fork) {
+        let parents_map = self.parents_map.read().unwrap();
+        if let Some(parents) = parents_map.get(&fork) {
+            for parent in parents.iter() {
+                if let Some(account_map) = account_maps.get(&parent) {
                     let account_map = account_map.read().unwrap();
                     if let Some(account_info) = account_map.get(&pubkey) {
                         return Some(self.get_account(account_info.id, account_info.offset));
@@ -450,9 +392,9 @@ impl AccountsDB {
         if !walk_back {
             return program_accounts;
         }
-        let fork_infos = self.fork_infos.read().unwrap();
-        if let Some(fork_info) = fork_infos.get(&fork) {
-            for parent_fork in fork_info.parents.iter() {
+        let parents_map = self.parents_map.read().unwrap();
+        if let Some(parents) = parents_map.get(&fork) {
+            for parent_fork in parents.iter() {
                 let mut parent_accounts = self.load_program_accounts(*parent_fork, &program_id);
                 program_accounts.append(&mut parent_accounts);
             }
@@ -561,11 +503,11 @@ impl AccountsDB {
             account_map.clear();
         }
         account_maps.remove(&fork);
-        let mut fork_infos = self.fork_infos.write().unwrap();
-        for (_, fork_info) in fork_infos.iter_mut() {
-            fork_info.parents.retain(|parent_fork| *parent_fork != fork);
+        let mut parents_map = self.parents_map.write().unwrap();
+        for (_, parents) in parents_map.iter_mut() {
+            parents.retain(|parent_fork| *parent_fork != fork);
         }
-        fork_infos.remove(&fork);
+        parents_map.remove(&fork);
     }
 
     /// Store the account update.
@@ -581,7 +523,6 @@ impl AccountsDB {
                 id,
                 offset,
                 lamports: account.lamports,
-                is_vote_account: solana_vote_api::check_id(&account.owner),
             };
             self.insert_account_entry(&pubkey, &account_info, &mut account_map);
         }
@@ -599,9 +540,9 @@ impl AccountsDB {
                 continue;
             }
 
-            let tx = &txs[i];
+            let message = &txs[i].message();
             let acc = raccs.as_ref().unwrap();
-            for (key, account) in tx.account_keys.iter().zip(acc.0.iter()) {
+            for (key, account) in message.account_keys.iter().zip(acc.0.iter()) {
                 self.store(fork, key, account);
             }
         }
@@ -611,14 +552,16 @@ impl AccountsDB {
         &self,
         fork: Fork,
         tx: &Transaction,
+        fee: u64,
         error_counters: &mut ErrorCounters,
     ) -> Result<Vec<Account>> {
         // Copy all the accounts
-        if tx.signatures.is_empty() && tx.fee != 0 {
+        let message = tx.message();
+        if tx.signatures.is_empty() && fee != 0 {
             Err(TransactionError::MissingSignatureForFee)
         } else {
             // Check for unique account keys
-            if has_duplicates(&tx.account_keys) {
+            if has_duplicates(&message.account_keys) {
                 error_counters.account_loaded_twice += 1;
                 return Err(TransactionError::AccountLoadedTwice);
             }
@@ -626,17 +569,17 @@ impl AccountsDB {
             // There is no way to predict what program will execute without an error
             // If a fee can pay for execution then the program will be scheduled
             let mut called_accounts: Vec<Account> = vec![];
-            for key in &tx.account_keys {
+            for key in &message.account_keys {
                 called_accounts.push(self.load(fork, key, true).unwrap_or_default());
             }
             if called_accounts.is_empty() || called_accounts[0].lamports == 0 {
                 error_counters.account_not_found += 1;
                 Err(TransactionError::AccountNotFound)
-            } else if called_accounts[0].lamports < tx.fee {
+            } else if called_accounts[0].lamports < fee {
                 error_counters.insufficient_funds += 1;
                 Err(TransactionError::InsufficientFundsForFee)
             } else {
-                called_accounts[0].lamports -= tx.fee;
+                called_accounts[0].lamports -= fee;
                 Ok(called_accounts)
             }
         }
@@ -690,14 +633,16 @@ impl AccountsDB {
         tx: &Transaction,
         error_counters: &mut ErrorCounters,
     ) -> Result<Vec<Vec<(Pubkey, Account)>>> {
-        tx.instructions
+        let message = tx.message();
+        message
+            .instructions
             .iter()
             .map(|ix| {
-                if tx.program_ids.len() <= ix.program_ids_index as usize {
+                if message.program_ids().len() <= ix.program_ids_index as usize {
                     error_counters.account_not_found += 1;
                     return Err(TransactionError::AccountNotFound);
                 }
-                let program_id = tx.program_ids[ix.program_ids_index as usize];
+                let program_id = message.program_ids()[ix.program_ids_index as usize];
                 self.load_executable_accounts(fork, &program_id, error_counters)
             })
             .collect()
@@ -708,13 +653,15 @@ impl AccountsDB {
         fork: Fork,
         txs: &[Transaction],
         lock_results: Vec<Result<()>>,
+        fee_calculator: &FeeCalculator,
         error_counters: &mut ErrorCounters,
     ) -> Vec<Result<(InstructionAccounts, InstructionLoaders)>> {
         txs.iter()
             .zip(lock_results.into_iter())
             .map(|etx| match etx {
                 (tx, Ok(())) => {
-                    let accounts = self.load_tx_accounts(fork, tx, error_counters)?;
+                    let fee = fee_calculator.calculate_fee(tx.message());
+                    let accounts = self.load_tx_accounts(fork, tx, fee, error_counters)?;
                     let loaders = self.load_loaders(fork, tx, error_counters)?;
                     Ok((accounts, loaders))
                 }
@@ -723,33 +670,18 @@ impl AccountsDB {
             .collect()
     }
 
-    pub fn increment_transaction_count(&self, fork: Fork, tx_count: usize) {
-        let mut fork_infos = self.fork_infos.write().unwrap();
-        let fork_info = fork_infos.entry(fork).or_insert(ForkInfo::default());
-        fork_info.transaction_count += tx_count as u64;
-    }
-
-    pub fn transaction_count(&self, fork: Fork) -> u64 {
-        self.fork_infos
-            .read()
-            .unwrap()
-            .get(&fork)
-            .map_or(0, |fork_info| fork_info.transaction_count)
-    }
-
     fn remove_parents(&self, fork: Fork) -> Vec<Fork> {
-        let mut info = self.fork_infos.write().unwrap();
-        let fork_info = info.get_mut(&fork).unwrap();
-        fork_info.parents.split_off(0)
+        let mut parents_map = self.parents_map.write().unwrap();
+        let parents = parents_map.get_mut(&fork).unwrap();
+        parents.split_off(0)
     }
 
     fn is_squashed(&self, fork: Fork) -> bool {
-        self.fork_infos
+        self.parents_map
             .read()
             .unwrap()
             .get(&fork)
             .unwrap()
-            .parents
             .is_empty()
     }
 
@@ -759,11 +691,28 @@ impl AccountsDB {
 
         let account_maps = self.account_index.account_maps.read().unwrap();
         let mut account_map = account_maps.get(&fork).unwrap().write().unwrap();
-        for parent_fork in parents.iter() {
-            let parent_map = account_maps.get(&parent_fork).unwrap().read().unwrap();
-            for (pubkey, account_info) in parent_map.iter() {
-                if account_map.get(pubkey).is_none() {
-                    self.insert_account_entry(&pubkey, &account_info, &mut account_map);
+        {
+            let stores = self.storage.read().unwrap();
+            for parent_fork in parents.iter() {
+                let parents_map = account_maps.get(&parent_fork).unwrap().read().unwrap();
+                if account_map.len() > parents_map.len() {
+                    for (pubkey, account_info) in parents_map.iter() {
+                        if !account_map.contains_key(pubkey) {
+                            stores[account_info.id].add_account();
+                            account_map.insert(*pubkey, account_info.clone());
+                        }
+                    }
+                } else {
+                    let mut maps = parents_map.clone();
+                    for (_, account_info) in maps.iter() {
+                        stores[account_info.id].add_account();
+                    }
+                    for (pubkey, account_info) in account_map.iter() {
+                        if let Some(old_account_info) = maps.insert(*pubkey, account_info.clone()) {
+                            stores[old_account_info.id].remove_account();
+                        }
+                    }
+                    *account_map = maps;
                 }
             }
         }
@@ -861,6 +810,7 @@ impl Accounts {
         for k in keys {
             if locks.contains(k) {
                 error_counters.account_in_use += 1;
+                debug!("Account in use: {:?}", k);
                 return Err(TransactionError::AccountInUse);
             }
         }
@@ -880,7 +830,7 @@ impl Accounts {
             Err(TransactionError::AccountInUse) => (),
             _ => {
                 if let Some(locks) = account_locks.get_mut(&fork) {
-                    for k in &tx.account_keys {
+                    for k in &tx.message().account_keys {
                         locks.remove(k);
                     }
                     if locks.is_empty() {
@@ -907,7 +857,7 @@ impl Accounts {
                 Self::lock_account(
                     fork,
                     &mut account_locks,
-                    &tx.account_keys,
+                    &tx.message().account_keys,
                     &mut error_counters,
                 )
             })
@@ -939,10 +889,11 @@ impl Accounts {
         fork: Fork,
         txs: &[Transaction],
         results: Vec<Result<()>>,
+        fee_calculator: &FeeCalculator,
         error_counters: &mut ErrorCounters,
     ) -> Vec<Result<(InstructionAccounts, InstructionLoaders)>> {
         self.accounts_db
-            .load_accounts(fork, txs, results, error_counters)
+            .load_accounts(fork, txs, results, fee_calculator, error_counters)
     }
 
     /// Store the accounts into the DB
@@ -956,26 +907,11 @@ impl Accounts {
         self.accounts_db.store_accounts(fork, txs, res, loaded)
     }
 
-    pub fn increment_transaction_count(&self, fork: Fork, tx_count: usize) {
-        self.accounts_db.increment_transaction_count(fork, tx_count)
-    }
-
-    pub fn transaction_count(&self, fork: Fork) -> u64 {
-        self.accounts_db.transaction_count(fork)
-    }
-
     /// accounts starts with an empty data structure for every child/fork
     ///   this function squashes all the parents into this instance
     pub fn squash(&self, fork: Fork) {
         assert!(!self.account_locks.lock().unwrap().contains_key(&fork));
         self.accounts_db.squash(fork);
-    }
-
-    pub fn get_vote_accounts(&self, fork: Fork) -> impl Iterator<Item = (Pubkey, Account)> {
-        self.accounts_db
-            .get_vote_accounts(fork)
-            .into_iter()
-            .filter(|(_, acc)| acc.lamports != 0)
     }
 
     pub fn remove_accounts(&self, fork: Fork) {
@@ -1002,9 +938,10 @@ mod tests {
         });
     }
 
-    fn load_accounts(
+    fn load_accounts_with_fee(
         tx: Transaction,
         ka: &Vec<(Pubkey, Account)>,
+        fee_calculator: &FeeCalculator,
         error_counters: &mut ErrorCounters,
     ) -> Vec<Result<(InstructionAccounts, InstructionLoaders)>> {
         let accounts = Accounts::new(0, None);
@@ -1012,8 +949,17 @@ mod tests {
             accounts.store_slow(0, &ka.0, &ka.1);
         }
 
-        let res = accounts.load_accounts(0, &[tx], vec![Ok(())], error_counters);
+        let res = accounts.load_accounts(0, &[tx], vec![Ok(())], &fee_calculator, error_counters);
         res
+    }
+
+    fn load_accounts(
+        tx: Transaction,
+        ka: &Vec<(Pubkey, Account)>,
+        error_counters: &mut ErrorCounters,
+    ) -> Vec<Result<(InstructionAccounts, InstructionLoaders)>> {
+        let fee_calculator = FeeCalculator::default();
+        load_accounts_with_fee(tx, ka, &fee_calculator, error_counters)
     }
 
     #[test]
@@ -1026,7 +972,6 @@ mod tests {
             &[],
             &[],
             Hash::default(),
-            0,
             vec![native_loader::id()],
             instructions,
         );
@@ -1050,7 +995,6 @@ mod tests {
             &[&keypair],
             &[],
             Hash::default(),
-            0,
             vec![native_loader::id()],
             instructions,
         );
@@ -1082,7 +1026,6 @@ mod tests {
             &[&keypair],
             &[],
             Hash::default(),
-            0,
             vec![Pubkey::default()],
             instructions,
         );
@@ -1110,12 +1053,15 @@ mod tests {
             &[&keypair],
             &[],
             Hash::default(),
-            10,
             vec![native_loader::id()],
             instructions,
         );
 
-        let loaded_accounts = load_accounts(tx, &accounts, &mut error_counters);
+        let fee_calculator = FeeCalculator::new(10);
+        assert_eq!(fee_calculator.calculate_fee(tx.message()), 10);
+
+        let loaded_accounts =
+            load_accounts_with_fee(tx, &accounts, &fee_calculator, &mut error_counters);
 
         assert_eq!(error_counters.insufficient_funds, 1);
         assert_eq!(loaded_accounts.len(), 1);
@@ -1145,7 +1091,6 @@ mod tests {
             &[&keypair],
             &[key1],
             Hash::default(),
-            0,
             vec![native_loader::id()],
             instructions,
         );
@@ -1217,7 +1162,6 @@ mod tests {
             &[&keypair],
             &[],
             Hash::default(),
-            0,
             vec![key6],
             instructions,
         );
@@ -1251,7 +1195,6 @@ mod tests {
             &[&keypair],
             &[],
             Hash::default(),
-            0,
             vec![key1],
             instructions,
         );
@@ -1284,7 +1227,6 @@ mod tests {
             &[&keypair],
             &[],
             Hash::default(),
-            0,
             vec![key1],
             instructions,
         );
@@ -1333,7 +1275,6 @@ mod tests {
             &[&keypair],
             &[],
             Hash::default(),
-            0,
             vec![key1, key2],
             instructions,
         );
@@ -1377,7 +1318,6 @@ mod tests {
             &[&keypair],
             &[pubkey],
             Hash::default(),
-            0,
             vec![native_loader::id()],
             instructions,
         );
@@ -1483,13 +1423,13 @@ mod tests {
         let db = AccountsDB::new(0, &paths.paths);
 
         let mut pubkeys: Vec<Pubkey> = vec![];
-        create_account(&db, &mut pubkeys, 0, 100, 0);
+        create_account(&db, &mut pubkeys, 0, 100, 0, 0);
         for _ in 1..100 {
             let idx = thread_rng().gen_range(0, 99);
             let account = db.load(0, &pubkeys[idx], true).unwrap();
             let mut default_account = Account::default();
             default_account.lamports = (idx + 1) as u64;
-            assert_eq!(compare_account(&default_account, &account), true);
+            assert_eq!(default_account, account);
         }
         db.add_fork(1, Some(0));
 
@@ -1525,6 +1465,42 @@ mod tests {
     }
 
     #[test]
+    fn test_accountsdb_squash_merge() {
+        let paths = get_tmp_accounts_path!();
+        let db = AccountsDB::new(0, &paths.paths);
+
+        let mut pubkeys: Vec<Pubkey> = vec![];
+        create_account(
+            &db,
+            &mut pubkeys,
+            0,
+            2,
+            ACCOUNT_DATA_FILE_SIZE as usize / 3,
+            0,
+        );
+        assert!(check_storage(&db, 2));
+
+        db.add_fork(1, Some(0));
+        let pubkey = Pubkey::new_rand();
+        let account = Account::new(1, ACCOUNT_DATA_FILE_SIZE as usize / 3, &pubkey);
+        db.store(1, &pubkey, &account);
+        db.store(1, &pubkeys[0], &account);
+        {
+            let stores = db.storage.read().unwrap();
+            assert_eq!(stores.len(), 2);
+            assert_eq!(stores[0].count.load(Ordering::Relaxed), 2);
+            assert_eq!(stores[1].count.load(Ordering::Relaxed), 2);
+        }
+        db.squash(1);
+        {
+            let stores = db.storage.read().unwrap();
+            assert_eq!(stores.len(), 2);
+            assert_eq!(stores[0].count.load(Ordering::Relaxed), 3);
+            assert_eq!(stores[1].count.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
     fn test_accounts_unsquashed() {
         let key = Pubkey::default();
 
@@ -1554,24 +1530,22 @@ mod tests {
         pubkeys: &mut Vec<Pubkey>,
         fork: Fork,
         num: usize,
+        space: usize,
         num_vote: usize,
     ) {
         for t in 0..num {
-            let pubkey = Keypair::new().pubkey();
-            let mut default_account = Account::default();
+            let pubkey = Pubkey::new_rand();
+            let account = Account::new((t + 1) as u64, space, &Account::default().owner);
             pubkeys.push(pubkey.clone());
-            default_account.lamports = (t + 1) as u64;
             assert!(accounts.load(fork, &pubkey, true).is_none());
-            accounts.store(fork, &pubkey, &default_account);
+            accounts.store(fork, &pubkey, &account);
         }
         for t in 0..num_vote {
-            let pubkey = Keypair::new().pubkey();
-            let mut default_account = Account::default();
+            let pubkey = Pubkey::new_rand();
+            let account = Account::new((num + t + 1) as u64, space, &solana_vote_api::id());
             pubkeys.push(pubkey.clone());
-            default_account.owner = solana_vote_api::id();
-            default_account.lamports = (num + t + 1) as u64;
             assert!(accounts.load(fork, &pubkey, true).is_none());
-            accounts.store(fork, &pubkey, &default_account);
+            accounts.store(fork, &pubkey, &account);
         }
     }
 
@@ -1586,21 +1560,10 @@ mod tests {
                 } else {
                     let mut default_account = Account::default();
                     default_account.lamports = account.lamports;
-                    assert_eq!(compare_account(&default_account, &account), true);
+                    assert_eq!(default_account, account);
                 }
             }
         }
-    }
-
-    fn compare_account(account1: &Account, account2: &Account) -> bool {
-        if account1.data != account2.data
-            || account1.owner != account2.owner
-            || account1.executable != account2.executable
-            || account1.lamports != account2.lamports
-        {
-            return false;
-        }
-        true
     }
 
     fn check_storage(accounts: &AccountsDB, count: usize) -> bool {
@@ -1619,7 +1582,7 @@ mod tests {
             let account = accounts.load(fork, &pubkeys[idx], true).unwrap();
             let mut default_account = Account::default();
             default_account.lamports = (idx + 1) as u64;
-            assert_eq!(compare_account(&default_account, &account), true);
+            assert_eq!(default_account, account);
         }
     }
 
@@ -1635,11 +1598,11 @@ mod tests {
         let paths = get_tmp_accounts_path!();
         let accounts = AccountsDB::new(0, &paths.paths);
         let mut pubkeys: Vec<Pubkey> = vec![];
-        create_account(&accounts, &mut pubkeys, 0, 1, 0);
+        create_account(&accounts, &mut pubkeys, 0, 1, 0, 0);
         let account = accounts.load(0, &pubkeys[0], true).unwrap();
         let mut default_account = Account::default();
         default_account.lamports = 1;
-        assert_eq!(compare_account(&default_account, &account), true);
+        assert_eq!(default_account, account);
     }
 
     #[test]
@@ -1647,7 +1610,7 @@ mod tests {
         let paths = get_tmp_accounts_path("many0,many1");
         let accounts = AccountsDB::new(0, &paths.paths);
         let mut pubkeys: Vec<Pubkey> = vec![];
-        create_account(&accounts, &mut pubkeys, 0, 100, 0);
+        create_account(&accounts, &mut pubkeys, 0, 100, 0, 0);
         check_accounts(&accounts, &pubkeys, 0);
     }
 
@@ -1656,7 +1619,7 @@ mod tests {
         let paths = get_tmp_accounts_path!();
         let accounts = AccountsDB::new(0, &paths.paths);
         let mut pubkeys: Vec<Pubkey> = vec![];
-        create_account(&accounts, &mut pubkeys, 0, 100, 0);
+        create_account(&accounts, &mut pubkeys, 0, 100, 0, 0);
         update_accounts(&accounts, &pubkeys, 0, 99);
         assert_eq!(check_storage(&accounts, 100), true);
     }
@@ -1668,7 +1631,7 @@ mod tests {
         let accounts = AccountsDB::new_with_file_size(0, &paths.paths, size, 0);
         let mut keys = vec![];
         for i in 0..9 {
-            let key = Keypair::new().pubkey();
+            let key = Pubkey::new_rand();
             let account = Account::new(i + 1, size as usize / 4, &key);
             accounts.store(0, &key, &account);
             keys.push(key);
@@ -1700,7 +1663,7 @@ mod tests {
             AccountStorageStatus::StorageAvailable,
             AccountStorageStatus::StorageFull,
         ];
-        let pubkey1 = Keypair::new().pubkey();
+        let pubkey1 = Pubkey::new_rand();
         let account1 = Account::new(1, ACCOUNT_DATA_FILE_SIZE as usize / 2, &pubkey1);
         accounts.store(0, &pubkey1, &account1);
         {
@@ -1710,7 +1673,7 @@ mod tests {
             assert_eq!(stores[0].get_status(), status[0]);
         }
 
-        let pubkey2 = Keypair::new().pubkey();
+        let pubkey2 = Pubkey::new_rand();
         let account2 = Account::new(1, ACCOUNT_DATA_FILE_SIZE as usize / 2, &pubkey2);
         accounts.store(0, &pubkey2, &account2);
         {
@@ -1747,11 +1710,11 @@ mod tests {
         let paths = get_tmp_accounts_path!();
         let accounts = AccountsDB::new(0, &paths.paths);
         let mut pubkeys0: Vec<Pubkey> = vec![];
-        create_account(&accounts, &mut pubkeys0, 0, 100, 0);
+        create_account(&accounts, &mut pubkeys0, 0, 100, 0, 0);
         assert_eq!(check_storage(&accounts, 100), true);
         accounts.add_fork(1, Some(0));
         let mut pubkeys1: Vec<Pubkey> = vec![];
-        create_account(&accounts, &mut pubkeys1, 1, 100, 0);
+        create_account(&accounts, &mut pubkeys1, 1, 100, 0, 0);
         assert_eq!(check_storage(&accounts, 200), true);
         accounts.remove_accounts(0);
         check_accounts(&accounts, &pubkeys1, 1);
@@ -1759,100 +1722,13 @@ mod tests {
         assert_eq!(check_storage(&accounts, 100), true);
         accounts.add_fork(2, Some(1));
         let mut pubkeys2: Vec<Pubkey> = vec![];
-        create_account(&accounts, &mut pubkeys2, 2, 100, 0);
+        create_account(&accounts, &mut pubkeys2, 2, 100, 0, 0);
         assert_eq!(check_storage(&accounts, 200), true);
         accounts.remove_accounts(1);
         check_accounts(&accounts, &pubkeys2, 2);
         assert_eq!(check_storage(&accounts, 100), true);
         accounts.remove_accounts(2);
         assert_eq!(check_storage(&accounts, 0), true);
-    }
-
-    #[test]
-    fn test_accounts_vote_filter() {
-        let accounts = Accounts::new(0, None);
-        let mut vote_account = Account::new(1, 0, &solana_vote_api::id());
-        let key = Keypair::new().pubkey();
-        accounts.store_slow(0, &key, &vote_account);
-
-        accounts.new_from_parent(1, 0);
-
-        let mut vote_accounts: Vec<_> = accounts.get_vote_accounts(1).collect();
-        assert_eq!(vote_accounts.len(), 1);
-
-        vote_account.lamports = 0;
-        accounts.store_slow(1, &key, &vote_account);
-
-        vote_accounts = accounts.get_vote_accounts(1).collect();
-        assert_eq!(vote_accounts.len(), 0);
-
-        let mut vote_account1 = Account::new(2, 0, &solana_vote_api::id());
-        let key1 = Keypair::new().pubkey();
-        accounts.store_slow(1, &key1, &vote_account1);
-
-        accounts.squash(1);
-        vote_accounts = accounts.get_vote_accounts(0).collect();
-        assert_eq!(vote_accounts.len(), 1);
-        vote_accounts = accounts.get_vote_accounts(1).collect();
-        assert_eq!(vote_accounts.len(), 1);
-
-        vote_account1.lamports = 0;
-        accounts.store_slow(1, &key1, &vote_account1);
-        accounts.store_slow(0, &key, &vote_account);
-
-        vote_accounts = accounts.get_vote_accounts(1).collect();
-        assert_eq!(vote_accounts.len(), 0);
-    }
-
-    #[test]
-    fn test_account_vote() {
-        let paths = get_tmp_accounts_path!();
-        let accounts_db = AccountsDB::new(0, &paths.paths);
-        let mut pubkeys: Vec<Pubkey> = vec![];
-        create_account(&accounts_db, &mut pubkeys, 0, 0, 1);
-        let accounts = accounts_db.get_vote_accounts(0);
-        assert_eq!(accounts.len(), 1);
-        accounts.iter().for_each(|(_, account)| {
-            assert_eq!(account.owner, solana_vote_api::id());
-        });
-        let lastkey = Keypair::new().pubkey();
-        let mut lastaccount = Account::new(1, 0, &solana_vote_api::id());
-        accounts_db.store(0, &lastkey, &lastaccount);
-        assert_eq!(accounts_db.get_vote_accounts(0).len(), 2);
-
-        accounts_db.add_fork(1, Some(0));
-
-        assert_eq!(
-            accounts_db.get_vote_accounts(1),
-            accounts_db.get_vote_accounts(0)
-        );
-
-        info!("storing lamports=0 to fork 1");
-        // should store a lamports=0 account in 1
-        lastaccount.lamports = 0;
-        accounts_db.store(1, &lastkey, &lastaccount);
-        // len == 2 because lamports=0 accounts are filtered at the Accounts interface.
-        assert_eq!(accounts_db.get_vote_accounts(1).len(), 2);
-
-        accounts_db.squash(1);
-
-        // should still be in 0
-        assert_eq!(accounts_db.get_vote_accounts(0).len(), 2);
-
-        // delete it from 0
-        accounts_db.store(0, &lastkey, &lastaccount);
-        assert_eq!(accounts_db.get_vote_accounts(0).len(), 1);
-        assert_eq!(accounts_db.get_vote_accounts(1).len(), 1);
-
-        // Add fork 2 and squash
-        accounts_db.add_fork(2, Some(1));
-        accounts_db.store(2, &lastkey, &lastaccount);
-
-        accounts_db.squash(1);
-        accounts_db.squash(2);
-
-        assert_eq!(accounts_db.get_vote_accounts(1).len(), 1);
-        assert_eq!(accounts_db.get_vote_accounts(2).len(), 1);
     }
 
     #[test]
@@ -1877,29 +1753,10 @@ mod tests {
         let accounts = AccountsDB::new(0, &paths.paths);
         let mut error_counters = ErrorCounters::default();
         assert_eq!(
-            accounts.load_executable_accounts(0, &Keypair::new().pubkey(), &mut error_counters),
+            accounts.load_executable_accounts(0, &Pubkey::new_rand(), &mut error_counters),
             Err(TransactionError::AccountNotFound)
         );
         assert_eq!(error_counters.account_not_found, 1);
-    }
-
-    #[test]
-    fn test_accountsdb_inherit_tx_count() {
-        let paths = get_tmp_accounts_path!();
-        let accounts = AccountsDB::new(0, &paths.paths);
-        assert_eq!(accounts.transaction_count(0), 0);
-        accounts.increment_transaction_count(0, 1);
-        assert_eq!(accounts.transaction_count(0), 1);
-        // fork and check that tx count is inherited
-        accounts.add_fork(1, Some(0));
-        assert_eq!(accounts.transaction_count(1), 1);
-        // Parent fork shouldn't change
-        accounts.increment_transaction_count(1, 1);
-        assert_eq!(accounts.transaction_count(1), 2);
-        assert_eq!(accounts.transaction_count(0), 1);
-        // Squash shouldn't effect tx count
-        accounts.squash(1);
-        assert_eq!(accounts.transaction_count(1), 2);
     }
 
     #[test]
@@ -1908,13 +1765,13 @@ mod tests {
         let accounts_db = AccountsDB::new(0, &paths.paths);
 
         // Load accounts owned by various programs into AccountsDB
-        let pubkey0 = Keypair::new().pubkey();
+        let pubkey0 = Pubkey::new_rand();
         let account0 = Account::new(1, 0, &Pubkey::new(&[2; 32]));
         accounts_db.store(0, &pubkey0, &account0);
-        let pubkey1 = Keypair::new().pubkey();
+        let pubkey1 = Pubkey::new_rand();
         let account1 = Account::new(1, 0, &Pubkey::new(&[2; 32]));
         accounts_db.store(0, &pubkey1, &account1);
-        let pubkey2 = Keypair::new().pubkey();
+        let pubkey2 = Pubkey::new_rand();
         let account2 = Account::new(1, 0, &Pubkey::new(&[3; 32]));
         accounts_db.store(0, &pubkey2, &account2);
 

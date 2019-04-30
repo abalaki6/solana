@@ -3,7 +3,7 @@ use crate::cluster::Cluster;
 use crate::cluster_info::{Node, FULLNODE_PORT_RANGE};
 use crate::contact_info::ContactInfo;
 use crate::fullnode::{Fullnode, FullnodeConfig};
-use crate::gossip_service::discover;
+use crate::gossip_service::discover_nodes;
 use crate::replicator::Replicator;
 use crate::service::Service;
 use solana_client::thin_client::create_client;
@@ -11,11 +11,13 @@ use solana_client::thin_client::ThinClient;
 use solana_sdk::genesis_block::GenesisBlock;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, KeypairUtil};
-use solana_sdk::system_transaction::SystemTransaction;
+use solana_sdk::sync_client::SyncClient;
+use solana_sdk::system_transaction;
 use solana_sdk::timing::DEFAULT_SLOTS_PER_EPOCH;
 use solana_sdk::timing::DEFAULT_TICKS_PER_SLOT;
+use solana_sdk::transaction::Transaction;
+use solana_vote_api::vote_instruction;
 use solana_vote_api::vote_state::VoteState;
-use solana_vote_api::vote_transaction::VoteTransaction;
 use std::collections::HashMap;
 use std::fs::remove_dir_all;
 use std::io::{Error, ErrorKind, Result};
@@ -35,6 +37,20 @@ impl FullnodeInfo {
     }
 }
 
+pub struct ReplicatorInfo {
+    pub replicator_storage_id: Pubkey,
+    pub ledger_path: String,
+}
+
+impl ReplicatorInfo {
+    fn new(storage_id: Pubkey, ledger_path: String) -> Self {
+        Self {
+            replicator_storage_id: storage_id,
+            ledger_path,
+        }
+    }
+}
+
 pub struct LocalCluster {
     /// Keypair with funding to particpiate in the network
     pub funding_keypair: Keypair,
@@ -44,21 +60,22 @@ pub struct LocalCluster {
     pub fullnode_infos: HashMap<Pubkey, FullnodeInfo>,
     fullnodes: HashMap<Pubkey, Fullnode>,
     genesis_ledger_path: String,
-    genesis_block: GenesisBlock,
+    pub genesis_block: GenesisBlock,
     replicators: Vec<Replicator>,
-    pub replicator_ledger_paths: Vec<String>,
+    pub replicator_infos: HashMap<Pubkey, ReplicatorInfo>,
 }
 
 impl LocalCluster {
     pub fn new(num_nodes: usize, cluster_lamports: u64, lamports_per_node: u64) -> Self {
         let stakes: Vec<_> = (0..num_nodes).map(|_| lamports_per_node).collect();
-        Self::new_with_config(&stakes, cluster_lamports, &FullnodeConfig::default())
+        Self::new_with_config(&stakes, cluster_lamports, &FullnodeConfig::default(), &[])
     }
 
     pub fn new_with_config(
         node_stakes: &[u64],
         cluster_lamports: u64,
         fullnode_config: &FullnodeConfig,
+        native_instruction_processors: &[(String, Pubkey)],
     ) -> Self {
         Self::new_with_config_replicators(
             node_stakes,
@@ -67,6 +84,7 @@ impl LocalCluster {
             0,
             DEFAULT_TICKS_PER_SLOT,
             DEFAULT_SLOTS_PER_EPOCH,
+            native_instruction_processors,
         )
     }
 
@@ -76,6 +94,7 @@ impl LocalCluster {
         fullnode_config: &FullnodeConfig,
         ticks_per_slot: u64,
         slots_per_epoch: u64,
+        native_instruction_processors: &[(String, Pubkey)],
     ) -> Self {
         Self::new_with_config_replicators(
             node_stakes,
@@ -84,6 +103,7 @@ impl LocalCluster {
             0,
             ticks_per_slot,
             slots_per_epoch,
+            native_instruction_processors,
         )
     }
 
@@ -94,6 +114,7 @@ impl LocalCluster {
         num_replicators: usize,
         ticks_per_slot: u64,
         slots_per_epoch: u64,
+        native_instruction_processors: &[(String, Pubkey)],
     ) -> Self {
         let leader_keypair = Arc::new(Keypair::new());
         let leader_pubkey = leader_keypair.pubkey();
@@ -102,6 +123,9 @@ impl LocalCluster {
             GenesisBlock::new_with_leader(cluster_lamports, &leader_pubkey, node_stakes[0]);
         genesis_block.ticks_per_slot = ticks_per_slot;
         genesis_block.slots_per_epoch = slots_per_epoch;
+        genesis_block
+            .native_instruction_processors
+            .extend_from_slice(native_instruction_processors);
         let (genesis_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
         let leader_ledger_path = tmp_copy_blocktree!(&genesis_ledger_path);
         let voting_keypair = Keypair::new();
@@ -130,10 +154,10 @@ impl LocalCluster {
             entry_point_info: leader_contact_info,
             fullnodes,
             replicators: vec![],
-            replicator_ledger_paths: vec![],
             genesis_ledger_path,
             genesis_block,
             fullnode_infos,
+            replicator_infos: HashMap::new(),
             fullnode_config: fullnode_config.clone(),
         };
 
@@ -141,11 +165,17 @@ impl LocalCluster {
             cluster.add_validator(&fullnode_config, *stake);
         }
 
+        discover_nodes(&cluster.entry_point_info.gossip, node_stakes.len()).unwrap();
+
         for _ in 0..num_replicators {
             cluster.add_replicator();
         }
 
-        discover(&cluster.entry_point_info.gossip, node_stakes.len()).unwrap();
+        discover_nodes(
+            &cluster.entry_point_info.gossip,
+            node_stakes.len() + num_replicators,
+        )
+        .unwrap();
 
         cluster
     }
@@ -162,8 +192,8 @@ impl LocalCluster {
             node.join().unwrap();
         }
 
-        while let Some(node) = self.replicators.pop() {
-            node.close();
+        while let Some(replicator) = self.replicators.pop() {
+            replicator.close();
         }
     }
 
@@ -183,7 +213,7 @@ impl LocalCluster {
 
         // Send each validator some lamports to vote
         let validator_balance =
-            Self::transfer(&client, &self.funding_keypair, &validator_pubkey, stake);
+            Self::transfer_with_client(&client, &self.funding_keypair, &validator_pubkey, stake);
         info!(
             "validator {} balance {}",
             validator_pubkey, validator_balance
@@ -212,18 +242,21 @@ impl LocalCluster {
 
     fn add_replicator(&mut self) {
         let replicator_keypair = Arc::new(Keypair::new());
+        let replicator_id = replicator_keypair.pubkey();
+        let storage_keypair = Arc::new(Keypair::new());
+        let storage_id = storage_keypair.pubkey();
         let client = create_client(
             self.entry_point_info.client_facing_addr(),
             FULLNODE_PORT_RANGE,
         );
 
-        Self::transfer(
+        Self::transfer_with_client(
             &client,
             &self.funding_keypair,
             &replicator_keypair.pubkey(),
             1,
         );
-        let replicator_node = Node::new_localhost_replicator(&replicator_keypair.pubkey());
+        let replicator_node = Node::new_localhost_replicator(&replicator_id);
 
         let (replicator_ledger_path, _blockhash) = create_new_tmp_ledger!(&self.genesis_block);
         let replicator = Replicator::new(
@@ -231,12 +264,16 @@ impl LocalCluster {
             replicator_node,
             self.entry_point_info.clone(),
             replicator_keypair,
+            storage_keypair,
             None,
         )
         .unwrap();
 
-        self.replicator_ledger_paths.push(replicator_ledger_path);
         self.replicators.push(replicator);
+        self.replicator_infos.insert(
+            replicator_id,
+            ReplicatorInfo::new(storage_id, replicator_ledger_path),
+        );
     }
 
     fn close(&mut self) {
@@ -245,14 +282,22 @@ impl LocalCluster {
             .fullnode_infos
             .values()
             .map(|f| &f.ledger_path)
-            .chain(self.replicator_ledger_paths.iter())
+            .chain(self.replicator_infos.values().map(|info| &info.ledger_path))
         {
             remove_dir_all(&ledger_path)
                 .unwrap_or_else(|_| panic!("Unable to remove {}", ledger_path));
         }
     }
 
-    fn transfer(
+    pub fn transfer(&self, source_keypair: &Keypair, dest_pubkey: &Pubkey, lamports: u64) -> u64 {
+        let client = create_client(
+            self.entry_point_info.client_facing_addr(),
+            FULLNODE_PORT_RANGE,
+        );
+        Self::transfer_with_client(&client, source_keypair, dest_pubkey, lamports)
+    }
+
+    fn transfer_with_client(
         client: &ThinClient,
         source_keypair: &Keypair,
         dest_pubkey: &Pubkey,
@@ -260,8 +305,13 @@ impl LocalCluster {
     ) -> u64 {
         trace!("getting leader blockhash");
         let blockhash = client.get_recent_blockhash().unwrap();
-        let mut tx =
-            SystemTransaction::new_account(&source_keypair, dest_pubkey, lamports, blockhash, 0);
+        let mut tx = system_transaction::create_user_account(
+            &source_keypair,
+            dest_pubkey,
+            lamports,
+            blockhash,
+            0,
+        );
         info!(
             "executing transfer of {} from {} to {}",
             lamports,
@@ -287,12 +337,15 @@ impl LocalCluster {
         // Create the vote account if necessary
         if client.poll_get_balance(&vote_account_pubkey).unwrap_or(0) == 0 {
             // 1) Create vote account
-            let mut transaction = VoteTransaction::new_account(
-                from_account,
+            let instructions = vote_instruction::create_account(
+                &from_account.pubkey(),
                 &vote_account_pubkey,
-                client.get_recent_blockhash().unwrap(),
                 amount,
-                1,
+            );
+            let mut transaction = Transaction::new_signed_instructions(
+                &[from_account.as_ref()],
+                instructions,
+                client.get_recent_blockhash().unwrap(),
             );
 
             client
@@ -303,11 +356,13 @@ impl LocalCluster {
                 .expect("get balance");
 
             // 2) Set delegate for new vote account
-            let mut transaction = VoteTransaction::delegate_vote_account(
-                vote_account,
+            let vote_instruction =
+                vote_instruction::delegate_stake(&vote_account_pubkey, &delegate_id);
+
+            let mut transaction = Transaction::new_signed_instructions(
+                &[vote_account],
+                vec![vote_instruction],
                 client.get_recent_blockhash().unwrap(),
-                &delegate_id,
-                0,
             );
 
             client
@@ -317,7 +372,7 @@ impl LocalCluster {
 
         info!("Checking for vote account registration");
         let vote_account_user_data = client.get_account_data(&vote_account_pubkey);
-        if let Ok(vote_account_user_data) = vote_account_user_data {
+        if let Ok(Some(vote_account_user_data)) = vote_account_user_data {
             if let Ok(vote_state) = VoteState::deserialize(&vote_account_user_data) {
                 if vote_state.delegate_id == delegate_id {
                     return Ok(());
@@ -397,6 +452,7 @@ mod test {
             num_replicators,
             16,
             16,
+            &[],
         );
         assert_eq!(cluster.fullnodes.len(), NUM_NODES);
         assert_eq!(cluster.replicators.len(), num_replicators);

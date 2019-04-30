@@ -4,10 +4,12 @@ use crate::entry::{Entry, EntrySlice};
 use crate::leader_schedule_utils;
 use rayon::prelude::*;
 use solana_metrics::counter::Counter;
-use solana_runtime::bank::{Bank, Result};
+use solana_runtime::bank::Bank;
+use solana_runtime::locked_accounts_results::LockedAccountsResults;
 use solana_sdk::genesis_block::GenesisBlock;
 use solana_sdk::timing::duration_as_ms;
 use solana_sdk::timing::MAX_RECENT_BLOCKHASHES;
+use solana_sdk::transaction::{Result, TransactionError};
 use std::result;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,18 +21,43 @@ fn first_err(results: &[Result<()>]) -> Result<()> {
     Ok(())
 }
 
-fn par_execute_entries(bank: &Bank, entries: &[(&Entry, Vec<Result<()>>)]) -> Result<()> {
+fn is_unexpected_validator_error(r: &Result<()>) -> bool {
+    match r {
+        Err(TransactionError::DuplicateSignature) => true,
+        _ => false,
+    }
+}
+
+fn par_execute_entries(bank: &Bank, entries: &[(&Entry, LockedAccountsResults)]) -> Result<()> {
     inc_new_counter_info!("bank-par_execute_entries-count", entries.len());
     let results: Vec<Result<()>> = entries
         .into_par_iter()
-        .map(|(e, lock_results)| {
+        .map(|(e, locked_accounts)| {
             let results = bank.load_execute_and_commit_transactions(
                 &e.transactions,
-                lock_results.to_vec(),
+                locked_accounts,
                 MAX_RECENT_BLOCKHASHES,
             );
-            bank.unlock_accounts(&e.transactions, &results);
-            first_err(&results)
+            let mut first_err = None;
+            for r in results {
+                if let Err(ref e) = r {
+                    if first_err.is_none() {
+                        first_err = Some(r.clone());
+                    }
+                    if is_unexpected_validator_error(&r) {
+                        warn!("Unexpected validator error: {:?}", e);
+                        solana_metrics::submit(
+                            solana_metrics::influxdb::Point::new("validator_process_entry_error")
+                                .add_field(
+                                    "error",
+                                    solana_metrics::influxdb::Value::String(format!("{:?}", e)),
+                                )
+                                .to_owned(),
+                        )
+                    }
+                }
+            }
+            first_err.unwrap_or(Ok(()))
         })
         .collect();
 
@@ -57,11 +84,12 @@ pub fn process_entries(bank: &Bank, entries: &[Entry]) -> Result<()> {
         let lock_results = bank.lock_accounts(&entry.transactions);
         // if any of the locks error out
         // execute the current group
-        if first_err(&lock_results).is_err() {
+        if first_err(lock_results.locked_accounts_results()).is_err() {
             par_execute_entries(bank, &mt_group)?;
+            // Drop all the locks on accounts by clearing the LockedAccountsFinalizer's in the
+            // mt_group
             mt_group = vec![];
-            //reset the lock and push the entry
-            bank.unlock_accounts(&entry.transactions, &lock_results);
+            drop(lock_results);
             let lock_results = bank.lock_accounts(&entry.transactions);
             mt_group.push((entry, lock_results));
         } else {
@@ -230,8 +258,9 @@ mod tests {
     use crate::entry::{create_ticks, next_entry, Entry};
     use solana_sdk::genesis_block::GenesisBlock;
     use solana_sdk::hash::Hash;
+    use solana_sdk::pubkey::Pubkey;
     use solana_sdk::signature::{Keypair, KeypairUtil};
-    use solana_sdk::system_transaction::SystemTransaction;
+    use solana_sdk::system_transaction;
     use solana_sdk::transaction::TransactionError;
 
     fn fill_blocktree_slot_with_ticks(
@@ -419,7 +448,7 @@ mod tests {
         let bank = Bank::new(&genesis_block);
         let keypair = Keypair::new();
         let slot_entries = create_ticks(genesis_block.ticks_per_slot - 1, genesis_block.hash());
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &mint_keypair,
             &keypair.pubkey(),
             1,
@@ -441,7 +470,7 @@ mod tests {
     #[test]
     fn test_process_ledger_simple() {
         solana_logger::setup();
-        let leader_pubkey = Keypair::new().pubkey();
+        let leader_pubkey = Pubkey::new_rand();
         let (genesis_block, mint_keypair) = GenesisBlock::new_with_leader(100, &leader_pubkey, 50);
         let (ledger_path, mut last_entry_hash) = create_new_tmp_ledger!(&genesis_block);
         debug!("ledger_path: {:?}", ledger_path);
@@ -451,8 +480,13 @@ mod tests {
         for _ in 0..3 {
             // Transfer one token from the mint to a random account
             let keypair = Keypair::new();
-            let tx =
-                SystemTransaction::new_account(&mint_keypair, &keypair.pubkey(), 1, blockhash, 0);
+            let tx = system_transaction::create_user_account(
+                &mint_keypair,
+                &keypair.pubkey(),
+                1,
+                blockhash,
+                0,
+            );
             let entry = Entry::new(&last_entry_hash, 1, vec![tx]);
             last_entry_hash = entry.hash;
             entries.push(entry);
@@ -460,7 +494,13 @@ mod tests {
             // Add a second Transaction that will produce a
             // InstructionError<0, ResultWithNegativeLamports> error when processed
             let keypair2 = Keypair::new();
-            let tx = SystemTransaction::new_account(&keypair, &keypair2.pubkey(), 42, blockhash, 0);
+            let tx = system_transaction::create_user_account(
+                &keypair,
+                &keypair2.pubkey(),
+                42,
+                blockhash,
+                0,
+            );
             let entry = Entry::new(&last_entry_hash, 1, vec![tx]);
             last_entry_hash = entry.hash;
             entries.push(entry);
@@ -537,7 +577,7 @@ mod tests {
         let blockhash = bank.last_blockhash();
 
         // ensure bank can process 2 entries that have a common account and no tick is registered
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &mint_keypair,
             &keypair1.pubkey(),
             2,
@@ -545,7 +585,7 @@ mod tests {
             0,
         );
         let entry_1 = next_entry(&blockhash, 1, vec![tx]);
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &mint_keypair,
             &keypair2.pubkey(),
             2,
@@ -568,20 +608,14 @@ mod tests {
         let keypair3 = Keypair::new();
 
         // fund: put 4 in each of 1 and 2
-        assert_matches!(
-            bank.transfer(4, &mint_keypair, &keypair1.pubkey(), bank.last_blockhash()),
-            Ok(_)
-        );
-        assert_matches!(
-            bank.transfer(4, &mint_keypair, &keypair2.pubkey(), bank.last_blockhash()),
-            Ok(_)
-        );
+        assert_matches!(bank.transfer(4, &mint_keypair, &keypair1.pubkey()), Ok(_));
+        assert_matches!(bank.transfer(4, &mint_keypair, &keypair2.pubkey()), Ok(_));
 
         // construct an Entry whose 2nd transaction would cause a lock conflict with previous entry
         let entry_1_to_mint = next_entry(
             &bank.last_blockhash(),
             1,
-            vec![SystemTransaction::new_account(
+            vec![system_transaction::create_user_account(
                 &keypair1,
                 &mint_keypair.pubkey(),
                 1,
@@ -594,14 +628,14 @@ mod tests {
             &entry_1_to_mint.hash,
             1,
             vec![
-                SystemTransaction::new_account(
+                system_transaction::create_user_account(
                     &keypair2,
                     &keypair3.pubkey(),
                     2,
                     bank.last_blockhash(),
                     0,
                 ), // should be fine
-                SystemTransaction::new_account(
+                system_transaction::create_user_account(
                     &keypair1,
                     &mint_keypair.pubkey(),
                     2,
@@ -622,6 +656,88 @@ mod tests {
     }
 
     #[test]
+    fn test_process_entries_2_txes_collision_and_error() {
+        let (genesis_block, mint_keypair) = GenesisBlock::new(1000);
+        let bank = Bank::new(&genesis_block);
+        let keypair1 = Keypair::new();
+        let keypair2 = Keypair::new();
+        let keypair3 = Keypair::new();
+        let keypair4 = Keypair::new();
+
+        // fund: put 4 in each of 1 and 2
+        assert_matches!(bank.transfer(4, &mint_keypair, &keypair1.pubkey()), Ok(_));
+        assert_matches!(bank.transfer(4, &mint_keypair, &keypair2.pubkey()), Ok(_));
+        assert_matches!(bank.transfer(4, &mint_keypair, &keypair4.pubkey()), Ok(_));
+
+        // construct an Entry whose 2nd transaction would cause a lock conflict with previous entry
+        let entry_1_to_mint = next_entry(
+            &bank.last_blockhash(),
+            1,
+            vec![
+                system_transaction::create_user_account(
+                    &keypair1,
+                    &mint_keypair.pubkey(),
+                    1,
+                    bank.last_blockhash(),
+                    0,
+                ),
+                system_transaction::transfer(
+                    &keypair4,
+                    &keypair4.pubkey(),
+                    1,
+                    Hash::default(), // Should cause a transaction failure with BlockhashNotFound
+                    0,
+                ),
+            ],
+        );
+
+        let entry_2_to_3_mint_to_1 = next_entry(
+            &entry_1_to_mint.hash,
+            1,
+            vec![
+                system_transaction::create_user_account(
+                    &keypair2,
+                    &keypair3.pubkey(),
+                    2,
+                    bank.last_blockhash(),
+                    0,
+                ), // should be fine
+                system_transaction::create_user_account(
+                    &keypair1,
+                    &mint_keypair.pubkey(),
+                    2,
+                    bank.last_blockhash(),
+                    0,
+                ), // will collide
+            ],
+        );
+
+        assert!(process_entries(
+            &bank,
+            &[entry_1_to_mint.clone(), entry_2_to_3_mint_to_1.clone()]
+        )
+        .is_err());
+
+        // First transaction in first entry succeeded, so keypair1 lost 1 lamport
+        assert_eq!(bank.get_balance(&keypair1.pubkey()), 3);
+        assert_eq!(bank.get_balance(&keypair2.pubkey()), 4);
+
+        // Check all accounts are unlocked
+        let txs1 = &entry_1_to_mint.transactions[..];
+        let txs2 = &entry_2_to_3_mint_to_1.transactions[..];
+        let locked_accounts1 = bank.lock_accounts(txs1);
+        for result in locked_accounts1.locked_accounts_results() {
+            assert!(result.is_ok());
+        }
+        // txs1 and txs2 have accounts that conflict, so we must drop txs1 first
+        drop(locked_accounts1);
+        let locked_accounts2 = bank.lock_accounts(txs2);
+        for result in locked_accounts2.locked_accounts_results() {
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
     fn test_process_entries_2_entries_par() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(1000);
         let bank = Bank::new(&genesis_block);
@@ -631,7 +747,7 @@ mod tests {
         let keypair4 = Keypair::new();
 
         //load accounts
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &mint_keypair,
             &keypair1.pubkey(),
             1,
@@ -639,7 +755,7 @@ mod tests {
             0,
         );
         assert_eq!(bank.process_transaction(&tx), Ok(()));
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &mint_keypair,
             &keypair2.pubkey(),
             1,
@@ -650,7 +766,7 @@ mod tests {
 
         // ensure bank can process 2 entries that do not have a common account and no tick is registered
         let blockhash = bank.last_blockhash();
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &keypair1,
             &keypair3.pubkey(),
             1,
@@ -658,7 +774,7 @@ mod tests {
             0,
         );
         let entry_1 = next_entry(&blockhash, 1, vec![tx]);
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &keypair2,
             &keypair4.pubkey(),
             1,
@@ -682,7 +798,7 @@ mod tests {
         let keypair4 = Keypair::new();
 
         //load accounts
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &mint_keypair,
             &keypair1.pubkey(),
             1,
@@ -690,7 +806,7 @@ mod tests {
             0,
         );
         assert_eq!(bank.process_transaction(&tx), Ok(()));
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &mint_keypair,
             &keypair2.pubkey(),
             1,
@@ -705,10 +821,11 @@ mod tests {
         }
 
         // ensure bank can process 2 entries that do not have a common account and tick is registered
-        let tx = SystemTransaction::new_account(&keypair2, &keypair3.pubkey(), 1, blockhash, 0);
+        let tx =
+            system_transaction::create_user_account(&keypair2, &keypair3.pubkey(), 1, blockhash, 0);
         let entry_1 = next_entry(&blockhash, 1, vec![tx]);
         let tick = next_entry(&entry_1.hash, 1, vec![]);
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &keypair1,
             &keypair4.pubkey(),
             1,
@@ -724,7 +841,7 @@ mod tests {
         assert_eq!(bank.get_balance(&keypair4.pubkey()), 1);
 
         // ensure that an error is returned for an empty account (keypair2)
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &keypair2,
             &keypair3.pubkey(),
             1,

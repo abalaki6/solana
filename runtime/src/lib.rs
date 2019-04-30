@@ -5,10 +5,11 @@ pub mod bank_client;
 mod blockhash_queue;
 pub mod bloom;
 pub mod loader_utils;
+pub mod locked_accounts_results;
+pub mod message_processor;
 mod native_loader;
-mod runtime;
 mod status_cache;
-mod system_program;
+mod system_instruction_processor;
 
 #[macro_use]
 extern crate solana_metrics;

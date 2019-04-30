@@ -29,14 +29,15 @@ MacOS or WSL users may build from source.
 The shell commands in this section assume the following environment variables are
 set:
 ```bash
-$ export release=0.12.1
+$ export release=0.12.4
 $ export ip=$(dig +short beta.testnet.solana.com)
+$ export USE_INSTALL=1
 ```
 
 #### Obtaining The Software
 Prebuilt binaries are available for Linux x86_64 systems.  Download and install by running:
 ```bash
-$ wget https://github.com/solana-labs/solana/releases/download/v${release:?}/solana-release-x86_64-unknown-linux-gnu.tar.bz2 -O solana-release.tar.gz
+$ wget https://github.com/solana-labs/solana/releases/download/v${release:?}/solana-release-x86_64-unknown-linux-gnu.tar.bz2 -O solana-release.tar.bz2
 $ tar jxf solana-release.tar.bz2
 $ cd solana-release/
 $ export PATH=$PWD/bin:$PATH
@@ -72,7 +73,7 @@ Inspect the blockexplorer at http://beta.testnet.solana.com/ for activity.
 
 Run the following command to join the gossip network and view all the other nodes in the cluster:
 ```bash
-$ RUST_LOG=info solana-bench-tps --converge-only --num-nodes 100000 --network ${ip:?}:8001
+$ RUST_LOG=info solana-gossip --network ${ip:?}:8001
 ```
 
 #### Starting The Validator
@@ -84,7 +85,7 @@ $ RUST_LOG=warn ./multinode-demo/fullnode-x.sh --public-address --poll-for-new-g
 Then from another console, confirm the IP address if your node is now visible in
 the gossip network by running:
 ```bash
-$ RUST_LOG=info solana-bench-tps --converge-only --num-nodes 100000 --network ${ip:?}:8001
+$ RUST_LOG=info solana-gossip --network ${ip:?}:8001
 ```
 
 Congratulations, you're now participating in the testnet cluster!
@@ -98,3 +99,44 @@ export p="password obtained from the Solana maintainers"
 export SOLANA_METRICS_CONFIG="db=testnet-beta,u=${u:?},p=${p:?}"
 source scripts/configure-metrics.sh
 ```
+Inspect for your contributions to our [metrics dashboard](https://metrics.solana.com:3000/d/U9-26Cqmk/testnet-monitor-cloud?refresh=60s&orgId=2&var-hostid=All).
+
+#### Metrics Server Maintenance
+Sometimes the dashboard becomes unresponsive. This happens due to glitch in the metrics server.
+The current solution is to reset the metrics server. Use the following steps.
+
+1. The server is hosted in a GCP VM instance. Check if the VM instance is down by trying to SSH
+ into it from the GCP console. The name of the VM is ```metrics-solana-com```.
+2. If the VM is inaccessible, reset it from the GCP console.
+3. Once VM is up (or, was already up), the metrics services can be restarted from build automation.
+    1. Navigate to https://buildkite.com/solana-labs/metrics-dot-solana-dot-com in your web browser
+    2. Click on ```New Build```
+    3. This will show a pop up dialog. Click on ```options``` drop down.
+    4. Type in ```FORCE_START=true``` in ```Environment Variables``` text box.
+    5. Click ```Create Build```
+    6. This will restart the metrics services, and the dashboards should be accessible afterwards.
+
+#### Debugging Testnet
+Testnet may exhibit different symptoms of failures. Primary statistics to check are
+1. Rise in Confirmation Time
+2. Nodes are not voting
+3. Panics, and OOM notifications
+
+Check the following if there are any signs of failure.
+1. Did testnet deployment fail?
+    1. View buildkite logs for the last deployment: https://buildkite.com/solana-labs/testnet-management
+    2. Use the relevant branch
+    3. If the deployment failed, look at the build logs. The build artifacts for each remote node is uploaded.
+       It's a good first step to triage from these logs.
+2. You may have to log into remote node if the deployment succeeded, but something failed during runtime.
+    1. Get the private key for the testnet deployment from ```metrics-solana-com``` GCP instance.
+    2. SSH into ```metrics-solana-com``` using GCP console and do the following.
+    ```bash
+    sudo bash
+    cd ~buildkite-agent/.ssh
+    ls
+    ```
+    3. Copy the relevant private key to your local machine
+    4. Find the public IP address of the AWS instance for the remote node using AWS console
+    5. ```ssh -i <private key file> ubuntu@<ip address of remote node>```
+    6. The logs are in ```~solana\solana``` folder

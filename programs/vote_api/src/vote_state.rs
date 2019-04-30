@@ -49,6 +49,9 @@ pub struct VoteState {
     pub votes: VecDeque<Lockout>,
     pub delegate_id: Pubkey,
     pub authorized_voter_id: Pubkey,
+    /// fraction of std::u32::MAX that represents what part of a rewards
+    ///  payout should be given to this VoteAccount
+    pub commission: u32,
     pub root_slot: Option<u64>,
     credits: u64,
 }
@@ -58,11 +61,13 @@ impl VoteState {
         let votes = VecDeque::new();
         let credits = 0;
         let root_slot = None;
+        let commission = 0;
         Self {
             votes,
             delegate_id: *staker_id,
             authorized_voter_id: *staker_id,
             credits,
+            commission,
             root_slot,
         }
     }
@@ -85,6 +90,21 @@ impl VoteState {
             ErrorKind::SizeLimit => InstructionError::AccountDataTooSmall,
             _ => InstructionError::GenericError,
         })
+    }
+
+    /// returns commission split as (voter_portion, staker_portion) tuple
+    ///
+    ///  if commission calculation is 100% one way or other,
+    ///   indicate with None for the 0% side
+    pub fn commission_split(&self, on: f64) -> (f64, f64, bool) {
+        match self.commission {
+            0 => (0.0, on, false),
+            std::u32::MAX => (on, 0.0, false),
+            split => {
+                let mine = on * f64::from(split) / f64::from(std::u32::MAX);
+                (mine, on - mine, true)
+            }
+        }
     }
 
     pub fn process_vote(&mut self, vote: Vote) {
@@ -150,8 +170,6 @@ impl VoteState {
             // than the max number of confirmations this vote has seen
             if stack_depth > i + v.confirmation_count as usize {
                 v.confirmation_count += 1;
-            } else {
-                break;
             }
         }
     }
@@ -312,14 +330,13 @@ pub fn vote_and_deserialize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::signature::{Keypair, KeypairUtil};
 
     #[test]
     fn test_initialize_vote_account() {
-        let vote_account_id = Keypair::new().pubkey();
+        let vote_account_id = Pubkey::new_rand();
         let mut vote_account = create_vote_account(100);
 
-        let bogus_account_id = Keypair::new().pubkey();
+        let bogus_account_id = Pubkey::new_rand();
         let mut bogus_account = Account::new(100, 0, &id());
 
         let mut keyed_accounts = [KeyedAccount::new(
@@ -351,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_voter_registration() {
-        let vote_id = Keypair::new().pubkey();
+        let vote_id = Pubkey::new_rand();
         let mut vote_account = create_vote_account(100);
 
         let vote_state = initialize_and_deserialize(&vote_id, &mut vote_account).unwrap();
@@ -361,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_vote() {
-        let vote_id = Keypair::new().pubkey();
+        let vote_id = Pubkey::new_rand();
         let mut vote_account = create_vote_account(100);
         initialize_and_deserialize(&vote_id, &mut vote_account).unwrap();
 
@@ -373,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_vote_signature() {
-        let vote_id = Keypair::new().pubkey();
+        let vote_id = Pubkey::new_rand();
         let mut vote_account = create_vote_account(100);
         initialize_and_deserialize(&vote_id, &mut vote_account).unwrap();
 
@@ -385,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_vote_without_initialization() {
-        let vote_id = Keypair::new().pubkey();
+        let vote_id = Pubkey::new_rand();
         let mut vote_account = create_vote_account(100);
 
         let vote = Vote::new(1);
@@ -395,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_vote_lockout() {
-        let voter_id = Keypair::new().pubkey();
+        let voter_id = Pubkey::new_rand();
         let mut vote_state = VoteState::new(&voter_id);
 
         for i in 0..(MAX_LOCKOUT_HISTORY + 1) {
@@ -425,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_vote_double_lockout_after_expiration() {
-        let voter_id = Keypair::new().pubkey();
+        let voter_id = Pubkey::new_rand();
         let mut vote_state = VoteState::new(&voter_id);
 
         for i in 0..3 {
@@ -433,8 +450,6 @@ mod tests {
             vote_state.process_vote(vote);
         }
 
-        // Check the lockouts for first and second votes. Lockouts should be
-        // INITIAL_LOCKOUT^3 and INITIAL_LOCKOUT^2 respectively
         check_lockouts(&vote_state);
 
         // Expire the third vote (which was a vote for slot 2). The height of the
@@ -447,11 +462,48 @@ mod tests {
         // double for everybody
         vote_state.process_vote(Vote::new((2 + INITIAL_LOCKOUT + 2) as u64));
         check_lockouts(&vote_state);
+
+        // Vote again, this time the vote stack depth increases, so the lockouts should
+        // double for everybody
+        vote_state.process_vote(Vote::new((2 + INITIAL_LOCKOUT + 3) as u64));
+        check_lockouts(&vote_state);
+    }
+
+    #[test]
+    fn test_expire_multiple_votes() {
+        let voter_id = Pubkey::new_rand();
+        let mut vote_state = VoteState::new(&voter_id);
+
+        for i in 0..3 {
+            let vote = Vote::new(i as u64);
+            vote_state.process_vote(vote);
+        }
+
+        assert_eq!(vote_state.votes[0].confirmation_count, 3);
+
+        // Expire the second and third votes
+        let expire_slot = vote_state.votes[1].slot + vote_state.votes[1].lockout() + 1;
+        vote_state.process_vote(Vote::new(expire_slot));
+        assert_eq!(vote_state.votes.len(), 2);
+
+        // Check that the old votes expired
+        assert_eq!(vote_state.votes[0].slot, 0);
+        assert_eq!(vote_state.votes[1].slot, expire_slot);
+
+        // Process one more vote
+        vote_state.process_vote(Vote::new(expire_slot + 1));
+
+        // Confirmation count for the older first vote should remain unchanged
+        assert_eq!(vote_state.votes[0].confirmation_count, 3);
+
+        // The later votes should still have increasing confirmation counts
+        assert_eq!(vote_state.votes[1].confirmation_count, 2);
+        assert_eq!(vote_state.votes[2].confirmation_count, 1);
     }
 
     #[test]
     fn test_vote_credits() {
-        let voter_id = Keypair::new().pubkey();
+        let voter_id = Pubkey::new_rand();
         let mut vote_state = VoteState::new(&voter_id);
 
         for i in 0..MAX_LOCKOUT_HISTORY {
@@ -472,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_vote() {
-        let voter_id = Keypair::new().pubkey();
+        let voter_id = Pubkey::new_rand();
         let mut vote_state = VoteState::new(&voter_id);
         vote_state.process_vote(Vote::new(0));
         vote_state.process_vote(Vote::new(1));
@@ -484,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_nth_recent_vote() {
-        let voter_id = Keypair::new().pubkey();
+        let voter_id = Pubkey::new_rand();
         let mut vote_state = VoteState::new(&voter_id);
         for i in 0..MAX_LOCKOUT_HISTORY {
             vote_state.process_vote(Vote::new(i as u64));

@@ -5,7 +5,7 @@ use log::*;
 use serde_json;
 use serde_json::json;
 use solana_budget_api;
-use solana_budget_api::budget_instruction::BudgetInstruction;
+use solana_budget_api::budget_instruction;
 use solana_client::rpc_client::{get_rpc_request_str, RpcClient};
 #[cfg(not(test))]
 use solana_drone::drone::request_airdrop_transaction;
@@ -14,14 +14,13 @@ use solana_drone::drone::DRONE_PORT;
 use solana_drone::drone_mock::request_airdrop_transaction;
 use solana_sdk::bpf_loader;
 use solana_sdk::hash::Hash;
-use solana_sdk::loader_instruction::LoaderInstruction;
+use solana_sdk::loader_instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::rpc_port::DEFAULT_RPC_PORT;
 use solana_sdk::signature::{Keypair, KeypairUtil, Signature};
-use solana_sdk::system_transaction::SystemTransaction;
+use solana_sdk::system_transaction;
 use solana_sdk::transaction::Transaction;
-use solana_vote_api::vote_instruction::VoteInstruction;
-use solana_vote_api::vote_transaction::VoteTransaction;
+use solana_vote_api::vote_instruction;
 use std::fs::File;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -82,7 +81,7 @@ impl error::Error for WalletError {
 }
 
 pub struct WalletConfig {
-    pub id: Keypair,
+    pub keypair: Keypair,
     pub command: WalletCommand,
     pub drone_host: Option<IpAddr>,
     pub drone_port: u16,
@@ -100,7 +99,7 @@ impl Default for WalletConfig {
             drone_host: None,
             drone_port: DRONE_PORT,
             host: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-            id: Keypair::new(),
+            keypair: Keypair::new(),
             rpc_client: None,
             rpc_host: None,
             rpc_port: DEFAULT_RPC_PORT,
@@ -267,17 +266,17 @@ fn process_airdrop(
         "Requesting airdrop of {:?} lamports from {}",
         lamports, drone_addr
     );
-    let previous_balance = match rpc_client.retry_get_balance(&config.id.pubkey(), 5)? {
+    let previous_balance = match rpc_client.retry_get_balance(&config.keypair.pubkey(), 5)? {
         Some(lamports) => lamports,
         None => Err(WalletError::RpcRequestError(
             "Received result of an unexpected type".to_string(),
         ))?,
     };
 
-    request_and_confirm_airdrop(&rpc_client, &drone_addr, &config.id.pubkey(), lamports)?;
+    request_and_confirm_airdrop(&rpc_client, &drone_addr, &config.keypair.pubkey(), lamports)?;
 
     let current_balance = rpc_client
-        .retry_get_balance(&config.id.pubkey(), 5)?
+        .retry_get_balance(&config.keypair.pubkey(), 5)?
         .unwrap_or(previous_balance);
 
     if current_balance < previous_balance {
@@ -312,8 +311,11 @@ fn process_balance(pubkey: &Pubkey, rpc_client: &RpcClient) -> ProcessResult {
 fn process_confirm(rpc_client: &RpcClient, signature: Signature) -> ProcessResult {
     match rpc_client.get_signature_status(&signature.to_string()) {
         Ok(status) => {
-            if status == solana_client::rpc_signature_status::RpcSignatureStatus::Confirmed {
-                Ok("Confirmed".to_string())
+            if let Some(result) = status {
+                match result {
+                    Ok(_) => Ok("Confirmed".to_string()),
+                    Err(err) => Ok(format!("Transaction failed with error {:?}", err)),
+                }
             } else {
                 Ok("Not found".to_string())
             }
@@ -334,20 +336,19 @@ fn process_configure_staking(
     let recent_blockhash = rpc_client.get_recent_blockhash()?;
     let mut ixs = vec![];
     if let Some(delegate_id) = delegate_option {
-        ixs.push(VoteInstruction::new_delegate_stake(
-            &config.id.pubkey(),
+        ixs.push(vote_instruction::delegate_stake(
+            &config.keypair.pubkey(),
             &delegate_id,
         ));
     }
     if let Some(authorized_voter_id) = authorized_voter_option {
-        ixs.push(VoteInstruction::new_authorize_voter(
-            &config.id.pubkey(),
+        ixs.push(vote_instruction::authorize_voter(
+            &config.keypair.pubkey(),
             &authorized_voter_id,
         ));
     }
-    let mut tx = Transaction::new(ixs);
-    tx.sign(&[&config.id], recent_blockhash);
-    let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.id)?;
+    let mut tx = Transaction::new_signed_instructions(&[&config.keypair], ixs, recent_blockhash);
+    let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.keypair)?;
     Ok(signature_str.to_string())
 }
 
@@ -358,9 +359,10 @@ fn process_create_staking(
     lamports: u64,
 ) -> ProcessResult {
     let recent_blockhash = rpc_client.get_recent_blockhash()?;
-    let mut tx =
-        VoteTransaction::new_account(&config.id, voting_account_id, recent_blockhash, lamports, 0);
-    let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.id)?;
+    let ixs =
+        vote_instruction::create_account(&config.keypair.pubkey(), voting_account_id, lamports);
+    let mut tx = Transaction::new_signed_instructions(&[&config.keypair], ixs, recent_blockhash);
+    let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.keypair)?;
     Ok(signature_str.to_string())
 }
 
@@ -369,7 +371,7 @@ fn process_deploy(
     config: &WalletConfig,
     program_location: &str,
 ) -> ProcessResult {
-    let balance = rpc_client.retry_get_balance(&config.id.pubkey(), 5)?;
+    let balance = rpc_client.retry_get_balance(&config.keypair.pubkey(), 5)?;
     if let Some(lamports) = balance {
         if lamports < 1 {
             Err(WalletError::DynamicProgramError(
@@ -392,8 +394,8 @@ fn process_deploy(
         )
     })?;
 
-    let mut tx = SystemTransaction::new_program_account(
-        &config.id,
+    let mut tx = system_transaction::create_account(
+        &config.keypair,
         &program_id.pubkey(),
         blockhash,
         1,
@@ -403,7 +405,7 @@ fn process_deploy(
     );
     trace!("Creating program account");
     rpc_client
-        .send_and_confirm_transaction(&mut tx, &config.id)
+        .send_and_confirm_transaction(&mut tx, &config.keypair)
         .map_err(|_| {
             WalletError::DynamicProgramError("Program allocate space failed".to_string())
         })?;
@@ -413,21 +415,20 @@ fn process_deploy(
         .chunks(USERDATA_CHUNK_SIZE)
         .zip(0..)
         .map(|(chunk, i)| {
-            let instruction = LoaderInstruction::new_write(
+            let instruction = loader_instruction::write(
                 &program_id.pubkey(),
                 &bpf_loader::id(),
                 (i * USERDATA_CHUNK_SIZE) as u32,
                 chunk.to_vec(),
             );
-            Transaction::new_signed_instructions(&[&program_id], vec![instruction], blockhash, 0)
+            Transaction::new_signed_instructions(&[&program_id], vec![instruction], blockhash)
         })
         .collect();
     rpc_client.send_and_confirm_transactions(write_transactions, &program_id)?;
 
     trace!("Finalizing program account");
-    let instruction = LoaderInstruction::new_finalize(&program_id.pubkey(), &bpf_loader::id());
-    let mut tx =
-        Transaction::new_signed_instructions(&[&program_id], vec![instruction], blockhash, 0);
+    let instruction = loader_instruction::finalize(&program_id.pubkey(), &bpf_loader::id());
+    let mut tx = Transaction::new_signed_instructions(&[&program_id], vec![instruction], blockhash);
     rpc_client
         .send_and_confirm_transaction(&mut tx, &program_id)
         .map_err(|_| {
@@ -453,21 +454,21 @@ fn process_pay(
     let blockhash = rpc_client.get_recent_blockhash()?;
 
     if timestamp == None && *witnesses == None {
-        let mut tx = SystemTransaction::new_move(&config.id, to, lamports, blockhash, 0);
-        let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.id)?;
+        let mut tx = system_transaction::transfer(&config.keypair, to, lamports, blockhash, 0);
+        let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.keypair)?;
         Ok(signature_str.to_string())
     } else if *witnesses == None {
         let dt = timestamp.unwrap();
         let dt_pubkey = match timestamp_pubkey {
             Some(pubkey) => pubkey,
-            None => config.id.pubkey(),
+            None => config.keypair.pubkey(),
         };
 
         let contract_state = Keypair::new();
 
         // Initializing contract
-        let ixs = BudgetInstruction::new_on_date(
-            &config.id.pubkey(),
+        let ixs = budget_instruction::on_date(
+            &config.keypair.pubkey(),
             to,
             &contract_state.pubkey(),
             dt,
@@ -475,8 +476,8 @@ fn process_pay(
             cancelable,
             lamports,
         );
-        let mut tx = Transaction::new_signed_instructions(&[&config.id], ixs, blockhash, 0);
-        let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.id)?;
+        let mut tx = Transaction::new_signed_instructions(&[&config.keypair], ixs, blockhash);
+        let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.keypair)?;
 
         Ok(json!({
             "signature": signature_str,
@@ -497,16 +498,16 @@ fn process_pay(
         let contract_state = Keypair::new();
 
         // Initializing contract
-        let ixs = BudgetInstruction::new_when_signed(
-            &config.id.pubkey(),
+        let ixs = budget_instruction::when_signed(
+            &config.keypair.pubkey(),
             to,
             &contract_state.pubkey(),
             &witness,
             cancelable,
             lamports,
         );
-        let mut tx = Transaction::new_signed_instructions(&[&config.id], ixs, blockhash, 0);
-        let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.id)?;
+        let mut tx = Transaction::new_signed_instructions(&[&config.keypair], ixs, blockhash);
+        let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.keypair)?;
 
         Ok(json!({
             "signature": signature_str,
@@ -520,10 +521,13 @@ fn process_pay(
 
 fn process_cancel(rpc_client: &RpcClient, config: &WalletConfig, pubkey: &Pubkey) -> ProcessResult {
     let blockhash = rpc_client.get_recent_blockhash()?;
-    let ix =
-        BudgetInstruction::new_apply_signature(&config.id.pubkey(), pubkey, &config.id.pubkey());
-    let mut tx = Transaction::new_signed_instructions(&[&config.id], vec![ix], blockhash, 0);
-    let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.id)?;
+    let ix = budget_instruction::apply_signature(
+        &config.keypair.pubkey(),
+        pubkey,
+        &config.keypair.pubkey(),
+    );
+    let mut tx = Transaction::new_signed_instructions(&[&config.keypair], vec![ix], blockhash);
+    let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.keypair)?;
     Ok(signature_str.to_string())
 }
 
@@ -540,17 +544,17 @@ fn process_time_elapsed(
     pubkey: &Pubkey,
     dt: DateTime<Utc>,
 ) -> ProcessResult {
-    let balance = rpc_client.retry_get_balance(&config.id.pubkey(), 5)?;
+    let balance = rpc_client.retry_get_balance(&config.keypair.pubkey(), 5)?;
 
     if let Some(0) = balance {
-        request_and_confirm_airdrop(&rpc_client, &drone_addr, &config.id.pubkey(), 1)?;
+        request_and_confirm_airdrop(&rpc_client, &drone_addr, &config.keypair.pubkey(), 1)?;
     }
 
     let blockhash = rpc_client.get_recent_blockhash()?;
 
-    let ix = BudgetInstruction::new_apply_timestamp(&config.id.pubkey(), pubkey, to, dt);
-    let mut tx = Transaction::new_signed_instructions(&[&config.id], vec![ix], blockhash, 0);
-    let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.id)?;
+    let ix = budget_instruction::apply_timestamp(&config.keypair.pubkey(), pubkey, to, dt);
+    let mut tx = Transaction::new_signed_instructions(&[&config.keypair], vec![ix], blockhash);
+    let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.keypair)?;
 
     Ok(signature_str.to_string())
 }
@@ -562,16 +566,16 @@ fn process_witness(
     to: &Pubkey,
     pubkey: &Pubkey,
 ) -> ProcessResult {
-    let balance = rpc_client.retry_get_balance(&config.id.pubkey(), 5)?;
+    let balance = rpc_client.retry_get_balance(&config.keypair.pubkey(), 5)?;
 
     if let Some(0) = balance {
-        request_and_confirm_airdrop(&rpc_client, &drone_addr, &config.id.pubkey(), 1)?;
+        request_and_confirm_airdrop(&rpc_client, &drone_addr, &config.keypair.pubkey(), 1)?;
     }
 
     let blockhash = rpc_client.get_recent_blockhash()?;
-    let ix = BudgetInstruction::new_apply_signature(&config.id.pubkey(), pubkey, to);
-    let mut tx = Transaction::new_signed_instructions(&[&config.id], vec![ix], blockhash, 0);
-    let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.id)?;
+    let ix = budget_instruction::apply_signature(&config.keypair.pubkey(), pubkey, to);
+    let mut tx = Transaction::new_signed_instructions(&[&config.keypair], vec![ix], blockhash);
+    let signature_str = rpc_client.send_and_confirm_transaction(&mut tx, &config.keypair)?;
 
     Ok(signature_str.to_string())
 }
@@ -579,7 +583,7 @@ fn process_witness(
 pub fn process_command(config: &WalletConfig) -> ProcessResult {
     if let WalletCommand::Address = config.command {
         // Get address of this client
-        return Ok(format!("{}", config.id.pubkey()));
+        return Ok(format!("{}", config.keypair.pubkey()));
     }
 
     let drone_addr = config.drone_addr();
@@ -695,7 +699,7 @@ impl KeypairUtil for DroneKeypair {
 
     /// Return the public key of the keypair used to sign votes
     fn pubkey(&self) -> Pubkey {
-        self.transaction.account_keys[0]
+        self.transaction.message().account_keys[0]
     }
 
     fn sign_message(&self, _msg: &[u8]) -> Signature {
@@ -723,6 +727,7 @@ mod tests {
     use serde_json::Value;
     use solana_client::mock_rpc_client_request::SIGNATURE;
     use solana_sdk::signature::{gen_keypair_file, read_keypair, read_pkcs8, Keypair, KeypairUtil};
+    use solana_sdk::transaction::TransactionError;
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::path::{Path, PathBuf};
@@ -952,11 +957,11 @@ mod tests {
                             .help("Optional arbitrary timestamp to apply"),
                     ),
             );
-        let pubkey = Keypair::new().pubkey();
+        let pubkey = Pubkey::new_rand();
         let pubkey_string = format!("{}", pubkey);
-        let witness0 = Keypair::new().pubkey();
+        let witness0 = Pubkey::new_rand();
         let witness0_string = format!("{}", witness0);
-        let witness1 = Keypair::new().pubkey();
+        let witness1 = Pubkey::new_rand();
         let witness1_string = format!("{}", witness1);
         let dt = Utc.ymd(2018, 9, 19).and_hms(17, 30, 59);
 
@@ -1000,7 +1005,7 @@ mod tests {
         assert!(parse_command(&pubkey, &test_bad_signature).is_err());
 
         // Test ConfigureStakingAccount Subcommand
-        let second_pubkey = Keypair::new().pubkey();
+        let second_pubkey = Pubkey::new_rand();
         let second_pubkey_string = format!("{}", second_pubkey);
         let test_configure_staking_account = test_commands.clone().get_matches_from(vec![
             "test",
@@ -1170,14 +1175,14 @@ mod tests {
 
         let keypair = Keypair::new();
         let pubkey = keypair.pubkey().to_string();
-        config.id = keypair;
+        config.keypair = keypair;
         config.command = WalletCommand::Address;
         assert_eq!(process_command(&config).unwrap(), pubkey);
 
-        config.command = WalletCommand::Balance(config.id.pubkey());
+        config.command = WalletCommand::Balance(config.keypair.pubkey());
         assert_eq!(process_command(&config).unwrap(), "50 lamports");
 
-        let process_id = Keypair::new().pubkey();
+        let process_id = Pubkey::new_rand();
         config.command = WalletCommand::Cancel(process_id);
         assert_eq!(process_command(&config).unwrap(), SIGNATURE);
 
@@ -1185,7 +1190,7 @@ mod tests {
         config.command = WalletCommand::Confirm(good_signature);
         assert_eq!(process_command(&config).unwrap(), "Confirmed");
 
-        let bob_pubkey = Keypair::new().pubkey();
+        let bob_pubkey = Pubkey::new_rand();
         config.command = WalletCommand::ConfigureStakingAccount(None, Some(bob_pubkey));
         let signature = process_command(&config);
         assert_eq!(signature.unwrap(), SIGNATURE.to_string());
@@ -1207,7 +1212,7 @@ mod tests {
             10,
             bob_pubkey,
             Some(dt),
-            Some(config.id.pubkey()),
+            Some(config.keypair.pubkey()),
             None,
             None,
         );
@@ -1223,14 +1228,14 @@ mod tests {
             SIGNATURE.to_string()
         );
 
-        let witness = Keypair::new().pubkey();
+        let witness = Pubkey::new_rand();
         config.command = WalletCommand::Pay(
             10,
             bob_pubkey,
             None,
             None,
             Some(vec![witness]),
-            Some(config.id.pubkey()),
+            Some(config.keypair.pubkey()),
         );
         let result = process_command(&config);
         let json: Value = serde_json::from_str(&result.unwrap()).unwrap();
@@ -1244,12 +1249,12 @@ mod tests {
             SIGNATURE.to_string()
         );
 
-        let process_id = Keypair::new().pubkey();
+        let process_id = Pubkey::new_rand();
         config.command = WalletCommand::TimeElapsed(bob_pubkey, process_id, dt);
         let signature = process_command(&config);
         assert_eq!(signature.unwrap(), SIGNATURE.to_string());
 
-        let witness = Keypair::new().pubkey();
+        let witness = Pubkey::new_rand();
         config.command = WalletCommand::Witness(bob_pubkey, witness);
         let signature = process_command(&config);
         assert_eq!(signature.unwrap(), SIGNATURE.to_string());
@@ -1263,16 +1268,28 @@ mod tests {
         let signature = process_command(&config);
         assert_eq!(signature.unwrap(), SIGNATURE.to_string());
 
-        let witness = Keypair::new().pubkey();
+        let witness = Pubkey::new_rand();
         config.command = WalletCommand::Witness(bob_pubkey, witness);
         let signature = process_command(&config);
         assert_eq!(signature.unwrap(), SIGNATURE.to_string());
 
-        // bad_sig_status cases
-        config.rpc_client = Some(RpcClient::new_mock("bad_sig_status".to_string()));
+        // sig_not_found case
+        config.rpc_client = Some(RpcClient::new_mock("sig_not_found".to_string()));
         let missing_signature = Signature::new(&bs58::decode("5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW").into_vec().unwrap());
         config.command = WalletCommand::Confirm(missing_signature);
         assert_eq!(process_command(&config).unwrap(), "Not found");
+
+        // Tx error case
+        config.rpc_client = Some(RpcClient::new_mock("account_in_use".to_string()));
+        let any_signature = Signature::new(&bs58::decode(SIGNATURE).into_vec().unwrap());
+        config.command = WalletCommand::Confirm(any_signature);
+        assert_eq!(
+            process_command(&config).unwrap(),
+            format!(
+                "Transaction failed with error {:?}",
+                TransactionError::AccountInUse
+            )
+        );
 
         // Failure cases
         config.rpc_client = Some(RpcClient::new_mock("fails".to_string()));
@@ -1280,11 +1297,7 @@ mod tests {
         config.command = WalletCommand::Airdrop(50);
         assert!(process_command(&config).is_err());
 
-        config.command = WalletCommand::Balance(config.id.pubkey());
-        assert!(process_command(&config).is_err());
-
-        let any_signature = Signature::new(&bs58::decode(SIGNATURE).into_vec().unwrap());
-        config.command = WalletCommand::Confirm(any_signature);
+        config.command = WalletCommand::Balance(config.keypair.pubkey());
         assert!(process_command(&config).is_err());
 
         config.command = WalletCommand::ConfigureStakingAccount(None, Some(bob_pubkey));
@@ -1303,7 +1316,7 @@ mod tests {
             10,
             bob_pubkey,
             Some(dt),
-            Some(config.id.pubkey()),
+            Some(config.keypair.pubkey()),
             None,
             None,
         );
@@ -1315,7 +1328,7 @@ mod tests {
             None,
             None,
             Some(vec![witness]),
-            Some(config.id.pubkey()),
+            Some(config.keypair.pubkey()),
         );
         assert!(process_command(&config).is_err());
 

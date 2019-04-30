@@ -5,24 +5,26 @@
 
 use crate::accounts::{Accounts, ErrorCounters, InstructionAccounts, InstructionLoaders};
 use crate::blockhash_queue::BlockhashQueue;
-use crate::runtime::{ProcessInstruction, Runtime};
+use crate::locked_accounts_results::LockedAccountsResults;
+use crate::message_processor::{MessageProcessor, ProcessInstruction};
 use crate::status_cache::StatusCache;
 use bincode::serialize;
 use hashbrown::HashMap;
 use log::*;
 use solana_metrics::counter::Counter;
+use solana_metrics::influxdb;
 use solana_sdk::account::Account;
+use solana_sdk::fee_calculator::FeeCalculator;
 use solana_sdk::genesis_block::GenesisBlock;
 use solana_sdk::hash::{extend_and_hash, Hash};
 use solana_sdk::native_loader;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
-use solana_sdk::system_transaction::SystemTransaction;
-use solana_sdk::timing::{duration_as_us, MAX_RECENT_BLOCKHASHES, NUM_TICKS_PER_SECOND};
-use solana_sdk::transaction::{Transaction, TransactionError};
+use solana_sdk::system_transaction;
+use solana_sdk::timing::{duration_as_ms, duration_as_us, MAX_RECENT_BLOCKHASHES};
+use solana_sdk::transaction::{Result, Transaction, TransactionError};
 use solana_vote_api::vote_instruction::Vote;
 use solana_vote_api::vote_state::{Lockout, VoteState};
-use std::result;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -103,9 +105,7 @@ impl EpochSchedule {
     }
 }
 
-pub type Result<T> = result::Result<T, TransactionError>;
-
-type BankStatusCache = StatusCache<TransactionError>;
+type BankStatusCache = StatusCache<Result<()>>;
 
 /// Manager for the state of all accounts and programs after processing its entries.
 #[derive(Default)]
@@ -117,7 +117,7 @@ pub struct Bank {
     accounts_id: u64,
 
     /// A cache of signature statuses
-    status_cache: RwLock<BankStatusCache>,
+    status_cache: Arc<RwLock<BankStatusCache>>,
 
     /// FIFO queue of `recent_blockhash` items
     blockhash_queue: RwLock<BlockhashQueue>,
@@ -131,6 +131,9 @@ pub struct Bank {
     /// Hash of this Bank's parent's state
     parent_hash: Hash,
 
+    /// The number of transactions processed without error
+    transaction_count: AtomicUsize, // TODO: Use AtomicU64 if/when available
+
     /// Bank tick height
     tick_height: AtomicUsize, // TODO: Use AtomicU64 if/when available
 
@@ -143,8 +146,14 @@ pub struct Bank {
     /// The pubkey to send transactions fees to.
     collector_id: Pubkey,
 
+    /// An object to calculate transaction fees.
+    pub fee_calculator: FeeCalculator,
+
     /// initialized from genesis
     epoch_schedule: EpochSchedule,
+
+    /// cache of vote_account state for this fork
+    vote_accounts: RwLock<HashMap<Pubkey, Account>>,
 
     /// staked nodes on epoch boundaries, saved off when a bank.slot() is at
     ///   a leader schedule boundary
@@ -154,8 +163,8 @@ pub struct Bank {
     /// stream for the slot == self.slot
     is_delta: AtomicBool,
 
-    /// The runtime executation environment
-    runtime: Runtime,
+    /// The Message processor
+    message_processor: MessageProcessor,
 }
 
 impl Default for BlockhashQueue {
@@ -173,14 +182,12 @@ impl Bank {
         let mut bank = Self::default();
         bank.accounts = Arc::new(Accounts::new(bank.slot, paths));
         bank.process_genesis_block(genesis_block);
-
         // genesis needs stakes for all epochs up to the epoch implied by
         //  slot = 0 and genesis configuration
-        let vote_accounts: HashMap<_, _> = bank.vote_accounts().collect();
+        let vote_accounts = bank.vote_accounts();
         for i in 0..=bank.get_stakers_epoch(bank.slot) {
             bank.epoch_vote_accounts.insert(i, vote_accounts.clone());
         }
-
         bank
     }
 
@@ -191,6 +198,12 @@ impl Bank {
 
         let mut bank = Self::default();
         bank.blockhash_queue = RwLock::new(parent.blockhash_queue.read().unwrap().clone());
+        bank.status_cache = parent.status_cache.clone();
+
+        bank.transaction_count
+            .store(parent.transaction_count() as usize, Ordering::Relaxed);
+        bank.vote_accounts = RwLock::new(parent.vote_accounts());
+
         bank.tick_height
             .store(parent.tick_height.load(Ordering::SeqCst), Ordering::SeqCst);
         bank.ticks_per_slot = parent.ticks_per_slot;
@@ -215,7 +228,7 @@ impl Bank {
             //  if my parent didn't populate for this epoch, we've
             //  crossed a boundary
             if epoch_vote_accounts.get(&epoch).is_none() {
-                epoch_vote_accounts.insert(epoch, bank.vote_accounts().collect());
+                epoch_vote_accounts.insert(epoch, bank.vote_accounts());
             }
             epoch_vote_accounts
         };
@@ -246,7 +259,6 @@ impl Bank {
             //  freeze is a one-way trip, idempotent
             *hash = self.hash_internal_state();
         }
-        self.status_cache.write().unwrap().freeze();
     }
 
     /// squash the parent's state up into this Bank,
@@ -257,17 +269,28 @@ impl Bank {
         let parents = self.parents();
         *self.parent.write().unwrap() = None;
 
+        let squash_accounts_start = Instant::now();
         self.accounts.squash(self.accounts_id);
+        let squash_accounts_ms = duration_as_ms(&squash_accounts_start.elapsed());
 
-        let parent_caches: Vec<_> = parents
+        let squash_cache_start = Instant::now();
+        parents
             .iter()
-            .map(|p| {
-                let mut parent = p.status_cache.write().unwrap();
-                parent.freeze();
-                parent
-            })
-            .collect();
-        self.status_cache.write().unwrap().squash(&parent_caches);
+            .for_each(|p| self.status_cache.write().unwrap().add_root(p.slot()));
+        let squash_cache_ms = duration_as_ms(&squash_cache_start.elapsed());
+
+        solana_metrics::submit(
+            influxdb::Point::new("counter-locktower-observed")
+                .add_field(
+                    "squash_accounts_ms",
+                    influxdb::Value::Integer(squash_accounts_ms as i64),
+                )
+                .add_field(
+                    "squash_cache_ms",
+                    influxdb::Value::Integer(squash_cache_ms as i64),
+                )
+                .to_owned(),
+        );
     }
 
     /// Return the more recent checkpoint of this bank instance.
@@ -311,8 +334,7 @@ impl Bank {
             .serialize(&mut bootstrap_leader_vote_account.data)
             .unwrap();
 
-        self.accounts.store_slow(
-            self.accounts_id,
+        self.store(
             &genesis_block.bootstrap_leader_vote_account_id,
             &bootstrap_leader_vote_account,
         );
@@ -330,22 +352,27 @@ impl Bank {
             genesis_block.epoch_warmup,
         );
 
-        // Add native programs mandatory for the runtime to function
-        self.add_native_program("solana_system_program", &solana_sdk::system_program::id());
-        self.add_native_program("solana_bpf_loader", &solana_sdk::bpf_loader::id());
-        self.add_native_program("solana_vote_program", &solana_vote_api::id());
+        // Add native programs mandatory for the MessageProcessor to function
+        self.register_native_instruction_processor(
+            "solana_system_program",
+            &solana_sdk::system_program::id(),
+        );
+        self.register_native_instruction_processor(
+            "solana_bpf_loader",
+            &solana_sdk::bpf_loader::id(),
+        );
+        self.register_native_instruction_processor("solana_vote_program", &solana_vote_api::id());
 
         // Add additional native programs specified in the genesis block
-        for (name, program_id) in &genesis_block.native_programs {
-            self.add_native_program(name, program_id);
+        for (name, program_id) in &genesis_block.native_instruction_processors {
+            self.register_native_instruction_processor(name, program_id);
         }
     }
 
-    pub fn add_native_program(&self, name: &str, program_id: &Pubkey) {
+    pub fn register_native_instruction_processor(&self, name: &str, program_id: &Pubkey) {
         debug!("Adding native program {} under {:?}", name, program_id);
-        let account = native_loader::create_program_account(name);
-        self.accounts
-            .store_slow(self.accounts_id, program_id, &account);
+        let account = native_loader::create_loadable_account(name);
+        self.store(program_id, &account);
     }
 
     /// Return the last block hash registered.
@@ -355,7 +382,7 @@ impl Bank {
 
     /// Forget all signatures. Useful for benchmarking.
     pub fn clear_signatures(&self) {
-        self.status_cache.write().unwrap().clear();
+        self.status_cache.write().unwrap().clear_signatures();
     }
 
     fn update_transaction_statuses(&self, txs: &[Transaction], res: &[Result<()>]) {
@@ -364,7 +391,12 @@ impl Bank {
             match &res[i] {
                 Ok(_) => {
                     if !tx.signatures.is_empty() {
-                        status_cache.add(&tx.signatures[0]);
+                        status_cache.insert(
+                            &tx.message().recent_blockhash,
+                            &tx.signatures[0],
+                            self.slot(),
+                            Ok(()),
+                        );
                     }
                 }
                 Err(TransactionError::BlockhashNotFound) => (),
@@ -372,8 +404,12 @@ impl Bank {
                 Err(TransactionError::AccountNotFound) => (),
                 Err(e) => {
                     if !tx.signatures.is_empty() {
-                        status_cache.add(&tx.signatures[0]);
-                        status_cache.save_failure_status(&tx.signatures[0], e.clone());
+                        status_cache.insert(
+                            &tx.message().recent_blockhash,
+                            &tx.signatures[0],
+                            self.slot(),
+                            Err(e.clone()),
+                        );
                     }
                 }
             }
@@ -430,12 +466,7 @@ impl Bank {
 
         // Register a new block hash if at the last tick in the slot
         if current_tick_height % self.ticks_per_slot == self.ticks_per_slot - 1 {
-            let mut blockhash_queue = self.blockhash_queue.write().unwrap();
-            blockhash_queue.register_hash(hash);
-        }
-
-        if current_tick_height % NUM_TICKS_PER_SECOND == 0 {
-            self.status_cache.write().unwrap().new_cache(hash);
+            self.blockhash_queue.write().unwrap().register_hash(hash);
         }
     }
 
@@ -448,18 +479,28 @@ impl Bank {
             .map_or(Ok(()), |sig| self.get_signature_status(sig).unwrap())
     }
 
-    pub fn lock_accounts(&self, txs: &[Transaction]) -> Vec<Result<()>> {
+    pub fn lock_accounts<'a, 'b>(
+        &'a self,
+        txs: &'b [Transaction],
+    ) -> LockedAccountsResults<'a, 'b> {
         if self.is_frozen() {
             warn!("=========== FIXME: lock_accounts() working on a frozen bank! ================");
         }
         // TODO: put this assert back in
         // assert!(!self.is_frozen());
-        self.accounts.lock_accounts(self.accounts_id, txs)
+        let results = self.accounts.lock_accounts(self.accounts_id, txs);
+        LockedAccountsResults::new(results, &self, txs)
     }
 
-    pub fn unlock_accounts(&self, txs: &[Transaction], results: &[Result<()>]) {
-        self.accounts
-            .unlock_accounts(self.accounts_id, txs, results)
+    pub fn unlock_accounts(&self, locked_accounts_results: &mut LockedAccountsResults) {
+        if locked_accounts_results.needs_unlock {
+            locked_accounts_results.needs_unlock = false;
+            self.accounts.unlock_accounts(
+                self.accounts_id,
+                locked_accounts_results.transactions(),
+                locked_accounts_results.locked_accounts_results(),
+            )
+        }
     }
 
     fn load_accounts(
@@ -468,23 +509,28 @@ impl Bank {
         results: Vec<Result<()>>,
         error_counters: &mut ErrorCounters,
     ) -> Vec<Result<(InstructionAccounts, InstructionLoaders)>> {
-        self.accounts
-            .load_accounts(self.accounts_id, txs, results, error_counters)
+        self.accounts.load_accounts(
+            self.accounts_id,
+            txs,
+            results,
+            &self.fee_calculator,
+            error_counters,
+        )
     }
     fn check_refs(
         &self,
         txs: &[Transaction],
-        lock_results: Vec<Result<()>>,
+        lock_results: &LockedAccountsResults,
         error_counters: &mut ErrorCounters,
     ) -> Vec<Result<()>> {
         txs.iter()
-            .zip(lock_results.into_iter())
+            .zip(lock_results.locked_accounts_results())
             .map(|(tx, lock_res)| {
                 if lock_res.is_ok() && !tx.verify_refs() {
                     error_counters.invalid_account_index += 1;
                     Err(TransactionError::InvalidAccountIndex)
                 } else {
-                    lock_res
+                    lock_res.clone()
                 }
             })
             .collect()
@@ -500,7 +546,9 @@ impl Bank {
         txs.iter()
             .zip(lock_results.into_iter())
             .map(|(tx, lock_res)| {
-                if lock_res.is_ok() && !hash_queue.check_hash_age(tx.recent_blockhash, max_age) {
+                if lock_res.is_ok()
+                    && !hash_queue.check_hash_age(tx.message().recent_blockhash, max_age)
+                {
                     error_counters.reserve_blockhash += 1;
                     Err(TransactionError::BlockhashNotFound)
                 } else {
@@ -515,16 +563,28 @@ impl Bank {
         lock_results: Vec<Result<()>>,
         error_counters: &mut ErrorCounters,
     ) -> Vec<Result<()>> {
-        let parents = self.parents();
-        let mut caches = vec![self.status_cache.read().unwrap()];
-        caches.extend(parents.iter().map(|b| b.status_cache.read().unwrap()));
+        let mut ancestors = HashMap::new();
+        ancestors.insert(self.slot(), 0);
+        self.parents().iter().enumerate().for_each(|(i, p)| {
+            ancestors.insert(p.slot(), i + 1);
+        });
+
+        let rcache = self.status_cache.read().unwrap();
         txs.iter()
             .zip(lock_results.into_iter())
             .map(|(tx, lock_res)| {
                 if tx.signatures.is_empty() {
                     return lock_res;
                 }
-                if lock_res.is_ok() && StatusCache::has_signature_all(&caches, &tx.signatures[0]) {
+                if lock_res.is_ok()
+                    && rcache
+                        .get_signature_status(
+                            &tx.signatures[0],
+                            &tx.message().recent_blockhash,
+                            &ancestors,
+                        )
+                        .is_some()
+                {
                     error_counters.duplicate_signature += 1;
                     Err(TransactionError::DuplicateSignature)
                 } else {
@@ -537,7 +597,7 @@ impl Bank {
     pub fn load_and_execute_transactions(
         &self,
         txs: &[Transaction],
-        lock_results: Vec<Result<()>>,
+        lock_results: &LockedAccountsResults,
         max_age: usize,
     ) -> (
         Vec<Result<(InstructionAccounts, InstructionLoaders)>>,
@@ -554,17 +614,17 @@ impl Bank {
 
         let load_elapsed = now.elapsed();
         let now = Instant::now();
-        let executed: Vec<Result<()>> = loaded_accounts
-            .iter_mut()
-            .zip(txs.iter())
-            .map(|(accs, tx)| match accs {
-                Err(e) => Err(e.clone()),
-                Ok((ref mut accounts, ref mut loaders)) => {
-                    self.runtime
-                        .execute_transaction(tx, loaders, accounts, tick_height)
-                }
-            })
-            .collect();
+        let executed: Vec<Result<()>> =
+            loaded_accounts
+                .iter_mut()
+                .zip(txs.iter())
+                .map(|(accs, tx)| match accs {
+                    Err(e) => Err(e.clone()),
+                    Ok((ref mut accounts, ref mut loaders)) => self
+                        .message_processor
+                        .process_message(tx.message(), loaders, accounts, tick_height),
+                })
+                .collect();
 
         let execution_elapsed = now.elapsed();
 
@@ -595,8 +655,7 @@ impl Bank {
             inc_new_counter_info!("bank-process_transactions-error_count", err_count);
         }
 
-        self.accounts
-            .increment_transaction_count(self.accounts_id, tx_count);
+        self.increment_transaction_count(tx_count);
 
         inc_new_counter_info!("bank-process_transactions-txs", tx_count);
         if 0 != error_counters.blockhash_not_found {
@@ -647,18 +706,24 @@ impl Bank {
         let results = txs
             .iter()
             .zip(executed.iter())
-            .map(|(tx, res)| match *res {
-                Err(TransactionError::InstructionError(_, _)) => {
-                    // Charge the transaction fee even in case of InstructionError
-                    self.withdraw(&tx.account_keys[0], tx.fee)?;
-                    fees += tx.fee;
-                    Ok(())
+            .map(|(tx, res)| {
+                let fee = self.fee_calculator.calculate_fee(tx.message());
+                let message = tx.message();
+                match *res {
+                    Err(TransactionError::InstructionError(_, _)) => {
+                        // credit the transaction fee even in case of InstructionError
+                        // necessary to withdraw from account[0] here because previous
+                        // work of doing so (in accounts.load()) is ignored by store()
+                        self.withdraw(&message.account_keys[0], fee)?;
+                        fees += fee;
+                        Ok(())
+                    }
+                    Ok(()) => {
+                        fees += fee;
+                        Ok(())
+                    }
+                    _ => res.clone(),
                 }
-                Ok(()) => {
-                    fees += tx.fee;
-                    Ok(())
-                }
-                _ => res.clone(),
             })
             .collect();
         self.deposit(&self.collector_id, fees);
@@ -683,6 +748,8 @@ impl Bank {
         self.accounts
             .store_accounts(self.accounts_id, txs, executed, loaded_accounts);
 
+        self.store_vote_accounts(txs, executed, loaded_accounts);
+
         // once committed there is no way to unroll
         let write_elapsed = now.elapsed();
         debug!(
@@ -699,7 +766,7 @@ impl Bank {
     pub fn load_execute_and_commit_transactions(
         &self,
         txs: &[Transaction],
-        lock_results: Vec<Result<()>>,
+        lock_results: &LockedAccountsResults,
         max_age: usize,
     ) -> Vec<Result<()>> {
         let (loaded_accounts, executed) =
@@ -711,22 +778,14 @@ impl Bank {
     #[must_use]
     pub fn process_transactions(&self, txs: &[Transaction]) -> Vec<Result<()>> {
         let lock_results = self.lock_accounts(txs);
-        let results =
-            self.load_execute_and_commit_transactions(txs, lock_results, MAX_RECENT_BLOCKHASHES);
-        self.unlock_accounts(txs, &results);
-        results
+        self.load_execute_and_commit_transactions(txs, &lock_results, MAX_RECENT_BLOCKHASHES)
     }
 
     /// Create, sign, and process a Transaction from `keypair` to `to` of
     /// `n` lamports where `blockhash` is the last Entry ID observed by the client.
-    pub fn transfer(
-        &self,
-        n: u64,
-        keypair: &Keypair,
-        to: &Pubkey,
-        blockhash: Hash,
-    ) -> Result<Signature> {
-        let tx = SystemTransaction::new_account(keypair, to, n, blockhash, 0);
+    pub fn transfer(&self, n: u64, keypair: &Keypair, to: &Pubkey) -> Result<Signature> {
+        let blockhash = self.last_blockhash();
+        let tx = system_transaction::create_user_account(keypair, to, n, blockhash, 0);
         let signature = tx.signatures[0];
         self.process_transaction(&tx).map(|_| signature)
     }
@@ -753,6 +812,19 @@ impl Bank {
         parents
     }
 
+    fn store(&self, pubkey: &Pubkey, account: &Account) {
+        self.accounts.store_slow(self.accounts_id, pubkey, &account);
+
+        if solana_vote_api::check_id(&account.owner) {
+            let mut vote_accounts = self.vote_accounts.write().unwrap();
+            if account.lamports != 0 {
+                vote_accounts.insert(*pubkey, account.clone());
+            } else {
+                vote_accounts.remove(pubkey);
+            }
+        }
+    }
+
     pub fn withdraw(&self, pubkey: &Pubkey, lamports: u64) -> Result<()> {
         match self.get_account(pubkey) {
             Some(mut account) => {
@@ -761,7 +833,8 @@ impl Bank {
                 }
 
                 account.lamports -= lamports;
-                self.accounts.store_slow(self.accounts_id, pubkey, &account);
+                self.store(pubkey, &account);
+
                 Ok(())
             }
             None => Err(TransactionError::AccountNotFound),
@@ -771,7 +844,7 @@ impl Bank {
     pub fn deposit(&self, pubkey: &Pubkey, lamports: u64) {
         let mut account = self.get_account(pubkey).unwrap_or_default();
         account.lamports += lamports;
-        self.accounts.store_slow(self.accounts_id, pubkey, &account);
+        self.store(pubkey, &account);
     }
 
     pub fn get_account(&self, pubkey: &Pubkey) -> Option<Account> {
@@ -791,17 +864,24 @@ impl Bank {
     }
 
     pub fn transaction_count(&self) -> u64 {
-        self.accounts.transaction_count(self.accounts_id)
+        self.transaction_count.load(Ordering::Relaxed) as u64
+    }
+    fn increment_transaction_count(&self, tx_count: usize) {
+        self.transaction_count
+            .fetch_add(tx_count, Ordering::Relaxed);
     }
 
     pub fn get_signature_confirmation_status(
         &self,
         signature: &Signature,
     ) -> Option<(usize, Result<()>)> {
-        let parents = self.parents();
-        let mut caches = vec![self.status_cache.read().unwrap()];
-        caches.extend(parents.iter().map(|b| b.status_cache.read().unwrap()));
-        StatusCache::get_signature_status_all(&caches, signature)
+        let mut ancestors = HashMap::new();
+        ancestors.insert(self.slot(), 0);
+        self.parents().iter().enumerate().for_each(|(i, p)| {
+            ancestors.insert(p.slot(), i + 1);
+        });
+        let rcache = self.status_cache.read().unwrap();
+        rcache.get_signature_status_slow(signature, &ancestors)
     }
 
     pub fn get_signature_status(&self, signature: &Signature) -> Option<Result<()>> {
@@ -810,10 +890,7 @@ impl Bank {
     }
 
     pub fn has_signature(&self, signature: &Signature) -> bool {
-        let parents = self.parents();
-        let mut caches = vec![self.status_cache.read().unwrap()];
-        caches.extend(parents.iter().map(|b| b.status_cache.read().unwrap()));
-        StatusCache::has_signature_all(&caches, signature)
+        self.get_signature_confirmation_status(signature).is_some()
     }
 
     /// Hash the `accounts` HashMap. This represents a validator's interpretation
@@ -853,9 +930,40 @@ impl Bank {
         self.epoch_schedule.get_stakers_epoch(slot)
     }
 
+    /// a bank-level cache of vote accounts
+    fn store_vote_accounts(
+        &self,
+        txs: &[Transaction],
+        res: &[Result<()>],
+        loaded: &[Result<(InstructionAccounts, InstructionLoaders)>],
+    ) {
+        let mut vote_accounts = self.vote_accounts.write().unwrap();
+
+        for (i, raccs) in loaded.iter().enumerate() {
+            if res[i].is_err() || raccs.is_err() {
+                continue;
+            }
+
+            let message = &txs[i].message();
+            let acc = raccs.as_ref().unwrap();
+            for (key, account) in message
+                .account_keys
+                .iter()
+                .zip(acc.0.iter())
+                .filter(|(_, account)| solana_vote_api::check_id(&account.owner))
+            {
+                if account.lamports != 0 {
+                    vote_accounts.insert(*key, account.clone());
+                } else {
+                    vote_accounts.remove(key);
+                }
+            }
+        }
+    }
+
     /// current vote accounts for this bank
-    pub fn vote_accounts(&self) -> impl Iterator<Item = (Pubkey, Account)> {
-        self.accounts.get_vote_accounts(self.accounts_id)
+    pub fn vote_accounts(&self) -> HashMap<Pubkey, Account> {
+        self.vote_accounts.read().unwrap().clone()
     }
 
     ///  vote accounts for the specific epoch
@@ -883,18 +991,11 @@ impl Bank {
         program_id: Pubkey,
         process_instruction: ProcessInstruction,
     ) {
-        self.runtime
+        self.message_processor
             .add_instruction_processor(program_id, process_instruction);
 
-        // Add a bogus executable account to load.
-        let bogus_account = Account {
-            lamports: 1,
-            data: vec![],
-            owner: native_loader::id(),
-            executable: true,
-        };
-        self.accounts
-            .store_slow(self.accounts_id, &program_id, &bogus_account);
+        // Register a bogus executable account, which will be loaded and ignored.
+        self.register_native_instruction_processor("", &program_id);
     }
 
     pub fn is_in_subtree_of(&self, parent: u64) -> bool {
@@ -925,14 +1026,13 @@ impl Drop for Bank {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bincode::serialize;
     use solana_sdk::genesis_block::{GenesisBlock, BOOTSTRAP_LEADER_LAMPORTS};
     use solana_sdk::hash;
-    use solana_sdk::instruction::{CompiledInstruction, InstructionError};
+    use solana_sdk::instruction::InstructionError;
     use solana_sdk::signature::{Keypair, KeypairUtil};
-    use solana_sdk::system_instruction::SystemInstruction;
-    use solana_sdk::system_program;
-    use solana_sdk::system_transaction::SystemTransaction;
+    use solana_sdk::system_instruction;
+    use solana_sdk::system_transaction;
+    use solana_vote_api::vote_instruction;
 
     #[test]
     fn test_bank_new() {
@@ -943,7 +1043,7 @@ mod tests {
 
     #[test]
     fn test_bank_new_with_leader() {
-        let dummy_leader_id = Keypair::new().pubkey();
+        let dummy_leader_id = Pubkey::new_rand();
         let dummy_leader_lamports = BOOTSTRAP_LEADER_LAMPORTS;
         let (genesis_block, _) =
             GenesisBlock::new_with_leader(10_000, &dummy_leader_id, dummy_leader_lamports);
@@ -965,16 +1065,14 @@ mod tests {
     #[test]
     fn test_two_payments_to_one_party() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(10_000);
-        let pubkey = Keypair::new().pubkey();
+        let pubkey = Pubkey::new_rand();
         let bank = Bank::new(&genesis_block);
         assert_eq!(bank.last_blockhash(), genesis_block.hash());
 
-        bank.transfer(1_000, &mint_keypair, &pubkey, genesis_block.hash())
-            .unwrap();
+        bank.transfer(1_000, &mint_keypair, &pubkey).unwrap();
         assert_eq!(bank.get_balance(&pubkey), 1_000);
 
-        bank.transfer(500, &mint_keypair, &pubkey, genesis_block.hash())
-            .unwrap();
+        bank.transfer(500, &mint_keypair, &pubkey).unwrap();
         assert_eq!(bank.get_balance(&pubkey), 1_500);
         assert_eq!(bank.transaction_count(), 2);
     }
@@ -982,13 +1080,13 @@ mod tests {
     #[test]
     fn test_one_source_two_tx_one_batch() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(1);
-        let key1 = Keypair::new().pubkey();
-        let key2 = Keypair::new().pubkey();
+        let key1 = Pubkey::new_rand();
+        let key2 = Pubkey::new_rand();
         let bank = Bank::new(&genesis_block);
         assert_eq!(bank.last_blockhash(), genesis_block.hash());
 
-        let t1 = SystemTransaction::new_move(&mint_keypair, &key1, 1, genesis_block.hash(), 0);
-        let t2 = SystemTransaction::new_move(&mint_keypair, &key2, 1, genesis_block.hash(), 0);
+        let t1 = system_transaction::transfer(&mint_keypair, &key1, 1, genesis_block.hash(), 0);
+        let t2 = system_transaction::transfer(&mint_keypair, &key2, 1, genesis_block.hash(), 0);
         let res = bank.process_transactions(&vec![t1.clone(), t2.clone()]);
         assert_eq!(res.len(), 2);
         assert_eq!(res[0], Ok(()));
@@ -1007,80 +1105,63 @@ mod tests {
     #[test]
     fn test_one_tx_two_out_atomic_fail() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(1);
-        let key1 = Keypair::new().pubkey();
-        let key2 = Keypair::new().pubkey();
+        let key1 = Pubkey::new_rand();
+        let key2 = Pubkey::new_rand();
         let bank = Bank::new(&genesis_block);
-        let spend = SystemInstruction::Move { lamports: 1 };
-        let instructions = vec![
-            CompiledInstruction {
-                program_ids_index: 0,
-                data: serialize(&spend).unwrap(),
-                accounts: vec![0, 1],
-            },
-            CompiledInstruction {
-                program_ids_index: 0,
-                data: serialize(&spend).unwrap(),
-                accounts: vec![0, 2],
-            },
-        ];
-
-        let t1 = Transaction::new_with_compiled_instructions(
+        let instructions =
+            system_instruction::transfer_many(&mint_keypair.pubkey(), &[(key1, 1), (key2, 1)]);
+        let tx = Transaction::new_signed_instructions(
             &[&mint_keypair],
-            &[key1, key2],
-            genesis_block.hash(),
-            0,
-            vec![system_program::id()],
             instructions,
+            genesis_block.hash(),
         );
-        let res = bank.process_transactions(&vec![t1.clone()]);
-        assert_eq!(res.len(), 1);
+        assert_eq!(
+            bank.process_transaction(&tx).unwrap_err(),
+            TransactionError::InstructionError(
+                1,
+                InstructionError::new_result_with_negative_lamports(),
+            )
+        );
         assert_eq!(bank.get_balance(&mint_keypair.pubkey()), 1);
         assert_eq!(bank.get_balance(&key1), 0);
         assert_eq!(bank.get_balance(&key2), 0);
-        assert_eq!(
-            bank.get_signature_status(&t1.signatures[0]),
-            Some(Err(TransactionError::InstructionError(
-                1,
-                InstructionError::new_result_with_negative_lamports(),
-            )))
-        );
     }
 
     #[test]
     fn test_one_tx_two_out_atomic_pass() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(2);
-        let key1 = Keypair::new().pubkey();
-        let key2 = Keypair::new().pubkey();
+        let key1 = Pubkey::new_rand();
+        let key2 = Pubkey::new_rand();
         let bank = Bank::new(&genesis_block);
-        let t1 = SystemTransaction::new_move_many(
-            &mint_keypair,
-            &[(key1, 1), (key2, 1)],
+        let instructions =
+            system_instruction::transfer_many(&mint_keypair.pubkey(), &[(key1, 1), (key2, 1)]);
+        let tx = Transaction::new_signed_instructions(
+            &[&mint_keypair],
+            instructions,
             genesis_block.hash(),
-            0,
         );
-        let res = bank.process_transactions(&vec![t1.clone()]);
-        assert_eq!(res.len(), 1);
-        assert_eq!(res[0], Ok(()));
+        bank.process_transaction(&tx).unwrap();
         assert_eq!(bank.get_balance(&mint_keypair.pubkey()), 0);
         assert_eq!(bank.get_balance(&key1), 1);
         assert_eq!(bank.get_balance(&key2), 1);
-        assert_eq!(bank.get_signature_status(&t1.signatures[0]), Some(Ok(())));
     }
 
     // This test demonstrates that fees are paid even when a program fails.
     #[test]
     fn test_detect_failed_duplicate_transactions() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(2);
-        let bank = Bank::new(&genesis_block);
+        let mut bank = Bank::new(&genesis_block);
+        bank.fee_calculator.lamports_per_signature = 1;
+
         let dest = Keypair::new();
 
         // source with 0 program context
-        let tx = SystemTransaction::new_account(
+        let tx = system_transaction::create_user_account(
             &mint_keypair,
             &dest.pubkey(),
             2,
             genesis_block.hash(),
-            1,
+            0,
         );
         let signature = tx.signatures[0];
         assert!(!bank.has_signature(&signature));
@@ -1106,7 +1187,7 @@ mod tests {
         let bank = Bank::new(&genesis_block);
         let keypair = Keypair::new();
         assert_eq!(
-            bank.transfer(1, &keypair, &mint_keypair.pubkey(), genesis_block.hash()),
+            bank.transfer(1, &keypair, &mint_keypair.pubkey()),
             Err(TransactionError::AccountNotFound)
         );
         assert_eq!(bank.transaction_count(), 0);
@@ -1116,13 +1197,12 @@ mod tests {
     fn test_insufficient_funds() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(11_000);
         let bank = Bank::new(&genesis_block);
-        let pubkey = Keypair::new().pubkey();
-        bank.transfer(1_000, &mint_keypair, &pubkey, genesis_block.hash())
-            .unwrap();
+        let pubkey = Pubkey::new_rand();
+        bank.transfer(1_000, &mint_keypair, &pubkey).unwrap();
         assert_eq!(bank.transaction_count(), 1);
         assert_eq!(bank.get_balance(&pubkey), 1_000);
         assert_eq!(
-            bank.transfer(10_001, &mint_keypair, &pubkey, genesis_block.hash()),
+            bank.transfer(10_001, &mint_keypair, &pubkey),
             Err(TransactionError::InstructionError(
                 0,
                 InstructionError::new_result_with_negative_lamports(),
@@ -1139,9 +1219,8 @@ mod tests {
     fn test_transfer_to_newb() {
         let (genesis_block, mint_keypair) = GenesisBlock::new(10_000);
         let bank = Bank::new(&genesis_block);
-        let pubkey = Keypair::new().pubkey();
-        bank.transfer(500, &mint_keypair, &pubkey, genesis_block.hash())
-            .unwrap();
+        let pubkey = Pubkey::new_rand();
+        bank.transfer(500, &mint_keypair, &pubkey).unwrap();
         assert_eq!(bank.get_balance(&pubkey), 500);
     }
 
@@ -1188,39 +1267,54 @@ mod tests {
 
     #[test]
     fn test_bank_tx_fee() {
-        let leader = Keypair::new().pubkey();
+        let leader = Pubkey::new_rand();
         let (genesis_block, mint_keypair) = GenesisBlock::new_with_leader(100, &leader, 3);
-        let bank = Bank::new(&genesis_block);
+        let mut bank = Bank::new(&genesis_block);
+        bank.fee_calculator.lamports_per_signature = 3;
+
         let key1 = Keypair::new();
         let key2 = Keypair::new();
 
         let tx =
-            SystemTransaction::new_move(&mint_keypair, &key1.pubkey(), 2, genesis_block.hash(), 3);
+            system_transaction::transfer(&mint_keypair, &key1.pubkey(), 2, genesis_block.hash(), 0);
         let initial_balance = bank.get_balance(&leader);
         assert_eq!(bank.process_transaction(&tx), Ok(()));
         assert_eq!(bank.get_balance(&leader), initial_balance + 3);
         assert_eq!(bank.get_balance(&key1.pubkey()), 2);
         assert_eq!(bank.get_balance(&mint_keypair.pubkey()), 100 - 5 - 3);
 
-        let tx = SystemTransaction::new_move(&key1, &key2.pubkey(), 1, genesis_block.hash(), 1);
+        bank.fee_calculator.lamports_per_signature = 1;
+        let tx = system_transaction::transfer(&key1, &key2.pubkey(), 1, genesis_block.hash(), 0);
+
         assert_eq!(bank.process_transaction(&tx), Ok(()));
         assert_eq!(bank.get_balance(&leader), initial_balance + 4);
         assert_eq!(bank.get_balance(&key1.pubkey()), 0);
         assert_eq!(bank.get_balance(&key2.pubkey()), 1);
         assert_eq!(bank.get_balance(&mint_keypair.pubkey()), 100 - 5 - 3);
+
+        // verify that an InstructionError collects fees, too
+        let mut tx =
+            system_transaction::transfer(&mint_keypair, &key2.pubkey(), 1, genesis_block.hash(), 0);
+        // send a bogus instruction to system_program, cause an instruction error
+        tx.message.instructions[0].data[0] = 40;
+
+        bank.process_transaction(&tx).is_err(); // fails with an instruction error
+        assert_eq!(bank.get_balance(&leader), initial_balance + 5); // gots our bucks
+        assert_eq!(bank.get_balance(&key2.pubkey()), 1); //  our fee ------V
+        assert_eq!(bank.get_balance(&mint_keypair.pubkey()), 100 - 5 - 3 - 1);
     }
 
     #[test]
     fn test_filter_program_errors_and_collect_fee() {
-        let leader = Keypair::new().pubkey();
+        let leader = Pubkey::new_rand();
         let (genesis_block, mint_keypair) = GenesisBlock::new_with_leader(100, &leader, 3);
-        let bank = Bank::new(&genesis_block);
+        let mut bank = Bank::new(&genesis_block);
 
         let key = Keypair::new();
         let tx1 =
-            SystemTransaction::new_move(&mint_keypair, &key.pubkey(), 2, genesis_block.hash(), 3);
+            system_transaction::transfer(&mint_keypair, &key.pubkey(), 2, genesis_block.hash(), 0);
         let tx2 =
-            SystemTransaction::new_move(&mint_keypair, &key.pubkey(), 5, genesis_block.hash(), 1);
+            system_transaction::transfer(&mint_keypair, &key.pubkey(), 5, genesis_block.hash(), 0);
 
         let results = vec![
             Ok(()),
@@ -1230,9 +1324,10 @@ mod tests {
             )),
         ];
 
+        bank.fee_calculator.lamports_per_signature = 2;
         let initial_balance = bank.get_balance(&leader);
         let results = bank.filter_program_errors_and_collect_fee(&vec![tx1, tx2], &results);
-        assert_eq!(bank.get_balance(&leader), initial_balance + 3 + 1);
+        assert_eq!(bank.get_balance(&leader), initial_balance + 2 + 2);
         assert_eq!(results[0], Ok(()));
         assert_eq!(results[1], Ok(()));
     }
@@ -1242,14 +1337,14 @@ mod tests {
         let (genesis_block, mint_keypair) = GenesisBlock::new(2);
         let bank = Bank::new(&genesis_block);
         let keypair = Keypair::new();
-        let tx0 = SystemTransaction::new_account(
+        let tx0 = system_transaction::create_user_account(
             &mint_keypair,
             &keypair.pubkey(),
             2,
             genesis_block.hash(),
             0,
         );
-        let tx1 = SystemTransaction::new_account(
+        let tx1 = system_transaction::create_user_account(
             &keypair,
             &mint_keypair.pubkey(),
             1,
@@ -1266,7 +1361,7 @@ mod tests {
 
     #[test]
     fn test_process_genesis() {
-        let dummy_leader_id = Keypair::new().pubkey();
+        let dummy_leader_id = Pubkey::new_rand();
         let dummy_leader_lamports = 2;
         let (genesis_block, _) =
             GenesisBlock::new_with_leader(5, &dummy_leader_id, dummy_leader_lamports);
@@ -1282,7 +1377,7 @@ mod tests {
         let alice = Keypair::new();
         let bob = Keypair::new();
 
-        let tx1 = SystemTransaction::new_account(
+        let tx1 = system_transaction::create_user_account(
             &mint_keypair,
             &alice.pubkey(),
             1,
@@ -1294,28 +1389,26 @@ mod tests {
         let lock_result = bank.lock_accounts(&pay_alice);
         let results_alice = bank.load_execute_and_commit_transactions(
             &pay_alice,
-            lock_result,
+            &lock_result,
             MAX_RECENT_BLOCKHASHES,
         );
         assert_eq!(results_alice[0], Ok(()));
 
         // try executing an interleaved transfer twice
         assert_eq!(
-            bank.transfer(1, &mint_keypair, &bob.pubkey(), genesis_block.hash()),
+            bank.transfer(1, &mint_keypair, &bob.pubkey()),
             Err(TransactionError::AccountInUse)
         );
         // the second time should fail as well
         // this verifies that `unlock_accounts` doesn't unlock `AccountInUse` accounts
         assert_eq!(
-            bank.transfer(1, &mint_keypair, &bob.pubkey(), genesis_block.hash()),
+            bank.transfer(1, &mint_keypair, &bob.pubkey()),
             Err(TransactionError::AccountInUse)
         );
 
-        bank.unlock_accounts(&pay_alice, &results_alice);
+        drop(lock_result);
 
-        assert!(bank
-            .transfer(2, &mint_keypair, &bob.pubkey(), genesis_block.hash())
-            .is_ok());
+        assert!(bank.transfer(2, &mint_keypair, &bob.pubkey()).is_ok());
     }
 
     #[test]
@@ -1324,7 +1417,7 @@ mod tests {
         let keypair = Keypair::new();
         let bank = Bank::new(&genesis_block);
 
-        let tx = SystemTransaction::new_move(
+        let tx = system_transaction::transfer(
             &mint_keypair,
             &keypair.pubkey(),
             1,
@@ -1333,14 +1426,14 @@ mod tests {
         );
 
         let mut tx_invalid_program_index = tx.clone();
-        tx_invalid_program_index.instructions[0].program_ids_index = 42;
+        tx_invalid_program_index.message.instructions[0].program_ids_index = 42;
         assert_eq!(
             bank.process_transaction(&tx_invalid_program_index),
             Err(TransactionError::InvalidAccountIndex)
         );
 
         let mut tx_invalid_account_index = tx.clone();
-        tx_invalid_account_index.instructions[0].accounts[0] = 42;
+        tx_invalid_account_index.message.instructions[0].accounts[0] = 42;
         assert_eq!(
             bank.process_transaction(&tx_invalid_account_index),
             Err(TransactionError::InvalidAccountIndex)
@@ -1353,10 +1446,9 @@ mod tests {
         let key1 = Keypair::new();
         let bank = Bank::new(&genesis_block);
 
-        bank.transfer(1, &mint_keypair, &key1.pubkey(), genesis_block.hash())
-            .unwrap();
+        bank.transfer(1, &mint_keypair, &key1.pubkey()).unwrap();
         assert_eq!(bank.get_balance(&key1.pubkey()), 1);
-        let tx = SystemTransaction::new_move(&key1, &key1.pubkey(), 1, genesis_block.hash(), 0);
+        let tx = system_transaction::transfer(&key1, &key1.pubkey(), 1, genesis_block.hash(), 0);
         let res = bank.process_transactions(&vec![tx.clone()]);
         assert_eq!(res.len(), 1);
         assert_eq!(bank.get_balance(&key1.pubkey()), 1);
@@ -1391,7 +1483,7 @@ mod tests {
         let parent = Arc::new(Bank::new(&genesis_block));
 
         let tx =
-            SystemTransaction::new_move(&mint_keypair, &key1.pubkey(), 1, genesis_block.hash(), 0);
+            system_transaction::transfer(&mint_keypair, &key1.pubkey(), 1, genesis_block.hash(), 0);
         assert_eq!(parent.process_transaction(&tx), Ok(()));
         let bank = new_from_parent(&parent);
         assert_eq!(
@@ -1409,10 +1501,10 @@ mod tests {
         let parent = Arc::new(Bank::new(&genesis_block));
 
         let tx =
-            SystemTransaction::new_move(&mint_keypair, &key1.pubkey(), 1, genesis_block.hash(), 0);
+            system_transaction::transfer(&mint_keypair, &key1.pubkey(), 1, genesis_block.hash(), 0);
         assert_eq!(parent.process_transaction(&tx), Ok(()));
         let bank = new_from_parent(&parent);
-        let tx = SystemTransaction::new_move(&key1, &key2.pubkey(), 1, genesis_block.hash(), 0);
+        let tx = system_transaction::transfer(&key1, &key2.pubkey(), 1, genesis_block.hash(), 0);
         assert_eq!(bank.process_transaction(&tx), Ok(()));
         assert_eq!(parent.get_signature_status(&tx.signatures[0]), None);
     }
@@ -1425,14 +1517,10 @@ mod tests {
         let initial_state = bank0.hash_internal_state();
         assert_eq!(bank1.hash_internal_state(), initial_state);
 
-        let pubkey = Keypair::new().pubkey();
-        bank0
-            .transfer(1_000, &mint_keypair, &pubkey, bank0.last_blockhash())
-            .unwrap();
+        let pubkey = Pubkey::new_rand();
+        bank0.transfer(1_000, &mint_keypair, &pubkey).unwrap();
         assert_ne!(bank0.hash_internal_state(), initial_state);
-        bank1
-            .transfer(1_000, &mint_keypair, &pubkey, bank1.last_blockhash())
-            .unwrap();
+        bank1.transfer(1_000, &mint_keypair, &pubkey).unwrap();
         assert_eq!(bank0.hash_internal_state(), bank1.hash_internal_state());
 
         // Checkpointing should not change its state
@@ -1467,20 +1555,34 @@ mod tests {
     /// Verifies that last ids and accounts are correctly referenced from parent
     #[test]
     fn test_bank_squash() {
+        solana_logger::setup();
         let (genesis_block, mint_keypair) = GenesisBlock::new(2);
         let key1 = Keypair::new();
         let key2 = Keypair::new();
         let parent = Arc::new(Bank::new(&genesis_block));
 
         let tx_move_mint_to_1 =
-            SystemTransaction::new_move(&mint_keypair, &key1.pubkey(), 1, genesis_block.hash(), 0);
+            system_transaction::transfer(&mint_keypair, &key1.pubkey(), 1, genesis_block.hash(), 0);
+        trace!("parent process tx ");
         assert_eq!(parent.process_transaction(&tx_move_mint_to_1), Ok(()));
+        trace!("done parent process tx ");
         assert_eq!(parent.transaction_count(), 1);
+        assert_eq!(
+            parent.get_signature_status(&tx_move_mint_to_1.signatures[0]),
+            Some(Ok(()))
+        );
 
+        trace!("new form parent");
         let bank = new_from_parent(&parent);
+        trace!("done new form parent");
+        assert_eq!(
+            bank.get_signature_status(&tx_move_mint_to_1.signatures[0]),
+            Some(Ok(()))
+        );
+
         assert_eq!(bank.transaction_count(), parent.transaction_count());
         let tx_move_1_to_2 =
-            SystemTransaction::new_move(&key1, &key2.pubkey(), 1, genesis_block.hash(), 0);
+            system_transaction::transfer(&key1, &key2.pubkey(), 1, genesis_block.hash(), 0);
         assert_eq!(bank.process_transaction(&tx_move_1_to_2), Ok(()));
         assert_eq!(bank.transaction_count(), 2);
         assert_eq!(parent.transaction_count(), 1);
@@ -1494,6 +1596,7 @@ mod tests {
             assert_eq!(bank.get_balance(&key1.pubkey()), 0);
             assert_eq!(bank.get_account(&key1.pubkey()), None);
             assert_eq!(bank.get_balance(&key2.pubkey()), 1);
+            trace!("start");
             assert_eq!(
                 bank.get_signature_status(&tx_move_mint_to_1.signatures[0]),
                 Some(Ok(()))
@@ -1504,6 +1607,7 @@ mod tests {
             );
 
             // works iteration 0, no-ops on iteration 1 and 2
+            trace!("SQUASH");
             bank.squash();
 
             assert_eq!(parent.transaction_count(), 1);
@@ -1518,9 +1622,7 @@ mod tests {
 
         let key1 = Keypair::new();
 
-        parent
-            .transfer(1, &mint_keypair, &key1.pubkey(), genesis_block.hash())
-            .unwrap();
+        parent.transfer(1, &mint_keypair, &key1.pubkey()).unwrap();
         assert_eq!(parent.get_balance(&key1.pubkey()), 1);
         let bank = new_from_parent(&parent);
         bank.squash();
@@ -1529,7 +1631,7 @@ mod tests {
 
     #[test]
     fn test_bank_epoch_vote_accounts() {
-        let leader_id = Keypair::new().pubkey();
+        let leader_id = Pubkey::new_rand();
         let leader_lamports = 3;
         let (mut genesis_block, _) = GenesisBlock::new_with_leader(5, &leader_id, leader_lamports);
 
@@ -1593,28 +1695,19 @@ mod tests {
     fn test_zero_signatures() {
         solana_logger::setup();
         let (genesis_block, mint_keypair) = GenesisBlock::new(500);
-        let bank = Arc::new(Bank::new(&genesis_block));
+        let mut bank = Bank::new(&genesis_block);
+        bank.fee_calculator.lamports_per_signature = 2;
         let key = Keypair::new();
 
-        let move_lamports = SystemInstruction::Move { lamports: 1 };
+        let mut move_instruction =
+            system_instruction::transfer(&mint_keypair.pubkey(), &key.pubkey(), 0);
+        move_instruction.accounts[0].is_signer = false;
 
-        let mut tx = Transaction::new_with_blockhash_and_fee(
-            &mint_keypair.pubkey(),
-            &[key.pubkey()],
-            &system_program::id(),
-            &move_lamports,
+        let tx = Transaction::new_signed_instructions(
+            &Vec::<&Keypair>::new(),
+            vec![move_instruction],
             bank.last_blockhash(),
-            2,
         );
-
-        assert_eq!(
-            bank.process_transaction(&tx),
-            Err(TransactionError::MissingSignatureForFee)
-        );
-
-        // Set the fee to 0, this should give an InstructionError
-        // but since no signature we cannot look up the error.
-        tx.fee = 0;
 
         assert_eq!(bank.process_transaction(&tx), Ok(()));
         assert_eq!(bank.get_balance(&key.pubkey()), 0);
@@ -1689,7 +1782,7 @@ mod tests {
         let bank = Arc::new(Bank::new(&genesis_block));
         let key1 = Keypair::new();
         let tx_move_mint_to_1 =
-            SystemTransaction::new_move(&mint_keypair, &key1.pubkey(), 1, genesis_block.hash(), 0);
+            system_transaction::transfer(&mint_keypair, &key1.pubkey(), 1, genesis_block.hash(), 0);
         assert_eq!(bank.process_transaction(&tx_move_mint_to_1), Ok(()));
         assert_eq!(bank.is_delta.load(Ordering::Relaxed), true);
     }
@@ -1703,7 +1796,7 @@ mod tests {
 
         // Set is_delta to true
         let tx_move_mint_to_1 =
-            SystemTransaction::new_move(&mint_keypair, &key1.pubkey(), 1, genesis_block.hash(), 0);
+            system_transaction::transfer(&mint_keypair, &key1.pubkey(), 1, genesis_block.hash(), 0);
         assert_eq!(bank.process_transaction(&tx_move_mint_to_1), Ok(()));
         assert_eq!(bank.is_votable(), false);
 
@@ -1738,4 +1831,79 @@ mod tests {
         assert!(!bank5.is_in_subtree_of(2));
         assert!(!bank5.is_in_subtree_of(4));
     }
+
+    #[test]
+    fn test_bank_inherit_tx_count() {
+        let (genesis_block, mint_keypair) = GenesisBlock::new(500);
+        let bank0 = Arc::new(Bank::new(&genesis_block));
+
+        // Bank 1
+        let bank1 = Arc::new(new_from_parent(&bank0));
+        // Bank 2
+        let bank2 = new_from_parent(&bank0);
+
+        // transfer a token
+        assert_eq!(
+            bank1.process_transaction(&system_transaction::transfer(
+                &mint_keypair,
+                &Keypair::new().pubkey(),
+                1,
+                genesis_block.hash(),
+                0
+            )),
+            Ok(())
+        );
+
+        assert_eq!(bank0.transaction_count(), 0);
+        assert_eq!(bank2.transaction_count(), 0);
+        assert_eq!(bank1.transaction_count(), 1);
+
+        bank1.squash();
+
+        assert_eq!(bank0.transaction_count(), 0);
+        assert_eq!(bank2.transaction_count(), 0);
+        assert_eq!(bank1.transaction_count(), 1);
+
+        let bank6 = new_from_parent(&bank1);
+        assert_eq!(bank1.transaction_count(), 1);
+        assert_eq!(bank6.transaction_count(), 1);
+
+        bank6.squash();
+        assert_eq!(bank6.transaction_count(), 1);
+    }
+
+    #[test]
+    fn test_bank_vote_accounts() {
+        let (genesis_block, mint_keypair) = GenesisBlock::new(500);
+        let bank = Arc::new(Bank::new(&genesis_block));
+
+        let vote_accounts = bank.vote_accounts();
+        assert_eq!(vote_accounts.len(), 1); // bootstrap leader has
+                                            // to have a vote account
+
+        let vote_keypair = Keypair::new();
+        let instructions =
+            vote_instruction::create_account(&mint_keypair.pubkey(), &vote_keypair.pubkey(), 10);
+
+        let transaction = Transaction::new_signed_instructions(
+            &[&mint_keypair],
+            instructions,
+            bank.last_blockhash(),
+        );
+
+        bank.process_transaction(&transaction).unwrap();
+
+        let vote_accounts = bank.vote_accounts();
+
+        assert_eq!(vote_accounts.len(), 2);
+
+        assert!(vote_accounts.get(&vote_keypair.pubkey()).is_some());
+
+        assert!(bank.withdraw(&vote_keypair.pubkey(), 10).is_ok());
+
+        let vote_accounts = bank.vote_accounts();
+
+        assert_eq!(vote_accounts.len(), 1);
+    }
+
 }

@@ -8,7 +8,7 @@ use crate::result::{Error, Result};
 #[cfg(feature = "kvstore")]
 use solana_kvstore as kvstore;
 
-use bincode::{deserialize, serialize};
+use bincode::deserialize;
 
 use hashbrown::HashMap;
 
@@ -28,48 +28,35 @@ use std::fs;
 use std::io;
 use std::rc::Rc;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 mod db;
-#[cfg(feature = "kvstore")]
-mod kvs;
-#[cfg(not(feature = "kvstore"))]
-mod rocks;
 
-#[cfg(feature = "kvstore")]
-use self::kvs::{DataCf, ErasureCf, Kvs, MetaCf};
-#[cfg(not(feature = "kvstore"))]
-use self::rocks::{DataCf, ErasureCf, MetaCf, Rocks};
+macro_rules! db_imports {
+    { $mod:ident, $db:ident, $db_path:expr } => {
+        mod $mod;
 
-pub use db::{
-    Cursor, Database, IDataCf, IErasureCf, IMetaCf, IWriteBatch, LedgerColumnFamily,
-    LedgerColumnFamilyRaw,
-};
+        use $mod::$db;
+        use db::columns as cf;
 
-#[cfg(not(feature = "kvstore"))]
-pub type BlocktreeRawIterator = <Rocks as Database>::Cursor;
-#[cfg(feature = "kvstore")]
-pub type BlocktreeRawIterator = <Kvs as Database>::Cursor;
+        pub use db::columns;
 
-#[cfg(not(feature = "kvstore"))]
-pub type WriteBatch = <Rocks as Database>::WriteBatch;
-#[cfg(feature = "kvstore")]
-pub type WriteBatch = <Kvs as Database>::WriteBatch;
+        pub type Database = db::Database<$db>;
+        pub type Cursor<C>  = db::Cursor<$db, C>;
+        pub type LedgerColumn<C> = db::LedgerColumn<$db, C>;
+        pub type WriteBatch = db::WriteBatch<$db>;
+
+        pub trait Column: db::Column<$db> {}
+        impl<C: db::Column<$db>> Column for C {}
+
+        pub const BLOCKTREE_DIRECTORY: &str = $db_path;
+    };
+}
 
 #[cfg(not(feature = "kvstore"))]
-type KeyRef = <Rocks as Database>::KeyRef;
+db_imports! {rocks, Rocks, "rocksdb"}
 #[cfg(feature = "kvstore")]
-type KeyRef = <Kvs as Database>::KeyRef;
-
-#[cfg(not(feature = "kvstore"))]
-pub type Key = <Rocks as Database>::Key;
-#[cfg(feature = "kvstore")]
-pub type Key = <Kvs as Database>::Key;
-
-#[cfg(not(feature = "kvstore"))]
-pub const BLOCKTREE_DIRECTORY: &str = "rocksdb";
-#[cfg(feature = "kvstore")]
-pub const BLOCKTREE_DIRECTORY: &str = "kvstore";
+db_imports! {kvs, Kvs, "kvstore"}
 
 #[derive(Debug)]
 pub enum BlocktreeError {
@@ -118,6 +105,10 @@ impl SlotMeta {
         self.consumed == self.last_index + 1
     }
 
+    pub fn is_parent_set(&self) -> bool {
+        self.parent_slot != std::u64::MAX
+    }
+
     fn new(slot: u64, parent_slot: u64) -> Self {
         SlotMeta {
             slot,
@@ -133,15 +124,13 @@ impl SlotMeta {
 
 // ledger window
 pub struct Blocktree {
-    // Underlying database is automatically closed in the Drop implementation of DB
-    #[cfg(not(feature = "kvstore"))]
-    db: Arc<Rocks>,
-    #[cfg(feature = "kvstore")]
-    db: Arc<Kvs>,
-    meta_cf: MetaCf,
-    data_cf: DataCf,
-    erasure_cf: ErasureCf,
+    db: Arc<Database>,
+    meta_cf: LedgerColumn<cf::SlotMeta>,
+    data_cf: LedgerColumn<cf::Data>,
+    erasure_cf: LedgerColumn<cf::Coding>,
+    orphans_cf: LedgerColumn<cf::Orphans>,
     pub new_blobs_signals: Vec<SyncSender<bool>>,
+    pub root_slot: RwLock<u64>,
 }
 
 // Column family for metadata about a leader slot
@@ -150,8 +139,45 @@ pub const META_CF: &str = "meta";
 pub const DATA_CF: &str = "data";
 // Column family for erasure data
 pub const ERASURE_CF: &str = "erasure";
+// Column family for orphans data
+pub const ORPHANS_CF: &str = "orphans";
 
 impl Blocktree {
+    /// Opens a Ledger in directory, provides "infinite" window of blobs
+    pub fn open(ledger_path: &str) -> Result<Blocktree> {
+        use std::path::Path;
+
+        fs::create_dir_all(&ledger_path)?;
+        let ledger_path = Path::new(&ledger_path).join(BLOCKTREE_DIRECTORY);
+
+        // Open the database
+        let db = Arc::new(Database::open(&ledger_path)?);
+
+        // Create the metadata column family
+        let meta_cf = LedgerColumn::new(&db);
+
+        // Create the data column family
+        let data_cf = LedgerColumn::new(&db);
+
+        // Create the erasure column family
+        let erasure_cf = LedgerColumn::new(&db);
+
+        // Create the orphans column family. An "orphan" is defined as
+        // the head of a detached chain of slots, i.e. a slot with no
+        // known parent
+        let orphans_cf = LedgerColumn::new(&db);
+
+        Ok(Blocktree {
+            db,
+            meta_cf,
+            data_cf,
+            erasure_cf,
+            orphans_cf,
+            new_blobs_signals: vec![],
+            root_slot: RwLock::new(0),
+        })
+    }
+
     pub fn open_with_signal(ledger_path: &str) -> Result<(Self, Receiver<bool>)> {
         let mut blocktree = Self::open(ledger_path)?;
         let (signal_sender, signal_receiver) = sync_channel(1);
@@ -160,33 +186,43 @@ impl Blocktree {
         Ok((blocktree, signal_receiver))
     }
 
+    pub fn destroy(ledger_path: &str) -> Result<()> {
+        // Database::destroy() fails is the path doesn't exist
+        fs::create_dir_all(ledger_path)?;
+        let path = std::path::Path::new(ledger_path).join(BLOCKTREE_DIRECTORY);
+        Database::destroy(&path)
+    }
+
     pub fn meta(&self, slot: u64) -> Result<Option<SlotMeta>> {
-        self.meta_cf.get(&MetaCf::key(slot))
+        self.meta_cf.get(slot)
+    }
+
+    pub fn orphan(&self, slot: u64) -> Result<Option<bool>> {
+        self.orphans_cf.get(slot)
     }
 
     pub fn reset_slot_consumed(&self, slot: u64) -> Result<()> {
-        let meta_key = MetaCf::key(slot);
-        if let Some(mut meta) = self.meta_cf.get(&meta_key)? {
+        if let Some(mut meta) = self.meta_cf.get(slot)? {
             for index in 0..meta.received {
-                self.data_cf.delete_by_slot_index(slot, index)?;
+                self.data_cf.delete((slot, index))?;
             }
             meta.consumed = 0;
             meta.received = 0;
             meta.last_index = std::u64::MAX;
             meta.next_slots = vec![];
-            self.meta_cf.put(&meta_key, &meta)?;
+            self.meta_cf.put(0, &meta)?;
         }
         Ok(())
     }
 
     pub fn get_next_slot(&self, slot: u64) -> Result<Option<u64>> {
-        let mut db_iterator = self.db.raw_iterator_cf(self.meta_cf.handle())?;
-        db_iterator.seek(&MetaCf::key(slot + 1));
+        let mut db_iterator = self.db.cursor::<cf::SlotMeta>()?;
+        db_iterator.seek(slot + 1);
         if !db_iterator.valid() {
             Ok(None)
         } else {
-            let key = &db_iterator.key().expect("Expected valid key");
-            Ok(Some(MetaCf::index_from_key(&key)?))
+            let next_slot = db_iterator.key().expect("Expected valid key");
+            Ok(Some(next_slot))
         }
     }
 
@@ -293,18 +329,16 @@ impl Blocktree {
                     .meta(blob_slot)
                     .expect("Expect database get to succeed")
                 {
-                    // If parent_slot == std::u64::MAX, then this is one of the dummy metadatas inserted
+                    let backup = Some(meta.clone());
+                    // If parent_slot == std::u64::MAX, then this is one of the orphans inserted
                     // during the chaining process, see the function find_slot_meta_in_cached_state()
-                    // for details
-                    if meta.parent_slot == std::u64::MAX {
+                    // for details. Slots that are orphans are missing a parent_slot, so we should
+                    // fill in the parent now that we know it.
+                    if Self::is_orphan(&meta) {
                         meta.parent_slot = parent_slot;
-                        // Set backup as None so that all the logic for inserting new slots
-                        // still runs, as this placeholder slot is essentially equivalent to
-                        // inserting a new slot
-                        (Rc::new(RefCell::new(meta.clone())), None)
-                    } else {
-                        (Rc::new(RefCell::new(meta.clone())), Some(meta))
                     }
+
+                    (Rc::new(RefCell::new(meta)), backup)
                 } else {
                     (
                         Rc::new(RefCell::new(SlotMeta::new(blob_slot, parent_slot))),
@@ -334,16 +368,12 @@ impl Blocktree {
 
         // Check if any metadata was changed, if so, insert the new version of the
         // metadata into the write batch
-        for (slot, (meta_copy, meta_backup)) in slot_meta_working_set.iter() {
-            let meta: &SlotMeta = &RefCell::borrow(&*meta_copy);
+        for (slot, (meta, meta_backup)) in slot_meta_working_set.iter() {
+            let meta: &SlotMeta = &RefCell::borrow(&*meta);
             // Check if the working copy of the metadata has changed
             if Some(meta) != meta_backup.as_ref() {
                 should_signal = should_signal || Self::slot_has_updates(meta, &meta_backup);
-                write_batch.put_cf(
-                    self.meta_cf.handle(),
-                    &MetaCf::key(*slot),
-                    &serialize(&meta)?,
-                )?;
+                write_batch.put::<cf::SlotMeta>(*slot, &meta)?;
             }
         }
 
@@ -368,9 +398,8 @@ impl Blocktree {
         buf: &mut [u8],
         slot: u64,
     ) -> Result<(u64, u64)> {
-        let start_key = DataCf::key(slot, start_index);
-        let mut db_iterator = self.db.raw_iterator_cf(self.data_cf.handle())?;
-        db_iterator.seek(&start_key);
+        let mut db_iterator = self.db.cursor::<cf::Data>()?;
+        db_iterator.seek((slot, start_index));
         let mut total_blobs = 0;
         let mut total_current_size = 0;
         for expected_index in start_index..start_index + num_blobs {
@@ -387,14 +416,13 @@ impl Blocktree {
 
             // Check key is the next sequential key based on
             // blob index
-            let key = &db_iterator.key().expect("Expected valid key");
-            let index = DataCf::index_from_key(key)?;
+            let (_, index) = db_iterator.key().expect("Expected valid key");
             if index != expected_index {
                 break;
             }
 
             // Get the blob data
-            let value = &db_iterator.value();
+            let value = &db_iterator.value_bytes();
 
             if value.is_none() {
                 break;
@@ -421,24 +449,24 @@ impl Blocktree {
     }
 
     pub fn get_coding_blob_bytes(&self, slot: u64, index: u64) -> Result<Option<Vec<u8>>> {
-        self.erasure_cf.get_by_slot_index(slot, index)
+        self.erasure_cf.get_bytes((slot, index))
     }
     pub fn delete_coding_blob(&self, slot: u64, index: u64) -> Result<()> {
-        self.erasure_cf.delete_by_slot_index(slot, index)
+        self.erasure_cf.delete((slot, index))
     }
     pub fn get_data_blob_bytes(&self, slot: u64, index: u64) -> Result<Option<Vec<u8>>> {
-        self.data_cf.get_by_slot_index(slot, index)
+        self.data_cf.get_bytes((slot, index))
     }
     pub fn put_coding_blob_bytes(&self, slot: u64, index: u64, bytes: &[u8]) -> Result<()> {
-        self.erasure_cf.put_by_slot_index(slot, index, bytes)
+        self.erasure_cf.put_bytes((slot, index), bytes)
     }
 
-    pub fn put_data_raw(&self, key: &KeyRef, value: &[u8]) -> Result<()> {
-        self.data_cf.put(key, value)
+    pub fn put_data_raw(&self, slot: u64, index: u64, value: &[u8]) -> Result<()> {
+        self.data_cf.put_bytes((slot, index), value)
     }
 
     pub fn put_data_blob_bytes(&self, slot: u64, index: u64, bytes: &[u8]) -> Result<()> {
-        self.data_cf.put_by_slot_index(slot, index, bytes)
+        self.data_cf.put_bytes((slot, index), bytes)
     }
 
     pub fn get_data_blob(&self, slot: u64, blob_index: u64) -> Result<Option<Blob>> {
@@ -463,16 +491,16 @@ impl Blocktree {
     // Given a start and end entry index, find all the missing
     // indexes in the ledger in the range [start_index, end_index)
     // for the slot with the specified slot
-    fn find_missing_indexes(
-        db_iterator: &mut BlocktreeRawIterator,
+    fn find_missing_indexes<C>(
+        db_iterator: &mut Cursor<C>,
         slot: u64,
         start_index: u64,
         end_index: u64,
-        key: &dyn Fn(u64, u64) -> Key,
-        slot_from_key: &dyn Fn(&KeyRef) -> Result<u64>,
-        index_from_key: &dyn Fn(&KeyRef) -> Result<u64>,
         max_missing: usize,
-    ) -> Vec<u64> {
+    ) -> Vec<u64>
+    where
+        C: Column<Index = (u64, u64)>,
+    {
         if start_index >= end_index || max_missing == 0 {
             return vec![];
         }
@@ -480,7 +508,7 @@ impl Blocktree {
         let mut missing_indexes = vec![];
 
         // Seek to the first blob with index >= start_index
-        db_iterator.seek(&key(slot, start_index));
+        db_iterator.seek((slot, start_index));
 
         // The index of the first missing blob in the slot
         let mut prev_index = start_index;
@@ -494,15 +522,12 @@ impl Blocktree {
                 }
                 break;
             }
-            let current_key = db_iterator.key().expect("Expect a valid key");
-            let current_slot = slot_from_key(&current_key)
-                .expect("Expect to be able to parse slot from valid key");
+            let (current_slot, index) = db_iterator.key().expect("Expect a valid key");
             let current_index = {
                 if current_slot > slot {
                     end_index
                 } else {
-                    index_from_key(&current_key)
-                        .expect("Expect to be able to parse index from valid key")
+                    index
                 }
             };
             let upper_index = cmp::min(current_index, end_index);
@@ -536,18 +561,11 @@ impl Blocktree {
         end_index: u64,
         max_missing: usize,
     ) -> Vec<u64> {
-        let mut db_iterator = self.data_cf.raw_iterator();
-
-        Self::find_missing_indexes(
-            &mut db_iterator,
-            slot,
-            start_index,
-            end_index,
-            &DataCf::key,
-            &DataCf::slot_from_key,
-            &DataCf::index_from_key,
-            max_missing,
-        )
+        if let Ok(mut db_iterator) = self.data_cf.cursor() {
+            Self::find_missing_indexes(&mut db_iterator, slot, start_index, end_index, max_missing)
+        } else {
+            vec![]
+        }
     }
 
     pub fn find_missing_coding_indexes(
@@ -557,18 +575,11 @@ impl Blocktree {
         end_index: u64,
         max_missing: usize,
     ) -> Vec<u64> {
-        let mut db_iterator = self.erasure_cf.raw_iterator();
-
-        Self::find_missing_indexes(
-            &mut db_iterator,
-            slot,
-            start_index,
-            end_index,
-            &ErasureCf::key,
-            &ErasureCf::slot_from_key,
-            &ErasureCf::index_from_key,
-            max_missing,
-        )
+        if let Ok(mut db_iterator) = self.erasure_cf.cursor() {
+            Self::find_missing_indexes(&mut db_iterator, slot, start_index, end_index, max_missing)
+        } else {
+            vec![]
+        }
     }
 
     /// Returns the entry vector for the slot starting with `blob_start_index`
@@ -580,6 +591,77 @@ impl Blocktree {
     ) -> Result<Vec<Entry>> {
         self.get_slot_entries_with_blob_count(slot, blob_start_index, max_entries)
             .map(|x| x.0)
+    }
+
+    pub fn read_ledger_blobs(&self) -> impl Iterator<Item = Blob> {
+        self.data_cf
+            .iter()
+            .unwrap()
+            .map(|(_, blob_data)| Blob::new(&blob_data))
+    }
+
+    /// Return an iterator for all the entries in the given file.
+    pub fn read_ledger(&self) -> Result<impl Iterator<Item = Entry>> {
+        use crate::entry::EntrySlice;
+        use std::collections::VecDeque;
+
+        struct EntryIterator {
+            db_iterator: Cursor<cf::Data>,
+
+            // TODO: remove me when replay_stage is iterating by block (Blocktree)
+            //    this verification is duplicating that of replay_stage, which
+            //    can do this in parallel
+            blockhash: Option<Hash>,
+            // https://github.com/rust-rocksdb/rust-rocksdb/issues/234
+            //   rocksdb issue: the _blocktree member must be lower in the struct to prevent a crash
+            //   when the db_iterator member above is dropped.
+            //   _blocktree is unused, but dropping _blocktree results in a broken db_iterator
+            //   you have to hold the database open in order to iterate over it, and in order
+            //   for db_iterator to be able to run Drop
+            //    _blocktree: Blocktree,
+            entries: VecDeque<Entry>,
+        }
+
+        impl Iterator for EntryIterator {
+            type Item = Entry;
+
+            fn next(&mut self) -> Option<Entry> {
+                if !self.entries.is_empty() {
+                    return Some(self.entries.pop_front().unwrap());
+                }
+
+                if self.db_iterator.valid() {
+                    if let Some(value) = self.db_iterator.value_bytes() {
+                        if let Ok(next_entries) =
+                            deserialize::<Vec<Entry>>(&value[BLOB_HEADER_SIZE..])
+                        {
+                            if let Some(blockhash) = self.blockhash {
+                                if !next_entries.verify(&blockhash) {
+                                    return None;
+                                }
+                            }
+                            self.db_iterator.next();
+                            if next_entries.is_empty() {
+                                return None;
+                            }
+                            self.entries = VecDeque::from(next_entries);
+                            let entry = self.entries.pop_front().unwrap();
+                            self.blockhash = Some(entry.hash);
+                            return Some(entry);
+                        }
+                    }
+                }
+                None
+            }
+        }
+        let mut db_iterator = self.data_cf.cursor()?;
+
+        db_iterator.seek_to_first();
+        Ok(EntryIterator {
+            entries: VecDeque::new(),
+            db_iterator,
+            blockhash: None,
+        })
     }
 
     pub fn get_slot_entries_with_blob_count(
@@ -615,6 +697,26 @@ impl Blocktree {
     pub fn deserialize_blob_data(data: &[u8]) -> Result<Vec<Entry>> {
         let entries = deserialize(data)?;
         Ok(entries)
+    }
+
+    pub fn set_root(&self, root: u64) {
+        *self.root_slot.write().unwrap() = root;
+    }
+
+    pub fn get_orphans(&self, max: Option<usize>) -> Vec<u64> {
+        let mut results = vec![];
+        let mut iter = self.orphans_cf.cursor().unwrap();
+        iter.seek_to_first();
+        while iter.valid() {
+            if let Some(max) = max {
+                if results.len() > max {
+                    break;
+                }
+            }
+            results.push(iter.key().unwrap());
+            iter.next();
+        }
+        results
     }
 
     fn deserialize_blobs<I>(blob_datas: &[I]) -> Vec<Entry>
@@ -655,78 +757,113 @@ impl Blocktree {
         let mut new_chained_slots = HashMap::new();
         let working_set_slots: Vec<_> = working_set.iter().map(|s| *s.0).collect();
         for slot in working_set_slots {
-            self.handle_chaining_for_slot(working_set, &mut new_chained_slots, slot)?;
+            self.handle_chaining_for_slot(write_batch, working_set, &mut new_chained_slots, slot)?;
         }
 
         // Write all the newly changed slots in new_chained_slots to the write_batch
-        for (slot, meta_copy) in new_chained_slots.iter() {
-            let meta: &SlotMeta = &RefCell::borrow(&*meta_copy);
-            write_batch.put_cf(
-                self.meta_cf.handle(),
-                &MetaCf::key(*slot),
-                &serialize(meta)?,
-            )?;
+        for (slot, meta) in new_chained_slots.iter() {
+            let meta: &SlotMeta = &RefCell::borrow(&*meta);
+            write_batch.put::<cf::SlotMeta>(*slot, meta)?;
         }
         Ok(())
     }
 
     fn handle_chaining_for_slot(
         &self,
+        write_batch: &mut WriteBatch,
         working_set: &HashMap<u64, (Rc<RefCell<SlotMeta>>, Option<SlotMeta>)>,
         new_chained_slots: &mut HashMap<u64, Rc<RefCell<SlotMeta>>>,
         slot: u64,
     ) -> Result<()> {
-        let (meta_copy, meta_backup) = working_set
+        let (meta, meta_backup) = working_set
             .get(&slot)
             .expect("Slot must exist in the working_set hashmap");
+
         {
-            let mut slot_meta = meta_copy.borrow_mut();
+            let is_orphan = meta_backup.is_some() && Self::is_orphan(meta_backup.as_ref().unwrap());
+
+            let mut meta_mut = meta.borrow_mut();
 
             // If:
             // 1) This is a new slot
             // 2) slot != 0
             // then try to chain this slot to a previous slot
             if slot != 0 {
-                let prev_slot = slot_meta.parent_slot;
+                let prev_slot = meta_mut.parent_slot;
 
-                // Check if slot_meta is a new slot
-                if meta_backup.is_none() {
-                    let prev_slot =
+                // Check if the slot represented by meta_mut is either a new slot or a orphan.
+                // In both cases we need to run the chaining logic b/c the parent on the slot was
+                // previously unknown.
+                if meta_backup.is_none() || is_orphan {
+                    let prev_slot_meta =
                         self.find_slot_meta_else_create(working_set, new_chained_slots, prev_slot)?;
 
-                    // This is a newly inserted slot so:
-                    // 1) Chain to the previous slot, and also
-                    // 2) Determine whether to set the is_connected flag
+                    // This is a newly inserted slot so run the chaining logic
                     self.chain_new_slot_to_prev_slot(
-                        &mut prev_slot.borrow_mut(),
+                        &mut prev_slot_meta.borrow_mut(),
                         slot,
-                        &mut slot_meta,
+                        &mut meta_mut,
                     );
+
+                    if Self::is_orphan(&RefCell::borrow(&*prev_slot_meta)) {
+                        write_batch.put::<cf::Orphans>(prev_slot, &true)?;
+                    }
                 }
+            }
+
+            // At this point this slot has received a parent, so no longer a orphan
+            if is_orphan {
+                write_batch.delete::<cf::Orphans>(slot)?;
             }
         }
 
-        if self.is_newly_completed_slot(&RefCell::borrow(&*meta_copy), meta_backup)
-            && RefCell::borrow(&*meta_copy).is_connected
-        {
-            // This is a newly inserted slot and slot.is_connected is true, so go through
-            // and update all child slots with is_connected if applicable
-            let mut next_slots: Vec<(u64, Rc<RefCell<(SlotMeta)>>)> =
-                vec![(slot, meta_copy.clone())];
-            while !next_slots.is_empty() {
-                let (_, current_slot) = next_slots.pop().unwrap();
-                current_slot.borrow_mut().is_connected = true;
+        // This is a newly inserted slot and slot.is_connected is true, so update all
+        // child slots so that their `is_connected` = true
+        let should_propagate_is_connected =
+            Self::is_newly_completed_slot(&RefCell::borrow(&*meta), meta_backup)
+                && RefCell::borrow(&*meta).is_connected;
 
+        if should_propagate_is_connected {
+            // slot_function returns a boolean indicating whether to explore the children
+            // of the input slot
+            let slot_function = |slot: &mut SlotMeta| {
+                slot.is_connected = true;
+
+                // We don't want to set the is_connected flag on the children of non-full
+                // slots
+                slot.is_full()
+            };
+
+            self.traverse_children_mut(slot, &meta, working_set, new_chained_slots, slot_function)?;
+        }
+
+        Ok(())
+    }
+
+    fn traverse_children_mut<F>(
+        &self,
+        slot: u64,
+        slot_meta: &Rc<RefCell<(SlotMeta)>>,
+        working_set: &HashMap<u64, (Rc<RefCell<SlotMeta>>, Option<SlotMeta>)>,
+        new_chained_slots: &mut HashMap<u64, Rc<RefCell<SlotMeta>>>,
+        slot_function: F,
+    ) -> Result<()>
+    where
+        F: Fn(&mut SlotMeta) -> bool,
+    {
+        let mut next_slots: Vec<(u64, Rc<RefCell<(SlotMeta)>>)> = vec![(slot, slot_meta.clone())];
+        while !next_slots.is_empty() {
+            let (_, current_slot) = next_slots.pop().unwrap();
+            // Check whether we should explore the children of this slot
+            if slot_function(&mut current_slot.borrow_mut()) {
                 let current_slot = &RefCell::borrow(&*current_slot);
-                if current_slot.is_full() {
-                    for next_slot_index in current_slot.next_slots.iter() {
-                        let next_slot = self.find_slot_meta_else_create(
-                            working_set,
-                            new_chained_slots,
-                            *next_slot_index,
-                        )?;
-                        next_slots.push((*next_slot_index, next_slot));
-                    }
+                for next_slot_index in current_slot.next_slots.iter() {
+                    let next_slot = self.find_slot_meta_else_create(
+                        working_set,
+                        new_chained_slots,
+                        *next_slot_index,
+                    )?;
+                    next_slots.push((*next_slot_index, next_slot));
                 }
             }
         }
@@ -734,6 +871,14 @@ impl Blocktree {
         Ok(())
     }
 
+    fn is_orphan(meta: &SlotMeta) -> bool {
+        // If we have no parent, then this is the head of a detached chain of
+        // slots
+        !meta.is_parent_set()
+    }
+
+    // 1) Chain current_slot to the previous slot defined by prev_slot_meta
+    // 2) Determine whether to set the is_connected flag
     fn chain_new_slot_to_prev_slot(
         &self,
         prev_slot_meta: &mut SlotMeta,
@@ -744,20 +889,17 @@ impl Blocktree {
         current_slot_meta.is_connected = prev_slot_meta.is_connected && prev_slot_meta.is_full();
     }
 
-    fn is_newly_completed_slot(
-        &self,
-        slot_meta: &SlotMeta,
-        backup_slot_meta: &Option<SlotMeta>,
-    ) -> bool {
+    fn is_newly_completed_slot(slot_meta: &SlotMeta, backup_slot_meta: &Option<SlotMeta>) -> bool {
         slot_meta.is_full()
             && (backup_slot_meta.is_none()
+                || Self::is_orphan(&backup_slot_meta.as_ref().unwrap())
                 || slot_meta.consumed != backup_slot_meta.as_ref().unwrap().consumed)
     }
 
     // 1) Find the slot metadata in the cache of dirty slot metadata we've previously touched,
     // else:
-    // 2) Search the database for that slot metadata. If still no luck, then
-    // 3) Create a dummy placeholder slot in the database
+    // 2) Search the database for that slot metadata. If still no luck, then:
+    // 3) Create a dummy orphan slot in the database
     fn find_slot_meta_else_create<'a>(
         &self,
         working_set: &'a HashMap<u64, (Rc<RefCell<SlotMeta>>, Option<SlotMeta>)>,
@@ -773,7 +915,7 @@ impl Blocktree {
     }
 
     // Search the database for that slot metadata. If still no luck, then
-    // create a dummy placeholder slot in the database
+    // create a dummy orphan slot in the database
     fn find_slot_meta_in_db_else_create<'a>(
         &self,
         slot: u64,
@@ -783,7 +925,7 @@ impl Blocktree {
             insert_map.insert(slot, Rc::new(RefCell::new(slot_meta)));
             Ok(insert_map.get(&slot).unwrap().clone())
         } else {
-            // If this slot doesn't exist, make a placeholder slot. This way we
+            // If this slot doesn't exist, make a orphan slot. This way we
             // remember which slots chained to this one when we eventually get a real blob
             // for this slot
             insert_map.insert(
@@ -848,12 +990,11 @@ impl Blocktree {
             }
         };
 
-        let key = DataCf::key(blob_slot, blob_index);
         let serialized_blob_data = &blob_to_insert.data[..BLOB_HEADER_SIZE + blob_size];
 
         // Commit step: commit all changes to the mutable structures at once, or none at all.
         // We don't want only some of these changes going through.
-        write_batch.put_cf(self.data_cf.handle(), &key, serialized_blob_data)?;
+        write_batch.put_bytes::<cf::Data>((blob_slot, blob_index), serialized_blob_data)?;
         prev_inserted_blob_datas.insert((blob_slot, blob_index), serialized_blob_data);
         // Index is zero-indexed, while the "received" height starts from 1,
         // so received = index + 1 for the same blob.
@@ -892,7 +1033,7 @@ impl Blocktree {
             // Try to find the next blob we're looking for in the prev_inserted_blob_datas
             if let Some(prev_blob_data) = prev_inserted_blob_datas.get(&(slot, current_index)) {
                 blobs.push(Cow::Borrowed(*prev_blob_data));
-            } else if let Some(blob_data) = self.data_cf.get_by_slot_index(slot, current_index)? {
+            } else if let Some(blob_data) = self.data_cf.get_bytes((slot, current_index))? {
                 // Try to find the next blob we're looking for in the database
                 blobs.push(Cow::Owned(blob_data));
             } else {
@@ -909,7 +1050,6 @@ impl Blocktree {
     // don't count as ticks, even if they're empty entries
     fn write_genesis_blobs(&self, blobs: &[Blob]) -> Result<()> {
         // TODO: change bootstrap height to number of slots
-        let meta_key = MetaCf::key(0);
         let mut bootstrap_meta = SlotMeta::new(0, 1);
         let last = blobs.last().unwrap();
 
@@ -918,15 +1058,10 @@ impl Blocktree {
         bootstrap_meta.is_connected = true;
 
         let mut batch = self.db.batch()?;
-        batch.put_cf(
-            self.meta_cf.handle(),
-            &meta_key,
-            &serialize(&bootstrap_meta)?,
-        )?;
+        batch.put::<cf::SlotMeta>(0, &bootstrap_meta)?;
         for blob in blobs {
-            let key = DataCf::key(blob.slot(), blob.index());
             let serialized_blob_datas = &blob.data[..BLOB_HEADER_SIZE + blob.size()];
-            batch.put_cf(self.data_cf.handle(), &key, serialized_blob_datas)?;
+            batch.put_bytes::<cf::Data>((blob.slot(), blob.index()), serialized_blob_datas)?;
         }
         self.db.write(batch)?;
         Ok(())
@@ -1049,6 +1184,7 @@ pub mod tests {
     use rand::seq::SliceRandom;
     use rand::thread_rng;
     use solana_sdk::hash::Hash;
+    use solana_sdk::pubkey::Pubkey;
     use std::cmp::min;
     use std::collections::HashSet;
     use std::iter::once;
@@ -1171,11 +1307,10 @@ pub mod tests {
 
         // Test meta column family
         let meta = SlotMeta::new(0, 1);
-        let meta_key = MetaCf::key(0);
-        ledger.meta_cf.put(&meta_key, &meta).unwrap();
+        ledger.meta_cf.put(0, &meta).unwrap();
         let result = ledger
             .meta_cf
-            .get(&meta_key)
+            .get(0)
             .unwrap()
             .expect("Expected meta object to exist");
 
@@ -1183,12 +1318,12 @@ pub mod tests {
 
         // Test erasure column family
         let erasure = vec![1u8; 16];
-        let erasure_key = ErasureCf::key(0, 0);
-        ledger.erasure_cf.put(&erasure_key, &erasure).unwrap();
+        let erasure_key = (0, 0);
+        ledger.erasure_cf.put_bytes(erasure_key, &erasure).unwrap();
 
         let result = ledger
             .erasure_cf
-            .get(&erasure_key)
+            .get_bytes(erasure_key)
             .unwrap()
             .expect("Expected erasure object to exist");
 
@@ -1196,12 +1331,12 @@ pub mod tests {
 
         // Test data column family
         let data = vec![2u8; 16];
-        let data_key = DataCf::key(0, 0);
-        ledger.data_cf.put(&data_key, &data).unwrap();
+        let data_key = (0, 0);
+        ledger.data_cf.put_bytes(data_key, &data).unwrap();
 
         let result = ledger
             .data_cf
-            .get(&data_key)
+            .get_bytes(data_key)
             .unwrap()
             .expect("Expected data object to exist");
 
@@ -1216,7 +1351,7 @@ pub mod tests {
     fn test_read_blobs_bytes() {
         let shared_blobs = make_tiny_test_entries(10).to_single_entry_shared_blobs();
         let slot = 0;
-        packet::index_blobs(&shared_blobs, &Keypair::new().pubkey(), 0, slot, 0);
+        packet::index_blobs(&shared_blobs, &Pubkey::new_rand(), 0, slot, 0);
 
         let blob_locks: Vec<_> = shared_blobs.iter().map(|b| b.read().unwrap()).collect();
         let blobs: Vec<&Blob> = blob_locks.iter().map(|b| &**b).collect();
@@ -1296,7 +1431,7 @@ pub mod tests {
 
         let meta = ledger
             .meta_cf
-            .get(&MetaCf::key(0))
+            .get(0)
             .unwrap()
             .expect("Expected new metadata object to be created");
         assert!(meta.consumed == 0 && meta.received == num_entries);
@@ -1311,7 +1446,7 @@ pub mod tests {
 
         let meta = ledger
             .meta_cf
-            .get(&MetaCf::key(0))
+            .get(0)
             .unwrap()
             .expect("Expected new metadata object to exist");
         assert_eq!(meta.consumed, num_entries);
@@ -1341,7 +1476,7 @@ pub mod tests {
 
             let meta = ledger
                 .meta_cf
-                .get(&MetaCf::key(0))
+                .get(0)
                 .unwrap()
                 .expect("Expected metadata object to exist");
             assert_eq!(meta.parent_slot, 0);
@@ -1389,17 +1524,15 @@ pub mod tests {
 
             let mut db_iterator = blocktree
                 .db
-                .raw_iterator_cf(blocktree.data_cf.handle())
+                .cursor::<cf::Data>()
                 .expect("Expected to be able to open database iterator");
 
-            db_iterator.seek(&DataCf::key(slot, 1));
+            db_iterator.seek((slot, 1));
 
             // Iterate through ledger
             for i in 0..num_entries {
                 assert!(db_iterator.valid());
-                let current_key = db_iterator.key().expect("Expected a valid key");
-                let current_index = DataCf::index_from_key(&current_key)
-                    .expect("Expect to be able to parse index from valid key");
+                let (_, current_index) = db_iterator.key().expect("Expected a valid key");
                 assert_eq!(current_index, (1 as u64) << (i * 8));
                 db_iterator.next();
             }
@@ -1519,8 +1652,7 @@ pub mod tests {
 
             assert_eq!(blocktree.get_slot_entries(0, 0, None).unwrap(), vec![]);
 
-            let meta_key = MetaCf::key(slot);
-            let meta = blocktree.meta_cf.get(&meta_key).unwrap().unwrap();
+            let meta = blocktree.meta_cf.get(slot).unwrap().unwrap();
             if num_entries % 2 == 0 {
                 assert_eq!(meta.received, num_entries);
             } else {
@@ -1541,8 +1673,7 @@ pub mod tests {
                 original_entries,
             );
 
-            let meta_key = MetaCf::key(slot);
-            let meta = blocktree.meta_cf.get(&meta_key).unwrap().unwrap();
+            let meta = blocktree.meta_cf.get(slot).unwrap().unwrap();
             assert_eq!(meta.received, num_entries);
             assert_eq!(meta.consumed, num_entries);
             assert_eq!(meta.parent_slot, 0);
@@ -1594,8 +1725,7 @@ pub mod tests {
 
             assert_eq!(blocktree.get_slot_entries(0, 0, None).unwrap(), expected,);
 
-            let meta_key = MetaCf::key(0);
-            let meta = blocktree.meta_cf.get(&meta_key).unwrap().unwrap();
+            let meta = blocktree.meta_cf.get(0).unwrap().unwrap();
             assert_eq!(meta.consumed, num_unique_entries);
             assert_eq!(meta.received, num_unique_entries);
             assert_eq!(meta.parent_slot, 0);
@@ -1836,9 +1966,9 @@ pub mod tests {
             for i in 0..num_slots {
                 // If "i" is the index of a slot we just inserted, then next_slots should be empty
                 // for slot "i" because no slots chain to that slot, because slot i + 1 is missing.
-                // However, if it's a slot we haven't inserted, aka one of the gaps, then one of the slots
-                // we just inserted will chain to that gap, so next_slots for that placeholder
-                // slot won't be empty, but the parent slot is unknown so should equal std::u64::MAX.
+                // However, if it's a slot we haven't inserted, aka one of the gaps, then one of the
+                // slots we just inserted will chain to that gap, so next_slots for that orphan slot
+                // won't be empty, but the parent slot is unknown so should equal std::u64::MAX.
                 let s = blocktree.meta(i as u64).unwrap().unwrap();
                 if i % 2 == 0 {
                     assert_eq!(s.next_slots, vec![i as u64 + 1]);
@@ -2010,6 +2140,7 @@ pub mod tests {
                 let slot_meta = blocktree.meta(slot).unwrap().unwrap();
                 assert_eq!(slot_meta.consumed, entries_per_slot);
                 assert_eq!(slot_meta.received, entries_per_slot);
+                assert!(slot_meta.is_connected);
                 let slot_parent = {
                     if slot == 0 {
                         0
@@ -2037,6 +2168,9 @@ pub mod tests {
                 }
                 assert_eq!(expected_children, result);
             }
+
+            // No orphan slots should exist
+            assert!(blocktree.orphans_cf.is_empty().unwrap())
         }
 
         Blocktree::destroy(&blocktree_path).expect("Expected successful database destruction");
@@ -2053,14 +2187,14 @@ pub mod tests {
             assert!(blocktree.get_slots_since(&vec![0]).unwrap().is_empty());
 
             let mut meta0 = SlotMeta::new(0, 0);
-            blocktree.meta_cf.put_slot_meta(0, &meta0).unwrap();
+            blocktree.meta_cf.put(0, &meta0).unwrap();
 
             // Slot exists, chains to nothing
             let expected: HashMap<u64, Vec<u64>> =
                 HashMap::from_iter(vec![(0, vec![])].into_iter());
             assert_eq!(blocktree.get_slots_since(&vec![0]).unwrap(), expected);
             meta0.next_slots = vec![1, 2];
-            blocktree.meta_cf.put_slot_meta(0, &meta0).unwrap();
+            blocktree.meta_cf.put(0, &meta0).unwrap();
 
             // Slot exists, chains to some other slots
             let expected: HashMap<u64, Vec<u64>> =
@@ -2070,12 +2204,69 @@ pub mod tests {
 
             let mut meta3 = SlotMeta::new(3, 1);
             meta3.next_slots = vec![10, 5];
-            blocktree.meta_cf.put_slot_meta(3, &meta3).unwrap();
+            blocktree.meta_cf.put(3, &meta3).unwrap();
             let expected: HashMap<u64, Vec<u64>> =
                 HashMap::from_iter(vec![(0, vec![1, 2]), (3, vec![10, 5])].into_iter());
             assert_eq!(blocktree.get_slots_since(&vec![0, 1, 3]).unwrap(), expected);
         }
 
+        Blocktree::destroy(&blocktree_path).expect("Expected successful database destruction");
+    }
+
+    #[test]
+    fn test_orphans() {
+        let blocktree_path = get_tmp_ledger_path("test_orphans");
+        {
+            let blocktree = Blocktree::open(&blocktree_path).unwrap();
+
+            // Create blobs and entries
+            let entries_per_slot = 1;
+            let (blobs, _) = make_many_slot_entries(0, 3, entries_per_slot);
+
+            // Write slot 2, which chains to slot 1. We're missing slot 0,
+            // so slot 1 is the orphan
+            blocktree.write_blobs(once(&blobs[2])).unwrap();
+            let meta = blocktree
+                .meta(1)
+                .expect("Expect database get to succeed")
+                .unwrap();
+            assert!(Blocktree::is_orphan(&meta));
+            assert_eq!(blocktree.get_orphans(None), vec![1]);
+
+            // Write slot 1 which chains to slot 0, so now slot 0 is the
+            // orphan, and slot 1 is no longer the orphan.
+            blocktree.write_blobs(once(&blobs[1])).unwrap();
+            let meta = blocktree
+                .meta(1)
+                .expect("Expect database get to succeed")
+                .unwrap();
+            assert!(!Blocktree::is_orphan(&meta));
+            let meta = blocktree
+                .meta(0)
+                .expect("Expect database get to succeed")
+                .unwrap();
+            assert!(Blocktree::is_orphan(&meta));
+            assert_eq!(blocktree.get_orphans(None), vec![0]);
+
+            // Write some slot that also chains to existing slots and orphan,
+            // nothing should change
+            let blob4 = &make_slot_entries(4, 0, 1).0[0];
+            let blob5 = &make_slot_entries(5, 1, 1).0[0];
+            blocktree.write_blobs(vec![blob4, blob5]).unwrap();
+            assert_eq!(blocktree.get_orphans(None), vec![0]);
+
+            // Write zeroth slot, no more orphans
+            blocktree.write_blobs(once(&blobs[0])).unwrap();
+            for i in 0..3 {
+                let meta = blocktree
+                    .meta(i)
+                    .expect("Expect database get to succeed")
+                    .unwrap();
+                assert!(!Blocktree::is_orphan(&meta));
+            }
+            // Orphans cf is empty
+            assert!(blocktree.orphans_cf.is_empty().unwrap())
+        }
         Blocktree::destroy(&blocktree_path).expect("Expected successful database destruction");
     }
 
@@ -2119,8 +2310,7 @@ pub mod tests {
                     entries[i as usize]
                 );
 
-                let meta_key = MetaCf::key(i);
-                let meta = blocktree.meta_cf.get(&meta_key).unwrap().unwrap();
+                let meta = blocktree.meta_cf.get(i).unwrap().unwrap();
                 assert_eq!(meta.received, i + 1);
                 assert_eq!(meta.last_index, i);
                 if i != 0 {
@@ -2132,6 +2322,165 @@ pub mod tests {
                 }
             }
         }
+        Blocktree::destroy(&blocktree_path).expect("Expected successful database destruction");
+    }
+
+    #[test]
+    fn test_find_missing_data_indexes() {
+        let slot = 0;
+        let blocktree_path = get_tmp_ledger_path!();
+        let blocktree = Blocktree::open(&blocktree_path).unwrap();
+
+        // Write entries
+        let gap = 10;
+        assert!(gap > 3);
+        let num_entries = 10;
+        let mut blobs = make_tiny_test_entries(num_entries).to_single_entry_blobs();
+        for (i, b) in blobs.iter_mut().enumerate() {
+            b.set_index(i as u64 * gap);
+            b.set_slot(slot);
+        }
+        blocktree.write_blobs(&blobs).unwrap();
+
+        // Index of the first blob is 0
+        // Index of the second blob is "gap"
+        // Thus, the missing indexes should then be [1, gap - 1] for the input index
+        // range of [0, gap)
+        let expected: Vec<u64> = (1..gap).collect();
+        assert_eq!(
+            blocktree.find_missing_data_indexes(slot, 0, gap, gap as usize),
+            expected
+        );
+        assert_eq!(
+            blocktree.find_missing_data_indexes(slot, 1, gap, (gap - 1) as usize),
+            expected,
+        );
+        assert_eq!(
+            blocktree.find_missing_data_indexes(slot, 0, gap - 1, (gap - 1) as usize),
+            &expected[..expected.len() - 1],
+        );
+        assert_eq!(
+            blocktree.find_missing_data_indexes(slot, gap - 2, gap, gap as usize),
+            vec![gap - 2, gap - 1],
+        );
+        assert_eq!(
+            blocktree.find_missing_data_indexes(slot, gap - 2, gap, 1),
+            vec![gap - 2],
+        );
+        assert_eq!(
+            blocktree.find_missing_data_indexes(slot, 0, gap, 1),
+            vec![1],
+        );
+
+        // Test with end indexes that are greater than the last item in the ledger
+        let mut expected: Vec<u64> = (1..gap).collect();
+        expected.push(gap + 1);
+        assert_eq!(
+            blocktree.find_missing_data_indexes(slot, 0, gap + 2, (gap + 2) as usize),
+            expected,
+        );
+        assert_eq!(
+            blocktree.find_missing_data_indexes(slot, 0, gap + 2, (gap - 1) as usize),
+            &expected[..expected.len() - 1],
+        );
+
+        for i in 0..num_entries as u64 {
+            for j in 0..i {
+                let expected: Vec<u64> = (j..i)
+                    .flat_map(|k| {
+                        let begin = k * gap + 1;
+                        let end = (k + 1) * gap;
+                        (begin..end)
+                    })
+                    .collect();
+                assert_eq!(
+                    blocktree.find_missing_data_indexes(
+                        slot,
+                        j * gap,
+                        i * gap,
+                        ((i - j) * gap) as usize
+                    ),
+                    expected,
+                );
+            }
+        }
+
+        drop(blocktree);
+        Blocktree::destroy(&blocktree_path).expect("Expected successful database destruction");
+    }
+
+    #[test]
+    fn test_find_missing_data_indexes_sanity() {
+        let slot = 0;
+
+        let blocktree_path = get_tmp_ledger_path!();
+        let blocktree = Blocktree::open(&blocktree_path).unwrap();
+
+        // Early exit conditions
+        let empty: Vec<u64> = vec![];
+        assert_eq!(blocktree.find_missing_data_indexes(slot, 0, 0, 1), empty);
+        assert_eq!(blocktree.find_missing_data_indexes(slot, 5, 5, 1), empty);
+        assert_eq!(blocktree.find_missing_data_indexes(slot, 4, 3, 1), empty);
+        assert_eq!(blocktree.find_missing_data_indexes(slot, 1, 2, 0), empty);
+
+        let mut blobs = make_tiny_test_entries(2).to_single_entry_blobs();
+
+        const ONE: u64 = 1;
+        const OTHER: u64 = 4;
+
+        blobs[0].set_index(ONE);
+        blobs[1].set_index(OTHER);
+
+        // Insert one blob at index = first_index
+        blocktree.write_blobs(&blobs).unwrap();
+
+        const STARTS: u64 = OTHER * 2;
+        const END: u64 = OTHER * 3;
+        const MAX: usize = 10;
+        // The first blob has index = first_index. Thus, for i < first_index,
+        // given the input range of [i, first_index], the missing indexes should be
+        // [i, first_index - 1]
+        for start in 0..STARTS {
+            let result = blocktree.find_missing_data_indexes(
+                slot, start, // start
+                END,   //end
+                MAX,   //max
+            );
+            let expected: Vec<u64> = (start..END).filter(|i| *i != ONE && *i != OTHER).collect();
+            assert_eq!(result, expected);
+        }
+
+        drop(blocktree);
+        Blocktree::destroy(&blocktree_path).expect("Expected successful database destruction");
+    }
+
+    #[test]
+    pub fn test_no_missing_blob_indexes() {
+        let slot = 0;
+        let blocktree_path = get_tmp_ledger_path!();
+        let blocktree = Blocktree::open(&blocktree_path).unwrap();
+
+        // Write entries
+        let num_entries = 10;
+        let shared_blobs = make_tiny_test_entries(num_entries).to_single_entry_shared_blobs();
+
+        crate::packet::index_blobs(&shared_blobs, &Pubkey::new_rand(), 0, slot, 0);
+
+        let blob_locks: Vec<_> = shared_blobs.iter().map(|b| b.read().unwrap()).collect();
+        let blobs: Vec<&Blob> = blob_locks.iter().map(|b| &**b).collect();
+        blocktree.write_blobs(blobs).unwrap();
+
+        let empty: Vec<u64> = vec![];
+        for i in 0..num_entries as u64 {
+            for j in 0..i {
+                assert_eq!(
+                    blocktree.find_missing_data_indexes(slot, j, i, (i - j) as usize),
+                    empty
+                );
+            }
+        }
+
+        drop(blocktree);
         Blocktree::destroy(&blocktree_path).expect("Expected successful database destruction");
     }
 

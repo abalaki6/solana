@@ -1,60 +1,96 @@
 use crate::bank::Bank;
+use solana_sdk::async_client::AsyncClient;
 use solana_sdk::instruction::Instruction;
+use solana_sdk::message::Message;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::signature::Signature;
 use solana_sdk::signature::{Keypair, KeypairUtil};
-use solana_sdk::system_instruction::SystemInstruction;
-use solana_sdk::transaction::{Transaction, TransactionError};
+use solana_sdk::sync_client::SyncClient;
+use solana_sdk::system_instruction;
+use solana_sdk::transaction::{self, Transaction};
+use solana_sdk::transport::Result;
+use std::io;
 
 pub struct BankClient<'a> {
     bank: &'a Bank,
-    keypairs: Vec<Keypair>,
 }
 
-impl<'a> BankClient<'a> {
-    pub fn new_with_keypairs(bank: &'a Bank, keypairs: Vec<Keypair>) -> Self {
-        assert!(!keypairs.is_empty());
-        Self { bank, keypairs }
+impl<'a> AsyncClient for BankClient<'a> {
+    fn async_send_transaction(&self, transaction: Transaction) -> io::Result<Signature> {
+        // Ignore the result. Client must use get_signature_status() instead.
+        let _ = self.bank.process_transaction(&transaction);
+
+        Ok(transaction.signatures.get(0).cloned().unwrap_or_default())
     }
 
-    pub fn new(bank: &'a Bank, keypair: Keypair) -> Self {
-        Self::new_with_keypairs(bank, vec![keypair])
+    fn async_send_message(&self, keypairs: &[&Keypair], message: Message) -> io::Result<Signature> {
+        let blockhash = self.bank.last_blockhash();
+        let transaction = Transaction::new(&keypairs, message, blockhash);
+        self.async_send_transaction(transaction)
     }
 
-    pub fn pubkey(&self) -> Pubkey {
-        self.keypairs[0].pubkey()
-    }
-
-    pub fn pubkeys(&self) -> Vec<Pubkey> {
-        self.keypairs.iter().map(|x| x.pubkey()).collect()
-    }
-
-    fn sign(&self, tx: &mut Transaction) {
-        let keypairs: Vec<_> = self.keypairs.iter().collect();
-        tx.sign(&keypairs, self.bank.last_blockhash());
-    }
-
-    pub fn process_transaction(&self, mut tx: Transaction) -> Result<(), TransactionError> {
-        self.sign(&mut tx);
-        self.bank.process_transaction(&tx)
-    }
-
-    /// Create and process a transaction from a list of instructions.
-    pub fn process_instructions(
+    fn async_send_instruction(
         &self,
-        instructions: Vec<Instruction>,
-    ) -> Result<(), TransactionError> {
-        self.process_transaction(Transaction::new(instructions))
+        keypair: &Keypair,
+        instruction: Instruction,
+    ) -> io::Result<Signature> {
+        let message = Message::new(vec![instruction]);
+        self.async_send_message(&[keypair], message)
+    }
+
+    /// Transfer `lamports` from `keypair` to `pubkey`
+    fn async_transfer(
+        &self,
+        lamports: u64,
+        keypair: &Keypair,
+        pubkey: &Pubkey,
+    ) -> io::Result<Signature> {
+        let transfer_instruction =
+            system_instruction::transfer(&keypair.pubkey(), pubkey, lamports);
+        self.async_send_instruction(keypair, transfer_instruction)
+    }
+}
+
+impl<'a> SyncClient for BankClient<'a> {
+    fn send_message(&self, keypairs: &[&Keypair], message: Message) -> Result<Signature> {
+        let blockhash = self.bank.last_blockhash();
+        let transaction = Transaction::new(&keypairs, message, blockhash);
+        self.bank.process_transaction(&transaction)?;
+        Ok(transaction.signatures.get(0).cloned().unwrap_or_default())
     }
 
     /// Create and process a transaction from a single instruction.
-    pub fn process_instruction(&self, instruction: Instruction) -> Result<(), TransactionError> {
-        self.process_instructions(vec![instruction])
+    fn send_instruction(&self, keypair: &Keypair, instruction: Instruction) -> Result<Signature> {
+        let message = Message::new(vec![instruction]);
+        self.send_message(&[keypair], message)
     }
 
-    /// Transfer lamports to pubkey
-    pub fn transfer(&self, lamports: u64, pubkey: &Pubkey) -> Result<(), TransactionError> {
-        let move_instruction = SystemInstruction::new_move(&self.pubkey(), pubkey, lamports);
-        self.process_instruction(move_instruction)
+    /// Transfer `lamports` from `keypair` to `pubkey`
+    fn transfer(&self, lamports: u64, keypair: &Keypair, pubkey: &Pubkey) -> Result<Signature> {
+        let transfer_instruction =
+            system_instruction::transfer(&keypair.pubkey(), pubkey, lamports);
+        self.send_instruction(keypair, transfer_instruction)
+    }
+
+    fn get_account_data(&self, pubkey: &Pubkey) -> Result<Option<Vec<u8>>> {
+        Ok(self.bank.get_account(pubkey).map(|account| account.data))
+    }
+
+    fn get_balance(&self, pubkey: &Pubkey) -> Result<u64> {
+        Ok(self.bank.get_balance(pubkey))
+    }
+
+    fn get_signature_status(
+        &self,
+        signature: &Signature,
+    ) -> Result<Option<transaction::Result<()>>> {
+        Ok(self.bank.get_signature_status(signature))
+    }
+}
+
+impl<'a> BankClient<'a> {
+    pub fn new(bank: &'a Bank) -> Self {
+        Self { bank }
     }
 }
 
@@ -67,21 +103,22 @@ mod tests {
     #[test]
     fn test_bank_client_new_with_keypairs() {
         let (genesis_block, john_doe_keypair) = GenesisBlock::new(10_000);
+        let john_pubkey = john_doe_keypair.pubkey();
         let jane_doe_keypair = Keypair::new();
-        let doe_keypairs = vec![john_doe_keypair, jane_doe_keypair];
+        let jane_pubkey = jane_doe_keypair.pubkey();
+        let doe_keypairs = vec![&john_doe_keypair, &jane_doe_keypair];
         let bank = Bank::new(&genesis_block);
-        let doe_client = BankClient::new_with_keypairs(&bank, doe_keypairs);
-        let jane_pubkey = doe_client.pubkeys()[1];
+        let bank_client = BankClient::new(&bank);
 
-        // Create 2-2 Multisig Move instruction.
-        let bob_pubkey = Keypair::new().pubkey();
-        let mut move_instruction =
-            SystemInstruction::new_move(&doe_client.pubkey(), &bob_pubkey, 42);
+        // Create 2-2 Multisig Transfer instruction.
+        let bob_pubkey = Pubkey::new_rand();
+        let mut move_instruction = system_instruction::transfer(&john_pubkey, &bob_pubkey, 42);
         move_instruction
             .accounts
             .push(AccountMeta::new(jane_pubkey, true));
 
-        doe_client.process_instruction(move_instruction).unwrap();
-        assert_eq!(bank.get_balance(&bob_pubkey), 42);
+        let message = Message::new(vec![move_instruction]);
+        bank_client.send_message(&doe_keypairs, message).unwrap();
+        assert_eq!(bank_client.get_balance(&bob_pubkey).unwrap(), 42);
     }
 }

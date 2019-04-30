@@ -18,6 +18,7 @@ use crate::blockstream_service::BlockstreamService;
 use crate::blocktree::Blocktree;
 use crate::blocktree_processor::BankForksInfo;
 use crate::cluster_info::ClusterInfo;
+use crate::entry::{EntryReceiver, EntrySender};
 use crate::poh_recorder::PohRecorder;
 use crate::replay_stage::ReplayStage;
 use crate::retransmit_stage::RetransmitStage;
@@ -68,6 +69,8 @@ impl Tvu {
         ledger_signal_receiver: Receiver<bool>,
         subscriptions: &Arc<RpcSubscriptions>,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
+        storage_entry_sender: EntrySender,
+        storage_entry_receiver: EntryReceiver,
         exit: &Arc<AtomicBool>,
     ) -> Self
     where
@@ -106,7 +109,7 @@ impl Tvu {
             &exit,
         );
 
-        let (replay_stage, slot_full_receiver, forward_entry_receiver) = ReplayStage::new(
+        let (replay_stage, slot_full_receiver) = ReplayStage::new(
             &keypair.pubkey(),
             vote_account,
             voting_keypair,
@@ -117,6 +120,7 @@ impl Tvu {
             ledger_signal_receiver,
             subscriptions,
             poh_recorder,
+            storage_entry_sender,
         );
 
         let blockstream_service = if blockstream.is_some() {
@@ -131,11 +135,13 @@ impl Tvu {
             None
         };
 
+        let storage_keypair = Arc::new(Keypair::new());
         let storage_stage = StorageStage::new(
             storage_state,
-            forward_entry_receiver,
+            storage_entry_receiver,
             Some(blocktree),
             &keypair,
+            &storage_keypair,
             &exit,
             bank_forks_info[0].entry_height, // TODO: StorageStage needs to deal with BankForks somehow still
             storage_rotate_count,
@@ -202,9 +208,12 @@ pub mod tests {
         let blocktree_path = get_tmp_ledger_path!();
         let (blocktree, l_receiver) = Blocktree::open_with_signal(&blocktree_path)
             .expect("Expected to successfully open ledger");
+        let blocktree = Arc::new(blocktree);
         let bank = bank_forks.working_bank();
-        let (exit, poh_recorder, poh_service, _entry_receiver) = create_test_recorder(&bank);
+        let (exit, poh_recorder, poh_service, _entry_receiver) =
+            create_test_recorder(&bank, &blocktree);
         let voting_keypair = Keypair::new();
+        let (storage_entry_sender, storage_entry_receiver) = channel();
         let tvu = Tvu::new(
             &voting_keypair.pubkey(),
             Some(Arc::new(voting_keypair)),
@@ -218,13 +227,15 @@ pub mod tests {
                     fetch: target1.sockets.tvu,
                 }
             },
-            Arc::new(blocktree),
+            blocktree,
             STORAGE_ROTATE_TEST_COUNT,
             &StorageState::default(),
             None,
             l_receiver,
             &Arc::new(RpcSubscriptions::default()),
             &poh_recorder,
+            storage_entry_sender,
+            storage_entry_receiver,
             &exit,
         );
         exit.store(true, Ordering::Relaxed);

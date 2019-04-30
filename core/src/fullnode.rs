@@ -25,12 +25,13 @@ use solana_sdk::genesis_block::GenesisBlock;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, KeypairUtil};
-use solana_sdk::system_transaction::SystemTransaction;
+use solana_sdk::system_transaction;
 use solana_sdk::timing::timestamp;
-use solana_vote_api::vote_transaction::VoteTransaction;
+use solana_sdk::transaction::Transaction;
+use solana_vote_api::vote_instruction::{self, Vote};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::Result;
 
@@ -104,13 +105,15 @@ impl Fullnode {
             bank.tick_height(),
             bank.last_blockhash(),
         );
+        let blocktree = Arc::new(blocktree);
         let (poh_recorder, entry_receiver) = PohRecorder::new(
             bank.tick_height(),
             bank.last_blockhash(),
             bank.slot(),
-            leader_schedule_utils::next_leader_slot(&id, bank.slot(), &bank),
+            leader_schedule_utils::next_leader_slot(&id, bank.slot(), &bank, Some(&blocktree)),
             bank.ticks_per_slot(),
             &id,
+            &blocktree,
         );
         let poh_recorder = Arc::new(Mutex::new(poh_recorder));
         let poh_service = PohService::new(poh_recorder.clone(), &config.tick_config, &exit);
@@ -129,7 +132,6 @@ impl Fullnode {
             node.sockets.gossip.local_addr().unwrap()
         );
 
-        let blocktree = Arc::new(blocktree);
         let bank_forks = Arc::new(RwLock::new(bank_forks));
 
         node.info.wallclock = timestamp();
@@ -202,7 +204,9 @@ impl Fullnode {
             Some(Arc::new(voting_keypair))
         };
 
-        // Setup channel for rotation indications
+        // Setup channel for sending entries to storage stage
+        let (sender, receiver) = channel();
+
         let tvu = Tvu::new(
             vote_account,
             voting_keypair,
@@ -217,6 +221,8 @@ impl Fullnode {
             ledger_signal_receiver,
             &subscriptions,
             &poh_recorder,
+            sender.clone(),
+            receiver,
             &exit,
         );
         let tpu = Tpu::new(
@@ -229,6 +235,7 @@ impl Fullnode {
             node.sockets.broadcast,
             config.sigverify_disabled,
             &blocktree,
+            sender,
             &exit,
         );
 
@@ -311,7 +318,7 @@ pub fn make_active_set_entries(
     num_ending_ticks: u64,
 ) -> (Vec<Entry>, Keypair) {
     // 1) Assume the active_keypair node has no lamports staked
-    let transfer_tx = SystemTransaction::new_account(
+    let transfer_tx = system_transaction::create_user_account(
         &lamport_source,
         &active_keypair.pubkey(),
         stake,
@@ -325,23 +332,22 @@ pub fn make_active_set_entries(
     let voting_keypair = Keypair::new();
     let vote_account_id = voting_keypair.pubkey();
 
-    let new_vote_account_tx = VoteTransaction::new_account(
-        active_keypair,
+    let new_vote_account_ixs = vote_instruction::create_account(
+        &active_keypair.pubkey(),
         &vote_account_id,
-        *blockhash,
         stake.saturating_sub(2),
-        1,
+    );
+    let new_vote_account_tx = Transaction::new_signed_instructions(
+        &[active_keypair.as_ref()],
+        new_vote_account_ixs,
+        *blockhash,
     );
     let new_vote_account_entry = next_entry_mut(&mut last_entry_hash, 1, vec![new_vote_account_tx]);
 
     // 3) Create vote entry
-    let vote_tx = VoteTransaction::new_vote(
-        &voting_keypair.pubkey(),
-        &voting_keypair,
-        slot_to_vote_on,
-        *blockhash,
-        0,
-    );
+    let vote_ix = vote_instruction::vote(&voting_keypair.pubkey(), Vote::new(slot_to_vote_on));
+    let vote_tx =
+        Transaction::new_signed_instructions(&[&voting_keypair], vec![vote_ix], *blockhash);
     let vote_entry = next_entry_mut(&mut last_entry_hash, 1, vec![vote_tx]);
 
     // 4) Create `num_ending_ticks` empty ticks
@@ -363,7 +369,7 @@ pub fn new_fullnode_for_tests() -> (Fullnode, ContactInfo, Keypair, String) {
     let (mut genesis_block, mint_keypair) =
         GenesisBlock::new_with_leader(10_000, &contact_info.id, 42);
     genesis_block
-        .native_programs
+        .native_instruction_processors
         .push(("solana_budget_program".to_string(), solana_budget_api::id()));
 
     let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
