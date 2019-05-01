@@ -1,6 +1,5 @@
 class nodeClass:
-    def __init__(self, public_key, tvu, tpu, storage_addr, rpc, latitude=9, longitude=20, city="Hobbiton", region="Shire", country="Middle Earth"):
->>>>>>> 0d04073b4a623b36a9694ac3a1ab961ddb31001a:visualization/src/server/nodeClass.py
+    def __init__(self, public_key, tvu, tpu, storage_addr, rpc, latitude=9, longitude=20, city="Hobbiton", region="Shire", country="Middle Earth", ping=0):
         self.public_key = public_key
         self.tvu = tvu
         self.tpu = tpu
@@ -12,6 +11,9 @@ class nodeClass:
         self.region = region
         self.country = country
         self.ping = ping
+        self.slot_height = 0
+        self.transaction_count = 0
+        self.stake_weight = 0
 
     def printNodeInfo(self):
         print("Public Key: ", self.public_key)
@@ -27,8 +29,8 @@ class nodeClass:
         print("Ping: ", self.ping)
 
     def get_ip_address(self):
-        return self.public_key.split(":")[0]
+        return self.tvu.split(":")[0]
 
     def as_tuple(self):
         return (self.get_ip_address(), self.longitude, self.latitude, self.city, self.region, self.country, 
-        self.ping_time, self.slot_height, self.transaction_count, self.stake_weight, self.public_key, 0, 0, 1)
+        self.ping, self.slot_height, self.transaction_count, self.stake_weight, self.public_key, 0, 0, 1)

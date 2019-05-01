@@ -63,6 +63,7 @@ def connect_to_database():
     return connection
 
 def upload_to_database(nodes, current_ip_list):
+    pass
     connection = connect_to_database()
 
     with connection.cursor() as cursor:
@@ -70,17 +71,17 @@ def upload_to_database(nodes, current_ip_list):
             ip_address = node.get_ip_address()
             if ip_address in current_ip_list:
                 # Just need to update the information
-                sql_req = "UPDATE NODES_TEST "
-                + "(ip_addr, longitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
-                + "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                sql_req = ("UPDATE NODES_TEST "
+                "(ip_addr, longtitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
 
                 cursor.execute(sql_req, node.as_tuple())
 
             else:
                 # Need to insert into the database
-                sql_req = "INSERT INTO NODES_TEST " 
-                + "(ip_addr, longitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
-                + "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                sql_req = ("INSERT INTO NODES_TEST " 
+                "(ip_addr, longtitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
                 cursor.execute(sql_req, node.as_tuple())
                 
                 current_ip_list.add(node.get_ip_addr())
@@ -102,7 +103,7 @@ def insert_good_name_here(iterations, log_data, sleep_time):
                 node.printNodeInfo()
                 print("")
 
-        upload_to_database(nodes, current_ip_list)
+        #  upload_to_database(nodes, current_ip_list)
 
         run_count += 1
         if iterations > 0 and run_count >= iterations:
