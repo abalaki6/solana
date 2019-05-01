@@ -1,6 +1,7 @@
 import getopt
 import ipapi
 import nodeClass
+import pymysql
 import subprocess
 import sys
 import time
@@ -56,11 +57,41 @@ def ping_network(nodes):
         #responseList = ping(ip)
         #node.ping = responseList.rtt_avg_ms
 
-def upload_to_database(nodes):
-    pass
+def connect_to_database():
+    connection = pymysql.connect(host='localhost', user="UIUC", password="UIUC_492", db="SOLANA")
+
+    return connection
+
+def upload_to_database(nodes, current_ip_list):
+    connection = connect_to_database()
+
+    with connection.cursor() as cursor:
+        for node in nodes:
+            ip_address = node.get_ip_address()
+            if ip_address in current_ip_list:
+                # Just need to update the information
+                sql_req = "UPDATE NODES_TEST "
+                + "(ip_addr, longitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
+                + "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+
+                cursor.execute(sql_req, node.as_tuple())
+
+            else:
+                # Need to insert into the database
+                sql_req = "INSERT INTO NODES_TEST " 
+                + "(ip_addr, longitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
+                + "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                cursor.execute(sql_req, node.as_tuple())
+                
+                current_ip_list.add(node.get_ip_addr())
+        cursor.commit()
+    connection.close()
 
 def insert_good_name_here(iterations, log_data, sleep_time):
     run_count = 0
+    
+    current_ip_list = set()
+
     while True:
         nodes = explore_network()
 
@@ -71,7 +102,7 @@ def insert_good_name_here(iterations, log_data, sleep_time):
                 node.printNodeInfo()
                 print("")
 
-        upload_to_database(nodes)
+        upload_to_database(nodes, current_ip_list)
 
         run_count += 1
         if iterations > 0 and run_count >= iterations:
@@ -99,6 +130,7 @@ if __name__ == "__main__":
             print("-i   Iterations is how many times the data is collected. 0 (default) is forever.")
             print("-l   Log data.")
             print("-t   Time between data collection. Default 10 seconds")
+            sys.exit(2)
         elif opt in ("-i", "--iterations"):
             iterations = int(arg)
             if iterations < 0:
