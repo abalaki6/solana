@@ -5,15 +5,17 @@
     <title>Solana Blockchain Nodes Distribution</title>
     <script src="//cdnjs.cloudflare.com/ajax/libs/d3/3.5.3/d3.min.js"></script>
     <script src="//cdnjs.cloudflare.com/ajax/libs/topojson/1.6.9/topojson.min.js"></script>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.1.0/jquery.min.js"></script>
+    <script src="http://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/js/bootstrap.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/datamaps/0.5.9/datamaps.world.hires.js"></script>
     <script src="https://code.jquery.com/jquery-3.4.0.js"></script>
     <link rel="stylesheet" href="css/styles.css">
     <link rel="shortcut icon" href="assets/images/favicon.ico" type="image/x-icon">
-    <link href="https://fonts.googleapis.com/css?family=Montserrat|Rubik|Exo+2:300,400,700" rel="stylesheet">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Montserrat|Rubik|Exo+2:300,400,700">
 
 </head>
 
-<body>
+<body style="text-align:center;">
     <div class="col-md-12" align=left>
         <h1 align=left><img src='assets/images/solana-logo.jpg' style="width: 30px; height: 30px;">Solana Blockchain
             Node Distribution
@@ -22,7 +24,22 @@
             the reachable nodes in the network.</p>
         <p align=left> Join our <a href="https://discord.gg/pquxPsq" target="_blank">discord</a></p>
     </div>
-    <div id='center'>
+
+    <div class='container' style="width: 20%; height: 50%; float:left;">
+      <div class='table-responsive'>
+        <p id = "center">Top 10 countries with their respective number of reachable nodes are as follow.</p>
+        <br/>
+        <table class='table table-bordered table-striped' id='rank_table'>
+            <tr>
+                <th>Rank</th>
+                <th>Country</th>
+                <th>Nodes</th>
+            </tr>
+        </table>
+      </div>
+    </div>
+
+    <div id='center' style="width: 80%; height: 50%; float:right;">
         <div id="container" style="width: 1000px; height: 640px;"></div>
 
         <button class="zoom-button" data-zoom="reset">0</button>
@@ -30,10 +47,23 @@
         <button class="zoom-button" data-zoom="in">+</button>
         <div id="zoom-info"></div>
     </div>
+    <div style="width: 100%; height: 50%; clear:both"></div>
+    <p align=left>Copyright Solana Labs, Inc. All rights reserved</p>
 </body>
 
 <script type="text/javascript" src="js/Zoom.js"> </script>
 <script type="text/javascript" src="js/map.js"></script>
+<script>
+  $(document).ready(function(){
+    $.getJSON("rank.json", function(data){
+      $.each(data.user, function(key, value){
+        var record = '<tr>' + '<td>'+ value.rank + '</td>' + '<td>'+ value.Country + '</td>' + '<td>'+ value.Nodes + '</td>'+ '</tr>'
+        $(record).appendTo('#rank_table')
+      });
+    });
+  });
+</script>
 
 </html>
+
 <!DOCTYPE html>
