@@ -72,15 +72,21 @@ def upload_to_database(nodes, current_ip_list):
             if ip_address in current_ip_list:
                 # Just need to update the information
                 sql_req = ("UPDATE NODES_TEST "
-                "(ip_addr, longtitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
+                "(ip_addr, longitude, latitude, city, region, country, ping_time, "
+                "slot_height, transaction_count, stake_weight, "
+                "public_key, tvu_addr, tpu_addr, rpc_addr, storage_addr, "
+                "map_depth, node_size) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
 
                 cursor.execute(sql_req, node.as_tuple())
 
             else:
                 # Need to insert into the database
-                sql_req = ("INSERT INTO NODES_TEST " 
-                "(ip_addr, longtitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
+                sql_req = ("INSERT INTO NODES_TEST "
+                "(ip_addr, longitude, latitude, city, region, country, ping_time, "
+                "slot_height, transaction_count, stake_weight, "
+                "public_key, tvu_addr, tpu_addr, rpc_addr, storage_addr, "
+                "map_depth, node_size) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
                 cursor.execute(sql_req, node.as_tuple())
                 
