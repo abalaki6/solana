@@ -3,14 +3,7 @@ const app = express();
 const Node = require('./node.model');
 var path = require('path');
 var mysql = require('mysql');
-
-app.use(express.static(path.join(__dirname, 'public')));
-
-
-app.get('/', function (req,res){
-  res.sendFile('index.html');
-});
-
+const fs = require('fs');
 
 var con = mysql.createConnection({
   host: "localhost",
@@ -19,15 +12,37 @@ var con = mysql.createConnection({
   database: "SOLANA"
 });
 
+function pullData(req,res, next) {
+    con.query("SELECT longitude, latitude, map_depth, node_size FROM NODES_TEST_CLUSTER",
+    function (err, result, fields) {
+      if (err) {
+        return next(err);
+        // throw err;
+      }
+      const features = [];
+      result.forEach(res => {
+        console.log(res);
+        const newRes = {};
+        newRes.type = 'Feature';
+        newRes.properties = {};
+        newRes.geometry = {};
+        newRes.geometry.type = "Point";
+        newRes.geometry.coordinates = [];
+        newRes.geometry.coordinates.push(res.latitude);
+        newRes.geometry.coordinates.push(res.longitude);
+        newRes.geometry.depth = res.map_depth;
+        newRes.geometry.radius = res.node_size;
+        features.push(newRes);
+      });
+    const final = {levels: [{type: 'FeatureCollection', features}]};
+    fs.writeFileSync('./public/d.json', JSON.stringify(final));
+    });
+    next();
 
-con.connect(function(err) {
-  if (err) throw err;
-  con.query("SELECT longitude, latitude, map_depth, node_size FROM NODES_TEST_CLUSTER", function (err, result, fields) {
-    if (err) throw err;
-    console.log(result);
-  });
-});
+};
 
+
+app.use('/', pullData, express.static(path.join(__dirname, 'public')));
 
 
 app.get('/newNode', async function (req, res) {
