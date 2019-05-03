@@ -47,7 +47,7 @@ Datamaps.prototype.update_level = function (level) {
 Datamaps.prototype._set_level = function (level) {
     try {
         json = this.responce.responseJSON;
-        return create_bubles(json.levels[0], 20 / ((level + 1)));
+        return create_bubles(json.levels[level], 20 / ((level + 1)));
     }
     catch{
 
@@ -56,7 +56,7 @@ Datamaps.prototype._set_level = function (level) {
 
 
 Datamap.prototype._handleMapReady = function (datamap) {
-    datamap.levels = new Array(0, 10, 20, 30, 40, 50, 60, 70);
+    datamap.levels = new Array(0, 20, 40, 70);
     datamap.current_level = -1;
 
     this.zoom = new Zoom({
@@ -88,23 +88,25 @@ function create_bubles(d, max_radius = 20) {
     bubbles = new Array(features.length);
     for (let i = 0; i < bubbles.length; i++) {
         xy = features[i].geometry.coordinates;
-        rad = Math.ceil(max_radius * Math.random());
-        console.log(rad);
-        key = rad / 20;
+        // rad = Math.ceil(max_radius * Math.random());
+        // console.log(rad);
+        number_of_nodes = features[i].node_size;
+        rad = max_radius * max_radius > number_of_nodes ? max_radius : Math.sqrt(number_of_nodes);
+        key = rad / max_radius;
         key = datamap.get_fillKey(key);
         bubbles[i] = {
-            radius: rad + 2,
+            radius: rad,
             fillKey: key,
             latitude: xy[1],
             longitude: xy[0],
-            number_of_nodes: rad * rad
+            number_of_nodes: number_of_nodes
         };
     }
     datamap.instance.bubbles(
         bubbles,
         {
             popupTemplate: function (geo, data) {
-                return '<div class="hoverinfo"> density:' + data.number_of_nodes;
+                return '<div class="hoverinfo"> Number of nodes: ' + data.number_of_nodes;
             }
         }
     );
