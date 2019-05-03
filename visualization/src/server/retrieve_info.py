@@ -9,6 +9,7 @@ import os
 from pythonping import ping
 
 def explore_network(printInfo=False):
+    #  Runs the Solana gossip module. 
     output = subprocess.check_output("../../../target/debug/visualizer_rust --timeout 2 --network $(dig +short edge.testnet.solana.com):8001", shell=True)
 
     output = output.decode("utf-8")
@@ -32,6 +33,8 @@ def get_network_info(nodes):
     ping_network(nodes)
 
 def get_location_info(nodes):
+    #  Currently uses ipapi, which is more expensive.
+    #  TODO: Change to different source before running full-time. 
     for node in nodes:
         nodeIP = node.get_ip_address()
 
@@ -62,15 +65,52 @@ def connect_to_database():
 
     return connection
 
+def load_database():
+    connection = connect_to_database()
+
+    #  Clears the database every time this script restarts. Assumes previous data is useless.
+    with connection.cursor() as cursor:
+        sql_req = "DROP TABLE IF EXISTS NODES"
+
+        cursor.execute (sql_req)
+        
+        sql_req = (
+        "CREATE TABLE NODES("
+        "ip_addr varchar(64) not null default '', "
+        "longitude double not null default -1, "
+        "latitude double not null default -1, "
+        "city varchar(64) not null default 'N/A', "
+        "region varchar(64) not null default 'N/A', "
+        "country varchar(64) not null default 'N/A', "
+        "ping_time INT(16) unsigned not null default 0, "
+        "slot_height INT(16) unsigned not null default 0, "
+        "transaction_count INT(64) unsigned not null default 0, "
+        "stake_weight FLOAT(32) not null default 0, "
+        "public_key varchar(256) not null default '', "
+        "tvu_addr varchar(64) not null default '', "
+        "tpu_addr varchar(64) not null default '', "
+        "rpc_addr varchar(64) not null default '', "
+        "storage_addr varchar(64) not null default '', "
+        "is_leader tinyint(1) not null default 0, "
+        "map_depth INT(4) unsigned not null default 0, "
+        "node_size INT(16) unsigned not null default 1);")
+
+        cursor.execute(sql_req)
+
+    connection.commit()
+    connection.close()
+
+
 def upload_to_database(nodes, current_ip_list):
     connection = connect_to_database()
 
     with connection.cursor() as cursor:
+        # TODO: Update in batches. 
         for node in nodes:
             ip_address = node.get_ip_address()
             if ip_address in current_ip_list:
                 # Just need to update the information
-                sql_req = ("UPDATE NODES_TEST "
+                sql_req = ("UPDATE NODES"
                 "SET ip_addr = %s, longitude = %s, latitude = %s, city = %s, region = %s, country = %s, "
                 "ping_time = %s, slot_height = %s, transaction_count = %s, stake_weight = %s, "
                 "public_key = %s, tvu_addr = %s, tpu_addr = %s, rpc_addr = %s, storage_addr = %s, is_leader = %s, "
@@ -81,7 +121,7 @@ def upload_to_database(nodes, current_ip_list):
 
             else:
                 # Need to insert into the database
-                sql_req = ("INSERT INTO NODES_TEST "
+                sql_req = ("INSERT INTO NODES"
                 "(ip_addr, longitude, latitude, city, region, country, ping_time, "
                 "slot_height, transaction_count, stake_weight, "
                 "public_key, tvu_addr, tpu_addr, rpc_addr, storage_addr, is_leader, "
@@ -93,10 +133,14 @@ def upload_to_database(nodes, current_ip_list):
         connection.commit()
     connection.close()
 
+#  Is there a better name than "main_loop"? 
 def insert_good_name_here(iterations, log_data, sleep_time):
     run_count = 0
 
     current_ip_list = set()
+
+    # TODO: Have load_database return current list of nodes in database
+    load_database()
 
     while True:
         nodes = explore_network()
@@ -115,8 +159,8 @@ def insert_good_name_here(iterations, log_data, sleep_time):
 
         run_count += 1
         if iterations > 0 and run_count >= iterations:
-            print(iterations, run_count)
             break
+        # TODO: Change so runs every N seconds instead of pausing N seconds between runs
         time.sleep(sleep_time)
 
 if __name__ == "__main__":
@@ -149,7 +193,7 @@ if __name__ == "__main__":
             log_data = True
         elif opt in ("-t", "--time"):
             sleep_time = int(arg)
-            if sleep_time <= 0:
+            if sleep_time < 0:
                 print("time must be a non-negative integer")
                 sys.exit(2)
 
