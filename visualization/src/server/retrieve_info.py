@@ -34,7 +34,7 @@ def get_network_info(nodes):
 def get_location_info(nodes):
     for node in nodes:
         nodeIP = node.get_ip_address()
-        
+
         node.latitude  = ipapi.location(nodeIP, None, 'latitude')
         node.longitude = ipapi.location(nodeIP, None, 'longitude')
         node.city = ipapi.location(nodeIP, None, 'city')
@@ -53,7 +53,7 @@ def ping_network(nodes):
             node.ping = pingTime * 100
         else:
             node.ping = -1
-    
+
         #responseList = ping(ip)
         #node.ping = responseList.rtt_avg_ms
 
@@ -76,7 +76,7 @@ def upload_to_database(nodes, current_ip_list):
                 "slot_height, transaction_count, stake_weight, "
                 "public_key, tvu_addr, tpu_addr, rpc_addr, storage_addr, "
                 "map_depth, node_size) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
 
                 cursor.execute(sql_req, node.as_tuple())
 
@@ -87,16 +87,16 @@ def upload_to_database(nodes, current_ip_list):
                 "slot_height, transaction_count, stake_weight, "
                 "public_key, tvu_addr, tpu_addr, rpc_addr, storage_addr, "
                 "map_depth, node_size) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
                 cursor.execute(sql_req, node.as_tuple())
-                
+
                 current_ip_list.add(node.get_ip_addr())
         cursor.commit()
     connection.close()
 
 def insert_good_name_here(iterations, log_data, sleep_time):
     run_count = 0
-    
+
     current_ip_list = set()
 
     while True:
@@ -178,7 +178,7 @@ for i in range(numberOfNodes):
     nodeInfo = [x.strip() for x in outputArray[i+1].split(',')]
 
     nodeIP = nodeInfo[1].split(':')[0]
-    
+
     lati = ipapi.location(nodeIP, None, 'latitude')
     longi = ipapi.location(nodeIP, None, 'longitude')
     city = ipapi.location(nodeIP, None, 'city')

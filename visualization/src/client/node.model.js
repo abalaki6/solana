@@ -4,10 +4,10 @@ const Datatypes = require('./sql').Sequelize;
 const NODES_TEST = sequelize.define('NODES_TEST', {
   ip_addr: {
     type: Datatypes.INTEGER,
-    allowNull: false,
-    defaultValue: 0
+    allowNull: true,
+    defaultValue: null
   },
-  longtitude: {
+  longitude: {
     type: Datatypes.FLOAT,
     allowNull: false,
     defaultValue: -1
@@ -54,11 +54,47 @@ const NODES_TEST = sequelize.define('NODES_TEST', {
     allowNull: false,
     defaultValue:''
   },
-  socket_status:{
+  public_key:{
     type: Datatypes.INTEGER,
     allowNull: false,
     defaultValue: 255
-  }
+  },
+  tvu_addr:{
+    type: Datatypes.STRING,
+    allowNull: true,
+    defaultValue: null
+  },
+  tpu_addr:{
+    type: Datatypes.STRING,
+    allowNull: true,
+    defaultValue: null
+  },
+  rpc_addr:{
+    type: Datatypes.STRING,
+    allowNull: true,
+    defaultValue: null
+  },
+  storage_addr:{
+    type: Datatypes.STRING,
+    allowNull: true,
+    defaultValue: null
+  },
+  is_leader:{
+    type: Datatypes.INTEGER,
+    allowNull: true,
+    defaultValue: null
+  },
+  map_depth:{
+    type: Datatypes.INTEGER,
+    allowNull: true,
+    defaultValue: null
+  },
+  node_size:{
+    type: Datatypes.INTEGER,
+    allowNull: true,
+    defaultValue: null
+  },
+
 });
 
 module.exports = NODES_TEST;

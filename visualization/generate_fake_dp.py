@@ -13,7 +13,7 @@ create database SOLANA;
 use SOLANA;
 create table NODES_TEST(
 ip_addr INT (4) unsigned not null default 0,
-longtitude float(32) not null default -1,
+longitude float(32) not null default -1,
 latitude float(32) not null default -1,
 city varchar(64) not null default 'N/A',
 region varchar(64) not null default 'N/A',
@@ -27,7 +27,7 @@ socket_status INT(4) unsigned not null default 255,
 map_depth INT(4) unsigned not null default 0,
 node_size INT(16) unsigned not null default 1);
 INSERT INTO NODES_TEST
-(longtitude, latitude, map_depth)
+(longitude, latitude, map_depth)
 VALUES
 """)
 
