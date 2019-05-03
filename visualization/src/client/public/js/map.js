@@ -89,6 +89,7 @@ function create_bubles(d, max_radius = 20) {
     for (let i = 0; i < bubbles.length; i++) {
         xy = features[i].geometry.coordinates;
         rad = Math.ceil(max_radius * Math.random());
+        console.log(rad);
         key = rad / 20;
         key = datamap.get_fillKey(key);
         bubbles[i] = {
