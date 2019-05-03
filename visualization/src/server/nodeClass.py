@@ -14,6 +14,7 @@ class nodeClass:
         self.slot_height = 0
         self.transaction_count = 0
         self.stake_weight = 0
+        self.is_leader = 0
 
     def printNodeInfo(self):
         print("Public Key: ", self.public_key)
@@ -34,4 +35,4 @@ class nodeClass:
     def as_tuple(self):
         return (self.get_ip_address(), self.longitude, self.latitude, self.city, self.region, self.country, 
         self.ping, self.slot_height, self.transaction_count, self.stake_weight, self.public_key, self.tvu, 
-        self.tpu, self.rpc, self.storage_addr, 0, 1)
+        self.tpu, self.rpc, self.storage_addr, self.is_leader, 0, 1)

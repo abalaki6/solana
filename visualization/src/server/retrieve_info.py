@@ -63,7 +63,6 @@ def connect_to_database():
     return connection
 
 def upload_to_database(nodes, current_ip_list):
-    pass
     connection = connect_to_database()
 
     with connection.cursor() as cursor:
@@ -72,26 +71,26 @@ def upload_to_database(nodes, current_ip_list):
             if ip_address in current_ip_list:
                 # Just need to update the information
                 sql_req = ("UPDATE NODES_TEST "
-                "(ip_addr, longitude, latitude, city, region, country, ping_time, "
-                "slot_height, transaction_count, stake_weight, "
-                "public_key, tvu_addr, tpu_addr, rpc_addr, storage_addr, "
-                "map_depth, node_size) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
+                "SET ip_addr = %s, longitude = %s, latitude = %s, city = %s, region = %s, country = %s, "
+                "ping_time = %s, slot_height = %s, transaction_count = %s, stake_weight = %s, "
+                "public_key = %s, tvu_addr = %s, tpu_addr = %s, rpc_addr = %s, storage_addr = %s, is_leader = %s, "
+                "map_depth = %s , node_size = %s "
+                "WHERE ip_addr = %s;")
 
-                cursor.execute(sql_req, node.as_tuple())
+                cursor.execute(sql_req, node.as_tuple() + (node.get_ip_address(), ))
 
             else:
                 # Need to insert into the database
                 sql_req = ("INSERT INTO NODES_TEST "
                 "(ip_addr, longitude, latitude, city, region, country, ping_time, "
                 "slot_height, transaction_count, stake_weight, "
-                "public_key, tvu_addr, tpu_addr, rpc_addr, storage_addr, "
+                "public_key, tvu_addr, tpu_addr, rpc_addr, storage_addr, is_leader, "
                 "map_depth, node_size) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
                 cursor.execute(sql_req, node.as_tuple())
 
-                current_ip_list.add(node.get_ip_addr())
-        cursor.commit()
+                current_ip_list.add(node.get_ip_address())
+        connection.commit()
     connection.close()
 
 def insert_good_name_here(iterations, log_data, sleep_time):
@@ -102,6 +101,9 @@ def insert_good_name_here(iterations, log_data, sleep_time):
     while True:
         nodes = explore_network()
 
+        for node in nodes:
+            node.slot_height = iterations + 1
+
         get_network_info(nodes)
 
         if log_data:
@@ -109,7 +111,7 @@ def insert_good_name_here(iterations, log_data, sleep_time):
                 node.printNodeInfo()
                 print("")
 
-        #  upload_to_database(nodes, current_ip_list)
+        upload_to_database(nodes, current_ip_list)
 
         run_count += 1
         if iterations > 0 and run_count >= iterations:
