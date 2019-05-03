@@ -34,7 +34,7 @@ def get_network_info(nodes):
 def get_location_info(nodes):
     for node in nodes:
         nodeIP = node.get_ip_address()
-        
+
         node.latitude  = ipapi.location(nodeIP, None, 'latitude')
         node.longitude = ipapi.location(nodeIP, None, 'longitude')
         node.city = ipapi.location(nodeIP, None, 'city')
@@ -53,7 +53,7 @@ def ping_network(nodes):
             node.ping = pingTime * 100
         else:
             node.ping = -1
-    
+
         #responseList = ping(ip)
         #node.ping = responseList.rtt_avg_ms
 
@@ -72,25 +72,25 @@ def upload_to_database(nodes, current_ip_list):
             if ip_address in current_ip_list:
                 # Just need to update the information
                 sql_req = ("UPDATE NODES_TEST "
-                "(ip_addr, longtitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
+                "(ip_addr, longttude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
 
                 cursor.execute(sql_req, node.as_tuple())
 
             else:
                 # Need to insert into the database
-                sql_req = ("INSERT INTO NODES_TEST " 
-                "(ip_addr, longtitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
+                sql_req = ("INSERT INTO NODES_TEST "
+                "(ip_addr, longitude, latitude, city, region, country, ping_time, slot_height, transaction_count, stake_weight, public_key, socket_status, map_depth, node_size) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
                 cursor.execute(sql_req, node.as_tuple())
-                
+
                 current_ip_list.add(node.get_ip_addr())
         cursor.commit()
     connection.close()
 
 def insert_good_name_here(iterations, log_data, sleep_time):
     run_count = 0
-    
+
     current_ip_list = set()
 
     while True:
@@ -172,7 +172,7 @@ for i in range(numberOfNodes):
     nodeInfo = [x.strip() for x in outputArray[i+1].split(',')]
 
     nodeIP = nodeInfo[1].split(':')[0]
-    
+
     lati = ipapi.location(nodeIP, None, 'latitude')
     longi = ipapi.location(nodeIP, None, 'longitude')
     city = ipapi.location(nodeIP, None, 'city')

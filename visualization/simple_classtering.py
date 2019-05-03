@@ -29,7 +29,7 @@ if __name__ == "__main__":
         cursor.execute(sql_req)
         responce = cursor.fetchall()
         # collect data from table
-        sql_req =  "select latitude, longtitude from NODES_TEST;"
+        sql_req =  "select latitude, longitude from NODES_TEST;"
         cursor.execute(sql_req)
         responce = cursor.fetchall()
         # define clusters sizes
@@ -45,7 +45,7 @@ if __name__ == "__main__":
         cursor.execute(sql_req)
         responce = cursor.fetchall()
 
-        sql_req = "insert into NODES_TEST_CLUSTER (longtitude, latitude, node_size, map_depth) VALUES\n"
+        sql_req = "insert into NODES_TEST_CLUSTER (longitude, latitude, node_size, map_depth) VALUES\n"
 
         steps = []
         for i,n in enumerate(n_clusters):
