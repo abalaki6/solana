@@ -47,7 +47,7 @@ Datamaps.prototype.update_level = function (level) {
 Datamaps.prototype._set_level = function (level) {
     try {
         json = this.responce.responseJSON;
-        return create_bubles(json.levels[level], 20 / ((level + 1)));
+        return create_bubles(json.levels[level], 1);
     }
     catch{
 
@@ -91,8 +91,9 @@ function create_bubles(d, max_radius = 20) {
         // rad = Math.ceil(max_radius * Math.random());
         // console.log(rad);
         number_of_nodes = features[i].node_size;
-        rad = max_radius * max_radius > number_of_nodes ? max_radius : Math.sqrt(number_of_nodes);
-        key = rad / max_radius;
+        //rad = max_radius * 5> number_of_nodes ? max_radius : Math.sqrt(number_of_nodes) / 5;
+        rad = Math.min(Math.sqrt(number_of_nodes) * 2, 20); 
+	key = rad / 20;
         key = datamap.get_fillKey(key);
         bubbles[i] = {
             radius: rad,
