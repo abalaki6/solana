@@ -32,7 +32,7 @@ VALUES
 """)
 
     # temporal location of test set
-    with open("src/client/public/d.json", 'r') as source:
+    with open("../client/public/d.json", 'r') as source:
         # select only feature attributes
         data = json.load(source)['levels'][0]['features']
 
