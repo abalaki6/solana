@@ -2,7 +2,7 @@
 <html>
 
 <head>
-    <title>Solana Blockchain Nodes Distribution</title>
+    <title>Solana Blockchain Network Visualization</title>
     <script src="//cdnjs.cloudflare.com/ajax/libs/d3/3.5.3/d3.min.js"></script>
     <script src="//cdnjs.cloudflare.com/ajax/libs/topojson/1.6.9/topojson.min.js"></script>
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.1.0/jquery.min.js"></script>
@@ -44,23 +44,21 @@
 
 <body style="text-align:center;">
     <div class="jumbotron">
-        <h1 align=left><img src='assets/images/solana-logo.jpg' style="width: 80px; height: 80px;"> Solana Blockchain
-            Node Distribution
-        </h1>
+        <h1 align=left><img src='assets/images/solana-logo.jpg' style="width: 80px; height: 80px;"> Solana Blockchain Network Visualization</h1>
         <p align=left><a class="button btn-primary btn-lg" href="https://discord.gg/pquxPsq">Join Our Discord</a></p>
     </div>
 
     <div id='wrapper' style='text-align: center;'>
       <div style='width: 20%; display: inline-block; vertical-align: top;'>
         <div class='table-responsive'>
-          <h4> GLOBAL NODE DISTRIBUTION</h4>
-          <p>Reachable nodes as of <span id="datetime"></span></p>
+          <h4 align=left>Global Network Statistics</h4>
+          <p align=left>Data as of <span id="datetime"></span></p>
           <script>
             var dt = new Date();
             document.getElementById("datetime").innerHTML = dt.toLocaleString();
           </script>
-          <h3> 2000 nodes</h3>
-          <p id = "center">Top 10 countries with their respective number of reachable nodes are as follow.</p>
+          <h3 align=left> 1000 nodes</h3>
+          <p align=left>Top 10 countries by number of nodes</p>
           <br/>
           <table class="table table-bordered table-striped" id="rank_table">
               <tr>
