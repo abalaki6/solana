@@ -47,7 +47,7 @@ VALUES
     np.random.seed(17121997)
     locs = locs[np.random.randint(locs.shape[0], size=N), :]
     # maximum offset in 1d from root point
-    MAXOFF = 4
+    MAXOFF = 10
 
     for i,loc in enumerate(locs):
         long, lat = (np.random.random(2) - 0.5) * (2 * MAXOFF) + loc

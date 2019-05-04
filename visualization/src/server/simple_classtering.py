@@ -35,7 +35,7 @@ if __name__ == "__main__":
         # define clusters sizes
         data = np.array(responce)
         # n_clusters = [10, 20, 30, 50, 100]
-        n_clusters = [15, 20, 50, 100]
+        n_clusters = [20, 50, 100, 400]
 
         # create scheme
         sql_req = "drop table if exists NODES_TEST_CLUSTER;"
