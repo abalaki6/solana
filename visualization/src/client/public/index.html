@@ -12,43 +12,67 @@
     <link rel="stylesheet" href="css/styles.css">
     <link rel="shortcut icon" href="assets/images/favicon.ico" type="image/x-icon">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Montserrat|Rubik|Exo+2:300,400,700">
-
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.0/css/bootstrap.min.css">
+    <style type="text/css">
+      .jumbotron{
+        background-image: url("assets/images/blockchain.jpg");
+        background-size: cover;
+        color: white;
+      }
+    </style>
+    <style>
+      .button {
+        background-color: #00FFAD;
+        border: none;
+        color: black;
+        padding: 15px 32px;
+        text-align: center;
+        text-decoration: none;
+        display: inline-block;
+        font-size: 16px;
+        margin: 4px 2px;
+        cursor: pointer;
+      }
+</style>
 </head>
 
 <body style="text-align:center;">
-    <div class="col-md-12" align=left>
-        <h1 align=left><img src='assets/images/solana-logo.jpg' style="width: 30px; height: 30px;">Solana Blockchain
+    <div class="jumbotron" align=left>
+        <h1 align=left><img src='assets/images/solana-logo.jpg' style="width: 80px; height: 80px;"> Solana Blockchain
             Node Distribution
         </h1>
         <p align=left> Solana blockchain is currently being developed to estimate the size of the network by finding all
             the reachable nodes in the network.</p>
-        <p align=left> Join our <a href="https://discord.gg/pquxPsq" target="_blank">discord</a></p>
+        <p align=left><a class="button btn-primary btn-lg" href="https://discord.gg/pquxPsq">Join Our Discord</a></p>
     </div>
 
-    <div class='container' style="width: 20%; height: 50%; float:left;">
-      <div class='table-responsive'>
-        <p id = "center">Top 10 countries with their respective number of reachable nodes are as follow.</p>
-        <br/>
-        <table class='table table-bordered table-striped' id='rank_table'>
-            <tr>
-                <th>Rank</th>
-                <th>Country</th>
-                <th>Nodes</th>
-            </tr>
-        </table>
+    <div class="center" style="text-align:center;">
+      <div class="container" style="width: 20%; height: 50%; float:left;">
+        <div class='table-responsive'>
+          <p id = "center">Top 10 countries with their respective number of reachable nodes are as follow.</p>
+          <br/>
+          <table class="table table-bordered table-striped" id="rank_table">
+              <tr>
+                  <th>Rank</th>
+                  <th>Country</th>
+                  <th>Nodes</th>
+              </tr>
+          </table>
+        </div>
       </div>
+
+      <div id="center" style="width: 80%; height: 50%; float:right;">
+          <div id="container" style="width: 1000px; height: 640px;"></div>
+
+          <button class="zoom-button" data-zoom="reset">0</button>
+          <button class="zoom-button" data-zoom="out">-</button>
+          <button class="zoom-button" data-zoom="in">+</button>
+          <div id="zoom-info"></div>
+      </div>
+      <div style="width: 100%; height: 50%; clear:both"></div>
     </div>
 
-    <div id='center' style="width: 80%; height: 50%; float:right;">
-        <div id="container" style="width: 1000px; height: 640px;"></div>
-
-        <button class="zoom-button" data-zoom="reset">0</button>
-        <button class="zoom-button" data-zoom="out">-</button>
-        <button class="zoom-button" data-zoom="in">+</button>
-        <div id="zoom-info"></div>
-    </div>
-    <div style="width: 100%; height: 50%; clear:both"></div>
-    <p align=left>Copyright Solana Labs, Inc. All rights reserved</p>
+    <p align=left> Copyright Solana Labs, Inc. All rights reserved</p>
 </body>
 
 <script type="text/javascript" src="js/Zoom.js"> </script>
