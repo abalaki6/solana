@@ -12,38 +12,69 @@ var con = mysql.createConnection({
   database: "SOLANA"
 });
 
-function pullData(req,res, next) {
-    con.query("SELECT longitude, latitude, map_depth, node_size FROM NODES_TEST_CLUSTER",
-    function (err, result, fields) {
-      if (err) {
-        return next(err);
-        // throw err;
+app.get('/d.json', function (req, res){
+  con.query("SELECT longitude, latitude, map_depth, node_size FROM NODES_TEST_CLUSTER",
+  function (err, result, fields) {
+    if (err) {
+      return next(err);
+    }
+    const all_features_on_level_zero = [];
+    const all_features_on_level_one = [];
+    const all_features_on_level_two = [];
+    const all_features_on_level_three = [];
+    const all_features_on_level_four = [];
+
+    result.forEach(res => {
+      // console.log(res);
+      const newRes = {};
+      newRes.type = 'Feature';
+      newRes.properties = {};
+      newRes.geometry = {};
+      newRes.geometry.type = "Point";
+      newRes.geometry.coordinates = [];
+      newRes.geometry.coordinates.push(res.latitude);
+      newRes.geometry.coordinates.push(res.longitude);
+      if(res.map_depth==0){
+        all_features_on_level_zero.push(newRes);
       }
-      const features = [];
-      result.forEach(res => {
-        console.log(res);
-        const newRes = {};
-        newRes.type = 'Feature';
-        newRes.properties = {};
-        newRes.geometry = {};
-        newRes.geometry.type = "Point";
-        newRes.geometry.coordinates = [];
-        newRes.geometry.coordinates.push(res.latitude);
-        newRes.geometry.coordinates.push(res.longitude);
-        newRes.geometry.depth = res.map_depth;
-        newRes.geometry.radius = res.node_size;
-        features.push(newRes);
-      });
-    const final = {levels: [{type: 'FeatureCollection', features}]};
-    fs.writeFileSync('./public/d.json', JSON.stringify(final));
-    });
-    next();
+      if(res.map_depth==1){
+        all_features_on_level_one.push(newRes);
+      }
+      if(res.map_depth==2){
+        all_features_on_level_two.push(newRes);
+      }
+      if(res.map_depth==3){
+        all_features_on_level_three.push(newRes);
+      }
+      if(res.map_depth==4){
+        all_features_on_level_four.push(newRes);
+      }
+    }
+    );
+  const final = {
+    levels: [
+      {
+        type: 'FeatureCollection', all_features_on_level_zero
+      },
+      {
+        type: 'FeatureCollection', all_features_on_level_one
+      },
+      {
+        type: 'FeatureCollection', all_features_on_level_two
+      },
+      {
+        type: 'FeatureCollection', all_features_on_level_three
+      },
+      {
+        type: 'FeatureCollection', all_features_on_level_four
+      }
+    ]
+  };
+  res.json(final)
+});
+})
 
-};
-
-
-app.use('/', pullData, express.static(path.join(__dirname, 'public')));
-
+app.use('/', express.static(path.join(__dirname, 'public')));
 
 app.get('/newNode', async function (req, res) {
   const node = await Node.create({
