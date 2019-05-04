@@ -33,22 +33,33 @@
         margin: 4px 2px;
         cursor: pointer;
       }
-</style>
+    </style>
+    <style type="text/css">
+      .wrapper {
+        width: 70%;
+        margin: 0 auto;
+      }
+    </style>
 </head>
 
 <body style="text-align:center;">
-    <div class="jumbotron" align=left>
+    <div class="jumbotron">
         <h1 align=left><img src='assets/images/solana-logo.jpg' style="width: 80px; height: 80px;"> Solana Blockchain
             Node Distribution
         </h1>
-        <p align=left> Solana blockchain is currently being developed to estimate the size of the network by finding all
-            the reachable nodes in the network.</p>
         <p align=left><a class="button btn-primary btn-lg" href="https://discord.gg/pquxPsq">Join Our Discord</a></p>
     </div>
 
-    <div class="center" style="text-align:center;">
-      <div class="container" style="width: 20%; height: 50%; float:left;">
+    <div id='wrapper' style='text-align: center;'>
+      <div style='width: 20%; display: inline-block; vertical-align: top;'>
         <div class='table-responsive'>
+          <h4> GLOBAL NODE DISTRIBUTION</h4>
+          <p>Reachable nodes as of <span id="datetime"></span></p>
+          <script>
+            var dt = new Date();
+            document.getElementById("datetime").innerHTML = dt.toLocaleString();
+          </script>
+          <h3> 2000 nodes</h3>
           <p id = "center">Top 10 countries with their respective number of reachable nodes are as follow.</p>
           <br/>
           <table class="table table-bordered table-striped" id="rank_table">
@@ -61,7 +72,7 @@
         </div>
       </div>
 
-      <div id="center" style="width: 80%; height: 50%; float:right;">
+      <div style='display: inline-block; vertical-align: top;'>
           <div id="container" style="width: 1000px; height: 640px;"></div>
 
           <button class="zoom-button" data-zoom="reset">0</button>
@@ -69,10 +80,11 @@
           <button class="zoom-button" data-zoom="in">+</button>
           <div id="zoom-info"></div>
       </div>
-      <div style="width: 100%; height: 50%; clear:both"></div>
     </div>
 
-    <p align=left> Copyright Solana Labs, Inc. All rights reserved</p>
+    <p>&copy; Copyright Solana Labs, Inc. All rights reserved</p>
+
+</div>
 </body>
 
 <script type="text/javascript" src="js/Zoom.js"> </script>
