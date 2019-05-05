@@ -110,7 +110,7 @@ def upload_to_database(nodes, current_ip_list):
             ip_address = node.get_ip_address()
             if ip_address in current_ip_list:
                 # Just need to update the information
-                sql_req = ("UPDATE NODES"
+                sql_req = ("UPDATE NODES "
                 "SET ip_addr = %s, longitude = %s, latitude = %s, city = %s, region = %s, country = %s, "
                 "ping_time = %s, slot_height = %s, transaction_count = %s, stake_weight = %s, "
                 "public_key = %s, tvu_addr = %s, tpu_addr = %s, rpc_addr = %s, storage_addr = %s, is_leader = %s, "
